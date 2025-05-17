@@ -9,6 +9,30 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+
+std::string char_to_hex(char c) {
+    std::stringstream ss;
+    ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(static_cast<unsigned char>(c));
+    return ss.str();
+}
+
+
+std::string string_to_hex(const char* text) {
+    if (text == nullptr) {
+        return ""; 
+    }
+    std::stringstream hex_stream;
+    hex_stream << std::hex << std::setfill('0'); 
+
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        hex_stream << std::setw(2) << static_cast<int>(static_cast<unsigned char>(text[i]));
+    }
+
+    return hex_stream.str();
+}
 
 struct whisper_params {
     int32_t n_threads    = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -158,15 +182,23 @@ class ProgressWorker : public Napi::AsyncWorker {
 
     void OnOK() override {
         Napi::HandleScope scope(Env());
-        Napi::Object res = Napi::Array::New(Env(), result.size());
+
+        // Create the segments array
+        Napi::Array segments_array = Napi::Array::New(Env(), result.size());
         for (uint64_t i = 0; i < result.size(); ++i) {
-            Napi::Object tmp = Napi::Array::New(Env(), 3);
-            for (uint64_t j = 0; j < 3; ++j) {
-                tmp[j] = Napi::String::New(Env(), result[i][j]);
-            }
-            res[i] = tmp;
+            Napi::Object segment = Napi::Object::New(Env());
+            segment.Set("start", Napi::String::New(Env(), result[i][0]));
+            segment.Set("end", Napi::String::New(Env(), result[i][1]));
+            segment.Set("text", Napi::String::New(Env(), result[i][2]));
+            segments_array[i] = segment;
         }
-        Callback().Call({Env().Null(), res});
+
+        // Create the final result object
+        Napi::Object final_res = Napi::Object::New(Env());
+        final_res.Set("segments", segments_array);
+        final_res.Set("language", Napi::String::New(Env(), this->detected_language)); 
+
+        Callback().Call({Env().Null(), final_res});
     }
 
     // Progress callback function - using thread-safe function
@@ -186,6 +218,7 @@ class ProgressWorker : public Napi::AsyncWorker {
     std::vector<std::vector<std::string>> result;
     Napi::Env env;
     Napi::ThreadSafeFunction tsfn;
+    std::string detected_language = "auto";
 
     // Custom run function with progress callback support
     int run_with_progress(whisper_params &params, std::vector<std::vector<std::string>> &result) {
@@ -325,22 +358,162 @@ class ProgressWorker : public Napi::AsyncWorker {
 
                 if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                     fprintf(stderr, "failed to process audio\n");
+                    // Clean up context before returning error
+                    whisper_free(ctx);
                     return 10;
                 }
             }
-    }
+             // --- Get detected language AFTER processing ---
+            int lang_id = whisper_full_lang_id(ctx);
+            if (lang_id != -1) {
+                 this->detected_language = whisper_lang_str(lang_id);
+                 if (!params.no_prints) {
+                    fprintf(stderr, "%s: detected language: %s\n", __func__, this->detected_language.c_str());
+                 }
+            } else {
+                 this->detected_language = "unknown"; // Or keep "auto" if detection failed
+                 if (!params.no_prints) {
+                    fprintf(stderr, "%s: language detection failed\n", __func__);
+                 }
+            }
+            // --- End of language detection ---
+        } // End of file processing loop
 
         const int n_segments = whisper_full_n_segments(ctx);
-        result.resize(n_segments);
+        result.clear(); // Clear result vector before processing segments
+        std::string hex_buffer; // Buffer for incomplete hex across segments
+        int64_t pending_t0 = -1; // Timestamp of the start of an incomplete segment
+
         for (int i = 0; i < n_segments; ++i) {
             const char * text = whisper_full_get_segment_text(ctx, i);
-            const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-            const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+            int64_t current_t0 = whisper_full_get_segment_t0(ctx, i);
+            const int64_t current_t1 = whisper_full_get_segment_t1(ctx, i);
+            if (current_t0 < 0) {
+                fprintf(stderr, "Warning: current_t0 is negative, setting to 0\n");
+                current_t0 = 0;
+            }
+            std::string current_text_hex = string_to_hex(text);
+            // Prepend buffer from previous segment, if any
+            std::string combined_hex = hex_buffer + current_text_hex;
+            hex_buffer.clear(); // Clear buffer, it will be repopulated if combined_hex ends incomplete
 
-            result[i].emplace_back(to_timestamp(t0, params.comma_in_time));
-            result[i].emplace_back(to_timestamp(t1, params.comma_in_time));
-            result[i].emplace_back(text);
+            std::string complete_text;
+            size_t consumed_hex_len = 0;
+
+            // Process combined_hex to find complete UTF-8 characters
+            while (consumed_hex_len + 2 <= combined_hex.length()) {
+                int char_length = 0; // Length in hex digits (bytes * 2)
+                unsigned int first_byte;
+                std::stringstream ss_first;
+                // Use substr starting from consumed_hex_len
+                ss_first << std::hex << combined_hex.substr(consumed_hex_len, 2);
+                ss_first >> first_byte;
+
+                // Determine expected UTF-8 char length based on first byte
+                if ((first_byte & 0x80) == 0) { char_length = 2; }         // ASCII (1 byte)
+                else if ((first_byte & 0xE0) == 0xC0) { char_length = 4; } // 2-byte UTF-8
+                else if ((first_byte & 0xF0) == 0xE0) { char_length = 6; } // 3-byte UTF-8
+                else if ((first_byte & 0xF8) == 0xF0) { char_length = 8; } // 4-byte UTF-8
+                else {
+                    // Invalid start byte. Skip this hex pair.
+                    fprintf(stderr, "Warning: Invalid UTF-8 start byte encountered: 0x%02x\n", first_byte);
+                    consumed_hex_len += 2;
+                    continue;
+                }
+
+                // Check if we have enough hex digits left for the complete character
+                if (consumed_hex_len + char_length <= combined_hex.length()) {
+                    std::string hex_char = combined_hex.substr(consumed_hex_len, char_length);
+                    std::string byte_str;
+                    bool conversion_ok = true;
+                    for (size_t j = 0; j < hex_char.length(); j += 2) {
+                        unsigned int byte;
+                        std::stringstream ss_byte;
+                        ss_byte << std::hex << hex_char.substr(j, 2);
+                        if (!(ss_byte >> byte)) {
+                            fprintf(stderr, "Warning: Hex conversion failed for: %s\n", hex_char.substr(j, 2).c_str());
+                            conversion_ok = false;
+                            break;
+                        }
+                        byte_str += static_cast<char>(byte);
+                    }
+
+                    if (conversion_ok) {
+                         // Basic validation for continuation bytes (optional but good)
+                         bool valid_utf8 = true;
+                         if (char_length > 2) {
+                             for(size_t k = 1; k < byte_str.length(); ++k) {
+                                 if ((static_cast<unsigned char>(byte_str[k]) & 0xC0) != 0x80) {
+                                     valid_utf8 = false;
+                                     fprintf(stderr, "Warning: Invalid UTF-8 continuation byte at pos %zu in char %s\n", k, hex_char.c_str());
+                                     break;
+                                 }
+                             }
+                         }
+                         if (valid_utf8) {
+                            complete_text += byte_str;
+                            consumed_hex_len += char_length;
+                         } else {
+                             // Skip the invalid sequence start byte pair
+                             consumed_hex_len += 2;
+                         }
+                    } else {
+                        // Skip the problematic hex pair where conversion failed
+                        consumed_hex_len += 2;
+                    }
+                } else {
+                    // Not enough hex digits left for the character indicated by first_byte.
+                    // Break the inner loop, the remainder will be put into hex_buffer.
+                    break;
+                }
+            }
+
+            // Store any remaining hex digits in the buffer for the next iteration
+            hex_buffer = combined_hex.substr(consumed_hex_len);
+
+            // Decide whether to store the result or wait for the next segment
+            if (!hex_buffer.empty()) {
+                // Current segment ends with an incomplete character.
+                if (pending_t0 < 0) { // If not already tracking an incomplete segment start
+                    pending_t0 = current_t0; // Store the start time of this segment
+                }
+                // If there was text completed *before* the incomplete part, store it now
+                // with the correct timestamp, otherwise wait.
+                if (!complete_text.empty()) {
+                     int64_t start_time = (pending_t0 >= 0 && pending_t0 != current_t0) ? pending_t0 : current_t0;
+                     // We use current_t1 because the *completed* text ends here, even if an incomplete char follows.
+                     result.emplace_back(std::vector<std::string>{
+                         to_timestamp(start_time, params.comma_in_time),
+                         to_timestamp(current_t1, params.comma_in_time), // End time is still current segment's end
+                         complete_text
+                     });
+                     // Since we added text, the *next* segment's text should start from pending_t0
+                     // which we just set (or kept). Don't reset pending_t0 here.
+                }
+                // Do not add the incomplete part to result yet.
+            } else {
+                // Current segment processing finished completely (no leftover hex).
+                if (!complete_text.empty()) {
+                    // Use pending_t0 if valid, otherwise use current_t0
+                    int64_t start_time = (pending_t0 >= 0) ? pending_t0 : current_t0;
+                    result.emplace_back(std::vector<std::string>{
+                        to_timestamp(start_time, params.comma_in_time),
+                        to_timestamp(current_t1, params.comma_in_time),
+                        complete_text
+                    });
+                }
+                // Reset pending_t0 as we have completed the sequence (or there was none)
+                pending_t0 = -1;
+            }
         }
+
+        // After the loop, check if there's anything left in the buffer
+        if (!hex_buffer.empty()) {
+            fprintf(stderr, "Warning: Transcription ended with incomplete UTF-8 sequence (hex: %s). Discarding.\n", hex_buffer.c_str());
+            // Optionally, you could try to decode it leniently or add placeholder text.
+            // If pending_t0 is valid here, it means the very last segment(s) were incomplete.
+        }
+
 
         whisper_print_timings(ctx);
         whisper_free(ctx);
