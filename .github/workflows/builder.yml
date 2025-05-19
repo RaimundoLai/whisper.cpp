@@ -64,8 +64,6 @@ jobs:
             "--arch=x64"
           )
           
-
-          $buildParams += "--CDCMAKE_CUDA_ARCHITECTURES=all"
           $outputName = "addon-${{ matrix.optimized }}.node"
           
           npx cmake-js compile -T addon.node -B Release $buildParams
@@ -143,7 +141,7 @@ jobs:
           tag_name: release-${{ steps.date.outputs.date }}
           name: whisper.cpp builds ${{ steps.date.outputs.date }}
           body: |
-            whisper.cpp addon builds for multiple platforms (Build date: ${{ steps.date.outputs.date }})
+            whisper.cpp addon builds (Build date: ${{ steps.date.outputs.date }})
             - Windows (with CUDA support)
             - Windows (without CUDA support)
           files: |
@@ -160,7 +158,7 @@ jobs:
           tag_name: latest
           name: Latest whisper.cpp builds
           body: |
-            Latest whisper.cpp addon builds for multiple platforms.
+            Latest whisper.cpp addon builds.
             Last updated: ${{ steps.date.outputs.date }}
             - Windows (with CUDA support)
             - Windows (without CUDA support)
