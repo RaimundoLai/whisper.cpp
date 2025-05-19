@@ -2,6 +2,8 @@ name: Build whisper.cpp addons
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ builder ]
 
 jobs:
   windows-cuda:
