@@ -1,0 +1,170 @@
+name: Build whisper.cpp addons
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2019
+    strategy:
+      matrix:
+        cuda_version: ['11.8.0', '12.4.1', '12.2.0']
+        include:
+          - cuda_version: '11.8.0'
+            optimized: 'windows-cuda-1180'
+          - cuda_version: '12.4.1'
+            optimized: 'windows-cuda-1241'
+          - cuda_version: '12.2.0'
+            optimized: 'windows-cuda-1220'
+    steps:
+      - name: Clone whisper.cpp repository
+        uses: actions/checkout@v3
+        with:
+          repository: RaimundoLai/whisper.cpp
+          branch: dev
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 22.15.1
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        run: |
+          choco install cmake -y
+          npm install -g cmake-js
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda_version }}
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Build
+        shell: powershell
+        run: |
+          cd examples/addon.node
+          npm install
+          cd ../../
+          $env:CUDA_PATH = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          $env:CUDA_TOOLKIT_ROOT_DIR = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          
+          $buildParams = @(
+            "--CDBUILD_SHARED_LIBS=OFF",
+            "--CDWHISPER_STATIC=ON",
+            "--CDGGML_CUDA=ON",
+            "--runtime=electron",
+            "--runtime-version=35.1.5",
+            "--arch=x64"
+          )
+          
+
+          $buildParams += "--CDCMAKE_CUDA_ARCHITECTURES=all"
+          $outputName = "addon-${{ matrix.optimized }}.node"
+          
+          npx cmake-js compile -T addon.node -B Release $buildParams
+          
+          mkdir -p artifacts
+          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/$outputName"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-${{ matrix.optimized }}.node
+          path: artifacts/addon-${{ matrix.optimized }}.node
+
+  windows-no-cuda:
+    runs-on: windows-2019
+    steps:
+      - name: Clone whisper.cpp repository
+        uses: actions/checkout@v3
+        with:
+          repository: RaimundoLai/whisper.cpp
+          branch: dev
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 22.15.1
+          
+      - name: Install dependencies
+        run: |
+          choco install cmake -y
+          npm install -g cmake-js
+
+      - name: Build
+        run: |
+          cd examples/addon.node
+          npm install
+          cd ../../
+          npx cmake-js compile -T addon.node -B Release `
+            --CDBUILD_SHARED_LIBS=OFF `
+            --CDWHISPER_STATIC=ON `
+            --runtime=electron `
+            --runtime-version=35.1.5 `
+            --arch=x64 `
+            
+          mkdir -p artifacts
+          
+          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-no-cuda.node"
+          
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-windows-no-cuda
+          path: artifacts/addon-windows-no-cuda.node
+
+  create-update-release:
+    needs: [windows-cuda, windows-no-cuda]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          
+      - name: List artifacts
+        run: ls -R artifacts/
+        
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+        
+      - name: Create Timestamped Release
+        uses: softprops/action-gh-release@v1
+        if: github.event_name != 'pull_request'
+        with:
+          tag_name: release-${{ steps.date.outputs.date }}
+          name: whisper.cpp builds ${{ steps.date.outputs.date }}
+          body: |
+            whisper.cpp addon builds for multiple platforms (Build date: ${{ steps.date.outputs.date }})
+            - Windows (with CUDA support)
+            - Windows (without CUDA support)
+          files: |
+            artifacts/**/*.node
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Update Latest Release
+        uses: softprops/action-gh-release@v1
+        if: github.event_name != 'pull_request'
+        with:
+          tag_name: latest
+          name: Latest whisper.cpp builds
+          body: |
+            Latest whisper.cpp addon builds for multiple platforms.
+            Last updated: ${{ steps.date.outputs.date }}
+            - Windows (with CUDA support)
+            - Windows (without CUDA support)
+          files: |
+            artifacts/**/*.node
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
