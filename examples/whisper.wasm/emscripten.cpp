@@ -32,15 +32,14 @@ std::string to_timestamp(int64_t t, bool comma) {
     return std::string(buf);
 }
 
-// [已更新] 這是新的 JSON 產生函式
 static bool output_json(
         struct whisper_context * ctx,
-        bool   final,
-        int    first_segment,
-        int    n_segments) {
+        bool    final,
+        int     first_segment,
+        int     n_segments) {
 
-    // 輔助函式：強化版的 JSON 字串轉義與消毒函式
-    // 這個版本會過濾掉無效的 UTF-8 序列和控制字元
+    // Helper function: An enhanced JSON string escaping and sanitizing function
+    // This version filters out invalid UTF-8 sequences and control characters
     auto escape_json_string = [](const char *s) -> std::string {
     std::string escaped;
     if (s == nullptr) {
@@ -52,7 +51,7 @@ static bool output_json(
     while (*p) {
         unsigned char c = *p;
         
-        // 处理需要转义的 JSON 特殊字符
+        // Handle special JSON characters that need to be escaped
         switch (c) {
             case '"':  escaped += "\\\""; p++; break;
             case '\\': escaped += "\\\\"; p++; break;
@@ -63,36 +62,36 @@ static bool output_json(
             case '\t': escaped += "\\t";  p++; break;
             default:
                 if (c < 32) {
-                    // 忽略其他控制字符
+                    // Ignore other control characters
                     p++;
                 } else if (c < 128) {
-                    // 标准 ASCII 字符
+                    // Standard ASCII characters
                     escaped += c;
                     p++;
                 } else {
-                    // UTF-8 多字节字符处理
+                    // UTF-8 multi-byte character handling
                     int utf8_len = 0;
                     
-                    // 判断 UTF-8 字符的字节长度
+                    // Determine the byte length of the UTF-8 character
                     if ((c & 0x80) == 0) {
-                        // ASCII (不应该到这里)
+                        // ASCII (shouldn't get here)
                         utf8_len = 1;
                     } else if ((c & 0xE0) == 0xC0) {
-                        // 2字节 UTF-8
+                        // 2-byte UTF-8
                         utf8_len = 2;
                     } else if ((c & 0xF0) == 0xE0) {
-                        // 3字节 UTF-8 (中文通常是这个)
+                        // 3-byte UTF-8 (Chinese characters are usually in this range)
                         utf8_len = 3;
                     } else if ((c & 0xF8) == 0xF0) {
-                        // 4字节 UTF-8
+                        // 4-byte UTF-8
                         utf8_len = 4;
                     } else {
-                        // 无效的 UTF-8 开始字节，跳过
+                        // Invalid UTF-8 start byte, skip it
                         p++;
                         continue;
                     }
                     
-                    // 验证后续字节是否为有效的 UTF-8 continuation bytes
+                    // Verify that the subsequent bytes are valid UTF-8 continuation bytes
                     bool valid_utf8 = true;
                     for (int i = 1; i < utf8_len; i++) {
                         if (p[i] == 0 || (p[i] & 0xC0) != 0x80) {
@@ -102,13 +101,13 @@ static bool output_json(
                     }
                     
                     if (valid_utf8) {
-                        // 添加完整的 UTF-8 字符
+                        // Add the complete UTF-8 character
                         for (int i = 0; i < utf8_len; i++) {
                             escaped += p[i];
                         }
                         p += utf8_len;
                     } else {
-                        // 无效的 UTF-8 序列，跳过这个字节
+                        // Invalid UTF-8 sequence, skip this byte
                         p++;
                     }
                 }
@@ -158,7 +157,6 @@ static bool output_json(
         output += "\"" + std::string(name) + "\": ";
     };
 
-    // [已修改] 使用新的 escape_json_string 函式
     auto value_s = [&](const char *name, const char *val, bool end) {
         start_value(name);
         std::string val_escaped = escape_json_string(val);
@@ -238,7 +236,7 @@ static bool output_json(
         for (int j = 0; j < n; ++j) {
             auto token = whisper_full_get_token_data(ctx, i, j);
             start_obj(nullptr);
-            // 這行現在會被正確地轉義
+            // This line will now be correctly escaped
             value_s("text", whisper_token_to_str(ctx, token.id), false);
             if(token.t0 > -1 && token.t1 > -1) {
                 times_o(token.t0, token.t1, false);

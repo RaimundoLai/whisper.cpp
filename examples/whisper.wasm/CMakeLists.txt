@@ -35,7 +35,7 @@ set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
     -s INITIAL_MEMORY=512MB \
     -s MAXIMUM_MEMORY=2000MB \
     -s ALLOW_MEMORY_GROWTH=1 \
-    -s FORCE_FILESYSTEM=1 \
+    -s FORCE_FILESYSTEM=1 -s ENVIRONMENT='web,worker' -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORT_NAME=\"createModule\" \
     -s EXPORTED_RUNTIME_METHODS=\"['print', 'printErr', 'ccall', 'cwrap', 'HEAPU8']\" \
     ${EXTRA_FLAGS} \
     ")
