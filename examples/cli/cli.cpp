@@ -75,7 +75,7 @@ struct whisper_params {
     bool no_timestamps   = false;
     bool log_score       = false;
     bool use_gpu         = true;
-    bool flash_attn      = false;
+    bool flash_attn      = true;
     bool suppress_nst    = false;
 
     std::string language  = "en";
@@ -193,6 +193,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-ls"   || arg == "--log-score")       { params.log_score       = true; }
         else if (arg == "-ng"   || arg == "--no-gpu")          { params.use_gpu         = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
+        else if (arg == "-nfa"  || arg == "--no-flash-attn")   { params.flash_attn      = false; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (                  arg == "--suppress-regex")  { params.suppress_regex  = ARGV_NEXT; }
         else if (                  arg == "--grammar")         { params.grammar         = ARGV_NEXT; }
@@ -202,7 +203,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--vad")                         { params.vad                         = true; }
         else if (arg == "-vm"   || arg == "--vad-model")                   { params.vad_model                   = ARGV_NEXT; }
         else if (arg == "-vt"   || arg == "--vad-threshold")               { params.vad_threshold               = std::stof(ARGV_NEXT); }
-        else if (arg == "-vsd"  || arg == "--vad-min-speech-duration-ms")  { params.vad_min_speech_duration_ms  = std::stoi(ARGV_NEXT); }
+        else if (arg == "-vspd" || arg == "--vad-min-speech-duration-ms")  { params.vad_min_speech_duration_ms  = std::stoi(ARGV_NEXT); }
         else if (arg == "-vsd"  || arg == "--vad-min-silence-duration-ms") { params.vad_min_speech_duration_ms  = std::stoi(ARGV_NEXT); }
         else if (arg == "-vmsd" || arg == "--vad-max-speech-duration-s")   { params.vad_max_speech_duration_s   = std::stof(ARGV_NEXT); }
         else if (arg == "-vp"   || arg == "--vad-speech-pad-ms")           { params.vad_speech_pad_ms           = std::stoi(ARGV_NEXT); }
@@ -271,7 +272,8 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -dtw MODEL --dtw MODEL         [%-7s] compute token-level timestamps\n",                 params.dtw.c_str());
     fprintf(stderr, "  -ls,       --log-score         [%-7s] log best decoder scores of tokens\n",              params.log_score?"true":"false");
     fprintf(stderr, "  -ng,       --no-gpu            [%-7s] disable GPU\n",                                    params.use_gpu ? "false" : "true");
-    fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n",                                params.flash_attn ? "true" : "false");
+    fprintf(stderr, "  -fa,       --flash-attn        [%-7s] enable flash attention\n",                         params.flash_attn ? "true" : "false");
+    fprintf(stderr, "  -nfa,      --no-flash-attn     [%-7s] disable flash attention\n",                        params.flash_attn ? "false" : "true");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n",                     params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  --suppress-regex REGEX         [%-7s] regular expression matching tokens to suppress\n", params.suppress_regex.c_str());
     fprintf(stderr, "  --grammar GRAMMAR              [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
@@ -909,6 +911,8 @@ static void output_lrc(struct whisper_context * ctx, std::ofstream & fout, const
 static void cb_log_disable(enum ggml_log_level , const char * , void * ) { }
 
 int main(int argc, char ** argv) {
+    ggml_backend_load_all();
+
 #if defined(_WIN32)
     // Set the console output code page to UTF-8, while command line arguments
     // are still encoded in the system's code page. In this way, we can print
@@ -988,7 +992,6 @@ int main(int argc, char ** argv) {
     }
 
     // whisper init
-
     struct whisper_context_params cparams = whisper_context_default_params();
 
     cparams.use_gpu    = params.use_gpu;

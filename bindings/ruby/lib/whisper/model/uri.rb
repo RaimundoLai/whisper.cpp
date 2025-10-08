@@ -94,7 +94,7 @@ module Whisper
       end
 
       def show_progress(current, size)
-        progress_rate_available = size && $stderr.tty?
+        progress_rate_available = size && $stderr.tty? && $stderr.winsize[1] >= line.size
 
         unless @prev
           @prev = Time.now
@@ -127,6 +127,44 @@ module Whisper
         units = %w[B KiB MiB GiB TiB]
         exp = (Math.log(bytesize) / Math.log(1024)).to_i
         format("%.1f %s", bytesize.to_f / 1024 ** exp, units[exp])
+      end
+    end
+
+    class ZipURI < URI
+      def cache
+        zip_path = super
+        dest = unzipped_path
+        return if dest.exist? && dest.mtime >= zip_path.mtime
+        escaping dest do
+          system "unzip", "-q", "-d", zip_path.dirname.to_path, zip_path.to_path, exception: true
+        end
+        zip_path
+      end
+
+      def clear_cache
+        super
+        unzipped_path.rmtree if unzipped_path.exist?
+      end
+
+      private
+
+      def unzipped_path
+        cache_path.sub_ext("")
+      end
+
+      def escaping(path)
+        escaped = Pathname("#{path}.removing")
+        if path.exist?
+          escaped.rmtree if escaped.exist?
+          path.rename escaped
+        end
+        yield
+      ensure
+        if path.exist?
+          escaped.rmtree if escaped.exist?
+        else
+          escaped.rename path if escaped.exist?
+        end
       end
     end
 
@@ -165,8 +203,31 @@ module Whisper
       models[name] = URI.new("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-#{name}.bin")
     }
 
+    %w[
+      silero-v5.1.2
+    ].each do |name|
+      @pre_converted_models[name] = URI.new("https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-#{name}.bin")
+    end
+
+    @coreml_compiled_models = %w[
+      tiny
+      tiny.en
+      base
+      base.en
+      small
+      small.en
+      medium
+      medium.en
+      large-v1
+      large-v2
+      large-v3
+      large-v3-turbo
+    ].each_with_object({}) do |name, models|
+      models[@pre_converted_models[name]] = ZipURI.new("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-#{name}-encoder.mlmodelc.zip")
+    end
+
     class << self
-      attr_reader :pre_converted_models
+      attr_reader :pre_converted_models, :coreml_compiled_models
     end
   end
 end

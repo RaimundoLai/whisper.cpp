@@ -83,6 +83,8 @@ static bool vad_params_parse(int argc, char ** argv, cli_params & params) {
 static void cb_log_disable(enum ggml_log_level , const char * , void * ) { }
 
 int main(int argc, char ** argv) {
+    ggml_backend_load_all();
+
     cli_params cli_params;
 
     if (!vad_params_parse(argc, argv, cli_params)) {
@@ -109,6 +111,10 @@ int main(int argc, char ** argv) {
     struct whisper_vad_context * vctx = whisper_vad_init_from_file_with_params(
             cli_params.vad_model.c_str(),
             ctx_params);
+    if (vctx == nullptr) {
+        fprintf(stderr, "error: failed to initialize whisper context\n");
+        return 2;
+    }
 
     // Detect speech in the input audio file.
     if (!whisper_vad_detect_speech(vctx, pcmf32.data(), pcmf32.size())) {

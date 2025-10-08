@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5) # for add_link_options and implicit target directories.
 project("whisper.cpp" C CXX)
-project("whisper.cpp" VERSION 1.7.5)
+project("whisper.cpp" VERSION 1.8.0)
 include(CheckIncludeFileCXX)
 
 set(SOVERSION 1)
@@ -119,6 +119,11 @@ whisper_option_depr(WARNING     WHISPER_SYCL                GGML_SYCL)
 whisper_option_depr(WARNING     WHISPER_SYCL_F16            GGML_SYCL_F16)
 whisper_option_depr(WARNING     WHISPER_CCACHE              GGML_CCACHE)
 
+if (GGML_CUDA AND NOT MSVC)
+    #GGML_CUDA enabled, add the necessary compile options -Wno-deprecated-gpu-targets
+    add_compile_options(-Wno-deprecated-gpu-targets)
+endif()
+
 #
 # build the library
 #
@@ -172,6 +177,10 @@ get_directory_property(WHISPER_TRANSIENT_DEFINES COMPILE_DEFINITIONS)
 
 set_target_properties(whisper PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/whisper.h)
 install(TARGETS whisper LIBRARY PUBLIC_HEADER)
+
+target_compile_definitions(whisper PRIVATE
+    WHISPER_VERSION="${PROJECT_VERSION}"
+)
 
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/whisper-config.cmake.in
@@ -241,5 +250,6 @@ if (MSVC)
         disable_msvc_warnings(whisper-talk-llama)
         disable_msvc_warnings(whisper-bench)
         disable_msvc_warnings(quantize)
+        disable_msvc_warnings(vad-speech-segments)
     endif()
 endif()
