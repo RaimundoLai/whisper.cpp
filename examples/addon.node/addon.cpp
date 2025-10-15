@@ -1,7 +1,6 @@
 #include "napi.h"
 #include "common.h"
 #include "common-whisper.h"
-
 #include "whisper.h"
 
 #include <string>
@@ -13,6 +12,11 @@
 #include <sstream>
 #include <iomanip>
 #include <cfloat>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <algorithm> 
 
 // Helper function for UTF-8 fix
 std::string string_to_hex(const char* text) {
@@ -130,6 +134,11 @@ struct whisper_params {
     float       vad_max_speech_duration_s = FLT_MAX;
     int         vad_speech_pad_ms         = 30;
     float       vad_samples_overlap       = 0.1f;
+	
+    // Streaming parameters
+    int32_t step_ms      = 3000;
+    int32_t length_ms    = 10000;
+    int32_t keep_ms      = 200;
 };
 
 struct whisper_print_user_data {
@@ -656,13 +665,452 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     worker->Queue();
     return env.Undefined();
 }
+struct SegmentData {
+    int64_t start_ms;
+    int64_t end_ms;
+    std::string text;
+    bool speaker_turn;
+};
 
+enum class StreamState {
+    IDLE,
+    RUNNING,
+    PAUSED,
+    STOPPING,  // Hard stop
+    FINISHING  // Soft stop (graceful shutdown)
+};
+
+// --- WhisperStream Class Definition ---
+
+class WhisperStream : public Napi::ObjectWrap<WhisperStream> {
+public:
+    static Napi::Object Init(Napi::Env env, Napi::Object exports);
+    WhisperStream(const Napi::CallbackInfo& info);
+    ~WhisperStream();
+
+private:
+    // N-API Methods
+    Napi::Value Start(const Napi::CallbackInfo& info);
+    Napi::Value AddAudio(const Napi::CallbackInfo& info);
+    Napi::Value Stop(const Napi::CallbackInfo& info);
+    Napi::Value Pause(const Napi::CallbackInfo& info);
+    Napi::Value Resume(const Napi::CallbackInfo& info);
+    Napi::Value Finish(const Napi::CallbackInfo& info); // New method
+
+    // Internal worker and callback
+    void StreamWorker();
+    void StreamWorkerVAD();
+    static void OnNewSegmentCallback(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data);
+
+    // Whisper context and parameters
+    whisper_context* m_ctx = nullptr;
+    whisper_full_params m_wparams;
+
+    // Model and language settings
+    std::string m_model_path;
+    std::string m_language;
+    int m_n_threads = 4;
+    bool m_use_gpu = true;
+
+    // Streaming parameters
+    int m_step_ms = 3000;
+    int m_length_ms = 10000;
+    int m_keep_ms = 200;
+
+    // VAD parameters
+    bool m_use_vad = false;
+    float m_vad_thold = 0.6f;
+    float m_freq_thold = 100.0f;
+
+    // Audio buffer and state
+    std::deque<float> m_audio_buffer;
+    std::vector<float> m_pcmf32_local;
+    int64_t m_n_samples_processed = 0;
+    int64_t m_current_callback_offset_samples = 0;
+
+    std::thread m_worker_thread;
+    std::atomic<StreamState> m_state;
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+
+    Napi::ThreadSafeFunction m_tsfn_callback;
+    
+    // Other whisper params
+    bool m_tinydiarize = false;
+    int m_max_tokens = 0;
+    int m_audio_ctx = 0;
+    bool m_translate = false;
+    bool m_single_segment = false;
+    bool m_no_timestamps = false;
+};
+
+// --- Implementation of WhisperStream Methods ---
+
+Napi::Object WhisperStream::Init(Napi::Env env, Napi::Object exports) {
+    Napi::HandleScope scope(env);
+    Napi::Function func = DefineClass(env, "WhisperStream", {
+        InstanceMethod("start", &WhisperStream::Start),
+        InstanceMethod("addAudio", &WhisperStream::AddAudio),
+        InstanceMethod("stop", &WhisperStream::Stop),
+        InstanceMethod("pause", &WhisperStream::Pause),
+        InstanceMethod("resume", &WhisperStream::Resume),
+        InstanceMethod("finish", &WhisperStream::Finish), // Register new method
+    });
+    exports.Set("WhisperStream", func);
+    return exports;
+}
+
+WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
+    : Napi::ObjectWrap<WhisperStream>(info), m_state(StreamState::IDLE) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject()) {
+        Napi::TypeError::New(env, "Constructor requires an options object").ThrowAsJavaScriptException(); return;
+    }
+    Napi::Object options = info[0].As<Napi::Object>();
+    if (options.Has("model") && options.Get("model").IsString()) {
+        m_model_path = options.Get("model").As<Napi::String>();
+    } else {
+        Napi::TypeError::New(env, "Constructor options must include a 'model' path").ThrowAsJavaScriptException(); return;
+    }
+    if (options.Has("language") && options.Get("language").IsString()) m_language = options.Get("language").As<Napi::String>(); else m_language = "en";
+    if (options.Has("n_threads") && options.Get("n_threads").IsNumber()) m_n_threads = options.Get("n_threads").As<Napi::Number>();
+    if (options.Has("use_gpu") && options.Get("use_gpu").IsBoolean()) m_use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
+    if (options.Has("step_ms") && options.Get("step_ms").IsNumber()) m_step_ms = options.Get("step_ms").As<Napi::Number>();
+    if (options.Has("length_ms") && options.Get("length_ms").IsNumber()) m_length_ms = options.Get("length_ms").As<Napi::Number>();
+    if (options.Has("keep_ms") && options.Get("keep_ms").IsNumber()) m_keep_ms = options.Get("keep_ms").As<Napi::Number>();
+    if (options.Has("use_vad") && options.Get("use_vad").IsBoolean()) m_use_vad = options.Get("use_vad").As<Napi::Boolean>();
+    if (options.Has("vad_thold") && options.Get("vad_thold").IsNumber()) m_vad_thold = options.Get("vad_thold").As<Napi::Number>().FloatValue();
+    if (options.Has("freq_thold") && options.Get("freq_thold").IsNumber()) m_freq_thold = options.Get("freq_thold").As<Napi::Number>().FloatValue();
+    if (options.Has("tinydiarize") && options.Get("tinydiarize").IsBoolean()) m_tinydiarize = options.Get("tinydiarize").As<Napi::Boolean>();
+    if (options.Has("max_tokens") && options.Get("max_tokens").IsNumber()) m_max_tokens = options.Get("max_tokens").As<Napi::Number>();
+    if (options.Has("audio_ctx") && options.Get("audio_ctx").IsNumber()) m_audio_ctx = options.Get("audio_ctx").As<Napi::Number>();
+    if (options.Has("translate") && options.Get("translate").IsBoolean()) m_translate = options.Get("translate").As<Napi::Boolean>();
+    if (options.Has("single_segment") && options.Get("single_segment").IsBoolean()) m_single_segment = options.Get("single_segment").As<Napi::Boolean>();
+    if (options.Has("no_timestamps") && options.Get("no_timestamps").IsBoolean()) m_no_timestamps = options.Get("no_timestamps").As<Napi::Boolean>();
+    m_wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+}
+
+WhisperStream::~WhisperStream() {
+    StreamState current_state = m_state.load();
+    if (current_state != StreamState::IDLE) {
+        m_state = StreamState::STOPPING;
+        m_cv.notify_one();
+        if (m_worker_thread.joinable()) {
+            m_worker_thread.join();
+        }
+    }
+    if (m_tsfn_callback) {
+        m_tsfn_callback.Release();
+    }
+    if (m_ctx) {
+        whisper_free(m_ctx);
+    }
+}
+
+Napi::Value WhisperStream::Start(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "start() requires a callback function").ThrowAsJavaScriptException(); return env.Undefined();
+    }
+    if (m_state.load() != StreamState::IDLE) {
+        Napi::Error::New(env, "Stream has already been started").ThrowAsJavaScriptException(); return env.Undefined();
+    }
+    struct whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = m_use_gpu;
+    m_ctx = whisper_init_from_file_with_params(m_model_path.c_str(), cparams);
+    if (m_ctx == nullptr) {
+        Napi::Error::New(env, "Failed to initialize whisper context from model").ThrowAsJavaScriptException(); return env.Undefined();
+    }
+    m_audio_buffer.clear();
+    m_pcmf32_local.clear();
+    m_n_samples_processed = 0;
+    m_current_callback_offset_samples = 0;
+    
+    Napi::Function callback = info[0].As<Napi::Function>();
+    m_tsfn_callback = Napi::ThreadSafeFunction::New(env, callback, "WhisperStreamCallback", 0, 1);
+    
+    m_state = StreamState::RUNNING;
+    if (m_use_vad) {
+        m_worker_thread = std::thread(&WhisperStream::StreamWorkerVAD, this);
+    } else {
+        m_worker_thread = std::thread(&WhisperStream::StreamWorker, this);
+    }
+    return env.Undefined();
+}
+
+Napi::Value WhisperStream::AddAudio(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    StreamState current_state = m_state.load();
+    // Do not accept new audio if stopping or finishing
+    if (current_state != StreamState::RUNNING && current_state != StreamState::PAUSED) {
+        return env.Undefined();
+    }
+    if (info.Length() < 1 || !info[0].IsTypedArray()) {
+        Napi::TypeError::New(env, "addAudio() requires a Float32Array").ThrowAsJavaScriptException(); return env.Undefined();
+    }
+    if (m_audio_buffer.size() > WHISPER_SAMPLE_RATE * 30) {
+        fprintf(stderr, "Warning: WhisperStream audio buffer is too large, dropping new audio.\n"); return env.Undefined();
+    }
+    Napi::Float32Array arr = info[0].As<Napi::Float32Array>();
+    float* data = arr.Data();
+    size_t length = arr.ElementLength();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_audio_buffer.insert(m_audio_buffer.end(), data, data + length);
+    }
+    m_cv.notify_one();
+    return env.Undefined();
+}
+
+Napi::Value WhisperStream::Stop(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    StreamState current_state = m_state.load();
+    if (current_state == StreamState::IDLE || current_state == StreamState::STOPPING) {
+        return env.Undefined();
+    }
+    m_state = StreamState::STOPPING;
+    m_cv.notify_one();
+
+    if (m_worker_thread.joinable()) {
+        m_worker_thread.join();
+    }
+
+    if (m_tsfn_callback) {
+        m_tsfn_callback.Abort(); // Abort any pending calls
+        m_tsfn_callback.Release();
+        m_tsfn_callback = nullptr;
+    }
+    if (m_ctx) {
+        whisper_free(m_ctx);
+        m_ctx = nullptr;
+    }
+    m_state = StreamState::IDLE;
+    return env.Undefined();
+}
+
+Napi::Value WhisperStream::Finish(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    StreamState current_state = m_state.load();
+    if (current_state == StreamState::RUNNING || current_state == StreamState::PAUSED) {
+        m_state = StreamState::FINISHING;
+        m_cv.notify_one(); // Wake up worker thread to notice the state change
+    }
+    return env.Undefined(); // Non-blocking
+}
+
+Napi::Value WhisperStream::Pause(const Napi::CallbackInfo& info) {
+    if (m_state.load() == StreamState::RUNNING) {
+        m_state = StreamState::PAUSED;
+    }
+    return info.Env().Undefined();
+}
+
+Napi::Value WhisperStream::Resume(const Napi::CallbackInfo& info) {
+    if (m_state.load() == StreamState::PAUSED) {
+        m_state = StreamState::RUNNING;
+        m_cv.notify_one();
+    }
+    return info.Env().Undefined();
+}
+
+void WhisperStream::OnNewSegmentCallback(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data) {
+    WhisperStream* self = static_cast<WhisperStream*>(user_data);
+    const int64_t time_offset_ms = (self->m_current_callback_offset_samples * 1000) / WHISPER_SAMPLE_RATE;
+    const int n_segments = whisper_full_n_segments_from_state(state);
+    const int s0 = n_segments - n_new;
+    std::vector<SegmentData> segments_data;
+    for (int i = s0; i < n_segments; ++i) {
+        const char* text_cstr = whisper_full_get_segment_text_from_state(state, i);
+        if (!text_cstr || strlen(text_cstr) == 0) continue;
+        SegmentData data;
+        data.start_ms = time_offset_ms + (whisper_full_get_segment_t0_from_state(state, i) * 10);
+        data.end_ms = time_offset_ms + (whisper_full_get_segment_t1_from_state(state, i) * 10);
+        data.text = std::string(text_cstr);
+        data.speaker_turn = whisper_full_get_segment_speaker_turn_next_from_state(state, i);
+        segments_data.push_back(data);
+    }
+    if (self->m_tsfn_callback && !segments_data.empty()) {
+        auto callback = [segments_data = std::move(segments_data)] (Napi::Env env, Napi::Function jsCallback) {
+            for (const auto& data : segments_data) {
+                Napi::Object result = Napi::Object::New(env);
+                result.Set("start", Napi::Number::New(env, data.start_ms));
+                result.Set("end", Napi::Number::New(env, data.end_ms));
+                result.Set("text", Napi::String::New(env, data.text));
+                result.Set("speaker_turn", Napi::Boolean::New(env, data.speaker_turn));
+                jsCallback.Call({env.Null(), result});
+            }
+        };
+        self->m_tsfn_callback.NonBlockingCall(callback);
+    }
+}
+
+void WhisperStream::StreamWorker() {
+    m_wparams.print_progress   = false;
+    m_wparams.print_realtime   = false;
+    m_wparams.print_timestamps = false;
+    m_wparams.language         = m_language.c_str();
+    m_wparams.n_threads        = m_n_threads;
+    m_wparams.new_segment_callback = WhisperStream::OnNewSegmentCallback;
+    m_wparams.new_segment_callback_user_data = this;
+    m_wparams.no_context = true;
+    m_wparams.audio_ctx = m_audio_ctx;
+    m_wparams.tdrz_enable = m_tinydiarize;
+    m_wparams.max_tokens = m_max_tokens;
+    m_wparams.translate = m_translate;
+    m_wparams.single_segment = m_single_segment;
+    m_wparams.no_timestamps = m_no_timestamps;
+
+    const size_t n_samples_step = (m_step_ms * WHISPER_SAMPLE_RATE) / 1000;
+    m_pcmf32_local.clear();
+
+    while (true) {
+        bool is_stopping = false;
+        bool is_finishing = false;
+
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this, n_samples_step] {
+                StreamState s = m_state.load();
+                return s == StreamState::STOPPING || s == StreamState::FINISHING || m_audio_buffer.size() >= n_samples_step;
+            });
+
+            StreamState current_state = m_state.load();
+            is_stopping = (current_state == StreamState::STOPPING);
+            is_finishing = (current_state == StreamState::FINISHING);
+
+            if (is_stopping) {
+                break; // Hard stop
+            }
+            if (current_state == StreamState::PAUSED) {
+                continue;
+            }
+            
+            m_pcmf32_local.insert(m_pcmf32_local.end(), m_audio_buffer.begin(), m_audio_buffer.end());
+            m_audio_buffer.clear();
+
+            // If finishing and the source buffer is empty, this is the last run
+            if (is_finishing && m_audio_buffer.empty()) {
+                lock.unlock(); // Unlock before heavy processing
+                if (!m_pcmf32_local.empty()) {
+                    m_current_callback_offset_samples = m_n_samples_processed;
+                    if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), m_pcmf32_local.size()) != 0) {
+                        fprintf(stderr, "whisper_full failed on final audio chunk (finish)\n");
+                    }
+                }
+                break; // Exit loop after final processing
+            }
+        }
+
+        while (m_pcmf32_local.size() >= n_samples_step) {
+            m_current_callback_offset_samples = m_n_samples_processed;
+            if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), n_samples_step) != 0) {
+                fprintf(stderr, "whisper_full failed in streaming mode\n");
+            }
+            m_n_samples_processed += n_samples_step;
+            m_pcmf32_local.erase(m_pcmf32_local.begin(), m_pcmf32_local.begin() + n_samples_step);
+        }
+    }
+
+    // After loop, thread is about to exit. Send 'end' signal.
+    if (m_tsfn_callback) {
+        m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("type", "end");
+            jsCallback.Call({env.Null(), result});
+        });
+    }
+}
+
+void WhisperStream::StreamWorkerVAD() {
+    m_wparams.print_progress   = false;
+    m_wparams.print_realtime   = false;
+    m_wparams.print_timestamps = false;
+    m_wparams.language         = m_language.c_str();
+    m_wparams.n_threads        = m_n_threads;
+    m_wparams.new_segment_callback = WhisperStream::OnNewSegmentCallback;
+    m_wparams.new_segment_callback_user_data = this;
+    m_wparams.no_context = true;
+    m_wparams.audio_ctx = m_audio_ctx;
+    m_wparams.tdrz_enable = m_tinydiarize;
+    m_wparams.max_tokens = m_max_tokens;
+    m_wparams.translate = m_translate;
+    m_wparams.single_segment = m_single_segment;
+    m_wparams.no_timestamps = m_no_timestamps;
+
+    const int vad_window_ms = 2000;
+    const int n_samples_vad_window = (vad_window_ms * WHISPER_SAMPLE_RATE) / 1000;
+    const int vad_last_ms = 500;
+    const size_t n_samples_max_len = (25 * WHISPER_SAMPLE_RATE);
+    m_pcmf32_local.clear();
+
+    while (true) {
+        bool is_finishing = false;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this] {
+                StreamState s = m_state.load();
+                return s == StreamState::STOPPING || s == StreamState::FINISHING || !m_audio_buffer.empty();
+            });
+
+            StreamState current_state = m_state.load();
+            if (current_state == StreamState::STOPPING) {
+                break; // Hard stop
+            }
+            if (current_state == StreamState::PAUSED) {
+                continue;
+            }
+            is_finishing = (current_state == StreamState::FINISHING);
+            
+            m_pcmf32_local.insert(m_pcmf32_local.end(), m_audio_buffer.begin(), m_audio_buffer.end());
+            m_audio_buffer.clear();
+        }
+
+        bool should_process = false;
+        if (is_finishing) {
+            // Force processing for the final chunk
+            should_process = true;
+        } else {
+            if ((int)m_pcmf32_local.size() >= n_samples_vad_window) {
+                std::vector<float> pcmf32_window(m_pcmf32_local.end() - n_samples_vad_window, m_pcmf32_local.end());
+                if (vad_simple(pcmf32_window, WHISPER_SAMPLE_RATE, vad_last_ms, m_vad_thold, m_freq_thold, false)) {
+                    should_process = true;
+                }
+            }
+            if (m_pcmf32_local.size() > n_samples_max_len) {
+                should_process = true;
+            }
+        }
+        
+        if (should_process && !m_pcmf32_local.empty()) {
+            m_current_callback_offset_samples = m_n_samples_processed;
+            if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), m_pcmf32_local.size()) != 0) {
+                fprintf(stderr, "whisper_full failed in VAD streaming mode\n");
+            }
+            m_n_samples_processed += m_pcmf32_local.size();
+            m_pcmf32_local.clear();
+        }
+        
+        if (is_finishing) {
+            break; // Exit loop after final processing
+        }
+    }
+
+    // After loop, thread is about to exit. Send 'end' signal.
+    if (m_tsfn_callback) {
+        m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("type", "end");
+            jsCallback.Call({env.Null(), result});
+        });
+    }
+}
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
         Napi::String::New(env, "whisper"),
         Napi::Function::New(env, whisper)
     );
+    WhisperStream::Init(env, exports);
     return exports;
 }
 
-NODE_API_MODULE(whisper, Init);
+NODE_API_MODULE(whisper, Init)
