@@ -717,10 +717,22 @@ private:
     int m_length_ms = 10000;
     int m_keep_ms = 200;
 
-    // VAD parameters
+    // VAD parameters (for vad_simple - used to decide when to process audio in StreamWorkerVAD)
     bool m_use_vad = false;
     float m_vad_thold = 0.6f;
     float m_freq_thold = 100.0f;
+
+    // VAD parameters (for whisper built-in VAD - used for precise speech segmentation during transcription)
+    // Note: These two VAD methods can be used independently or together:
+    // - vad_simple (m_use_vad): Fast VAD to decide when to process audio chunks
+    // - whisper VAD (m_vad_model): Precise VAD for speech segmentation within chunks
+    std::string m_vad_model = "";
+    float m_vad_threshold = 0.5f;
+    int m_vad_min_speech_duration_ms = 250;
+    int m_vad_min_silence_duration_ms = 100;
+    float m_vad_max_speech_duration_s = FLT_MAX;
+    int m_vad_speech_pad_ms = 30;
+    float m_vad_samples_overlap = 0.1f;
 
     // Audio buffer and state
     std::deque<float> m_audio_buffer;
@@ -778,9 +790,19 @@ WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
     if (options.Has("step_ms") && options.Get("step_ms").IsNumber()) m_step_ms = options.Get("step_ms").As<Napi::Number>();
     if (options.Has("length_ms") && options.Get("length_ms").IsNumber()) m_length_ms = options.Get("length_ms").As<Napi::Number>();
     if (options.Has("keep_ms") && options.Get("keep_ms").IsNumber()) m_keep_ms = options.Get("keep_ms").As<Napi::Number>();
+    // VAD parameters (vad_simple)
     if (options.Has("use_vad") && options.Get("use_vad").IsBoolean()) m_use_vad = options.Get("use_vad").As<Napi::Boolean>();
     if (options.Has("vad_thold") && options.Get("vad_thold").IsNumber()) m_vad_thold = options.Get("vad_thold").As<Napi::Number>().FloatValue();
     if (options.Has("freq_thold") && options.Get("freq_thold").IsNumber()) m_freq_thold = options.Get("freq_thold").As<Napi::Number>().FloatValue();
+
+    // VAD parameters (whisper built-in VAD)
+    if (options.Has("vad_model") && options.Get("vad_model").IsString()) m_vad_model = options.Get("vad_model").As<Napi::String>();
+    if (options.Has("vad_threshold") && options.Get("vad_threshold").IsNumber()) m_vad_threshold = options.Get("vad_threshold").As<Napi::Number>().FloatValue();
+    if (options.Has("vad_min_speech_duration_ms") && options.Get("vad_min_speech_duration_ms").IsNumber()) m_vad_min_speech_duration_ms = options.Get("vad_min_speech_duration_ms").As<Napi::Number>();
+    if (options.Has("vad_min_silence_duration_ms") && options.Get("vad_min_silence_duration_ms").IsNumber()) m_vad_min_silence_duration_ms = options.Get("vad_min_silence_duration_ms").As<Napi::Number>();
+    if (options.Has("vad_max_speech_duration_s") && options.Get("vad_max_speech_duration_s").IsNumber()) m_vad_max_speech_duration_s = options.Get("vad_max_speech_duration_s").As<Napi::Number>().FloatValue();
+    if (options.Has("vad_speech_pad_ms") && options.Get("vad_speech_pad_ms").IsNumber()) m_vad_speech_pad_ms = options.Get("vad_speech_pad_ms").As<Napi::Number>();
+    if (options.Has("vad_samples_overlap") && options.Get("vad_samples_overlap").IsNumber()) m_vad_samples_overlap = options.Get("vad_samples_overlap").As<Napi::Number>().FloatValue();
     if (options.Has("tinydiarize") && options.Get("tinydiarize").IsBoolean()) m_tinydiarize = options.Get("tinydiarize").As<Napi::Boolean>();
     if (options.Has("max_tokens") && options.Get("max_tokens").IsNumber()) m_max_tokens = options.Get("max_tokens").As<Napi::Number>();
     if (options.Has("audio_ctx") && options.Get("audio_ctx").IsNumber()) m_audio_ctx = options.Get("audio_ctx").As<Napi::Number>();
@@ -960,6 +982,18 @@ void WhisperStream::StreamWorker() {
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
 
+    // VAD parameters (whisper built-in VAD)
+    if (!m_vad_model.empty()) {
+        m_wparams.vad = true;
+        m_wparams.vad_model_path = m_vad_model.c_str();
+        m_wparams.vad_params.threshold = m_vad_threshold;
+        m_wparams.vad_params.min_speech_duration_ms = m_vad_min_speech_duration_ms;
+        m_wparams.vad_params.min_silence_duration_ms = m_vad_min_silence_duration_ms;
+        m_wparams.vad_params.max_speech_duration_s = m_vad_max_speech_duration_s;
+        m_wparams.vad_params.speech_pad_ms = m_vad_speech_pad_ms;
+        m_wparams.vad_params.samples_overlap = m_vad_samples_overlap;
+    }
+
     const size_t n_samples_step = (m_step_ms * WHISPER_SAMPLE_RATE) / 1000;
     m_pcmf32_local.clear();
 
@@ -988,8 +1022,8 @@ void WhisperStream::StreamWorker() {
             m_pcmf32_local.insert(m_pcmf32_local.end(), m_audio_buffer.begin(), m_audio_buffer.end());
             m_audio_buffer.clear();
 
-            // If finishing and the source buffer is empty, this is the last run
-            if (is_finishing && m_audio_buffer.empty()) {
+            // If finishing, process all remaining audio and exit the loop
+            if (is_finishing) {
                 lock.unlock(); // Unlock before heavy processing
                 if (!m_pcmf32_local.empty()) {
                     m_current_callback_offset_samples = m_n_samples_processed;
@@ -997,7 +1031,7 @@ void WhisperStream::StreamWorker() {
                         fprintf(stderr, "whisper_full failed on final audio chunk (finish)\n");
                     }
                 }
-                break; // Exit loop after final processing
+                break; // Exit loop after processing all remaining audio
             }
         }
 
@@ -1036,6 +1070,18 @@ void WhisperStream::StreamWorkerVAD() {
     m_wparams.translate = m_translate;
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
+
+    // VAD parameters (whisper built-in VAD)
+    if (!m_vad_model.empty()) {
+        m_wparams.vad = true;
+        m_wparams.vad_model_path = m_vad_model.c_str();
+        m_wparams.vad_params.threshold = m_vad_threshold;
+        m_wparams.vad_params.min_speech_duration_ms = m_vad_min_speech_duration_ms;
+        m_wparams.vad_params.min_silence_duration_ms = m_vad_min_silence_duration_ms;
+        m_wparams.vad_params.max_speech_duration_s = m_vad_max_speech_duration_s;
+        m_wparams.vad_params.speech_pad_ms = m_vad_speech_pad_ms;
+        m_wparams.vad_params.samples_overlap = m_vad_samples_overlap;
+    }
 
     const int vad_window_ms = 2000;
     const int n_samples_vad_window = (vad_window_ms * WHISPER_SAMPLE_RATE) / 1000;
