@@ -16,7 +16,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
-#include <algorithm> 
+#include <algorithm>
+#include <memory> 
 
 // Helper function for UTF-8 fix
 std::string string_to_hex(const char* text) {
@@ -209,8 +210,15 @@ struct whisper_result {
 
 class ProgressWorker : public Napi::AsyncWorker {
 public:
+    // Abort flags - using shared_ptr to ensure they survive after worker destruction
+    // This is important for NonBlockingCall callbacks that may execute after worker is destroyed
+    std::shared_ptr<std::atomic<bool>> m_should_abort;
+    std::shared_ptr<std::atomic<bool>> m_was_aborted;
+
     ProgressWorker(Napi::Function& callback, whisper_params params, Napi::Function progress_callback, Napi::Env env)
-        : Napi::AsyncWorker(callback), params(params), env(env) {
+        : Napi::AsyncWorker(callback), params(params), env(env),
+          m_should_abort(std::make_shared<std::atomic<bool>>(false)),
+          m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
         if (!progress_callback.IsEmpty()) {
             tsfn = Napi::ThreadSafeFunction::New(
                 env,
@@ -265,17 +273,36 @@ public:
         Napi::Object final_res = Napi::Object::New(Env());
         final_res.Set("segments", segments_array);
         final_res.Set("language", Napi::String::New(Env(), result.language));
+        final_res.Set("aborted", Napi::Boolean::New(Env(), m_was_aborted->load()));
 
         Callback().Call({Env().Null(), final_res});
     }
 
     void OnProgress(int progress) {
-        if (tsfn) {
-            auto callback = [progress](Napi::Env env, Napi::Function jsCallback) {
-                jsCallback.Call({Napi::Number::New(env, progress)});
+        if (tsfn && !m_should_abort->load()) {
+            auto abort_flag = m_should_abort;
+            auto callback = [abort_flag, progress](Napi::Env env, Napi::Function jsCallback) {
+                try {
+                    Napi::Value result = jsCallback.Call({Napi::Number::New(env, progress)});
+                    // If callback returns false, signal abort
+                    if (result.IsBoolean() && !result.As<Napi::Boolean>().Value()) {
+                        abort_flag->store(true);
+                    }
+                } catch (...) {
+                    // Continue on error
+                }
             };
             tsfn.BlockingCall(callback);
         }
+    }
+
+    // Method to request abort from outside
+    void RequestAbort() {
+        m_should_abort->store(true);
+    }
+
+    bool ShouldAbort() const {
+        return m_should_abort->load();
     }
 
 private:
@@ -388,6 +415,17 @@ private:
                     static_cast<ProgressWorker*>(user_data)->OnProgress(progress);
                 };
                 wparams.progress_callback_user_data = this;
+
+                // Set up abort callback - returns true to abort when m_should_abort is set
+                wparams.abort_callback = [](void * user_data) -> bool {
+                    auto* worker = static_cast<ProgressWorker*>(user_data);
+                    if (worker->m_should_abort->load()) {
+                        worker->m_was_aborted->store(true);
+                        return true; // Return true to abort
+                    }
+                    return false;
+                };
+                wparams.abort_callback_user_data = this;
 
                 // VAD parameters
                 wparams.vad                           = params.vad;
