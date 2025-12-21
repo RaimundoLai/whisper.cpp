@@ -7,7 +7,7 @@
 [![Conan Center](https://shields.io/conan/v/whisper-cpp)](https://conan.io/center/whisper-cpp)
 [![npm](https://img.shields.io/npm/v/whisper.cpp.svg)](https://www.npmjs.com/package/whisper.cpp/)
 
-Stable: [v1.7.5](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.7.5) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
+Stable: [v1.8.1](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.8.1) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
 
 High-performance inference of [OpenAI's Whisper](https://github.com/openai/whisper) automatic speech recognition (ASR) model:
 
@@ -35,7 +35,7 @@ Supported platforms:
 - [x] [Java](bindings/java/README.md)
 - [x] Linux / [FreeBSD](https://github.com/ggml-org/whisper.cpp/issues/56#issuecomment-1350920264)
 - [x] [WebAssembly](examples/whisper.wasm)
-- [x] Windows ([MSVC](https://github.com/ggml-org/whisper.cpp/blob/master/.github/workflows/build.yml#L117-L144) and [MinGW](https://github.com/ggml-org/whisper.cpp/issues/168)]
+- [x] Windows ([MSVC](https://github.com/ggml-org/whisper.cpp/blob/master/.github/workflows/build.yml#L117-L144) and [MinGW](https://github.com/ggml-org/whisper.cpp/issues/168))
 - [x] [Raspberry Pi](https://github.com/ggml-org/whisper.cpp/discussions/166)
 - [x] [Docker](https://github.com/ggml-org/whisper.cpp/pkgs/container/whisper.cpp)
 
@@ -80,7 +80,7 @@ Now build the [whisper-cli](examples/cli) example and transcribe an audio file l
 ```bash
 # build the project
 cmake -B build
-cmake --build build --config Release
+cmake --build build -j --config Release
 
 # transcribe an audio file
 ./build/bin/whisper-cli -f samples/jfk.wav
@@ -149,7 +149,7 @@ standard cmake setup with:
 ```bash
 # build with GGML_BLAS defined
 cmake -B build -DGGML_BLAS=1
-cmake --build build --config Release
+cmake --build build -j --config Release
 ./build/bin/whisper-cli [ .. etc .. ]
 ```
 
@@ -163,7 +163,7 @@ Here are the steps for creating and using a quantized model:
 ```bash
 # quantize a model with Q5_0 method
 cmake -B build
-cmake --build build --config Release
+cmake --build build -j --config Release
 ./build/bin/quantize models/ggml-base.en.bin models/ggml-base.en-q5_0.bin q5_0
 
 # run the examples as usual, specifying the quantized model file
@@ -386,7 +386,7 @@ Run the inference examples as usual, for example:
 ## Moore Threads GPU support
 
 With Moore Threads cards the processing of the models is done efficiently on the GPU via muBLAS and custom MUSA kernels.
-First, make sure you have installed `MUSA SDK rc3.1.1`: https://developer.mthreads.com/sdk/download/musa?equipment=&os=&driverVersion=&version=rc3.1.1
+First, make sure you have installed `MUSA SDK rc4.2.0`: https://developer.mthreads.com/sdk/download/musa?equipment=&os=&driverVersion=&version=4.2.0
 
 Now build `whisper.cpp` with MUSA support:
 
@@ -489,7 +489,7 @@ You will need to have [sdl2](https://wiki.libsdl.org/SDL2/Installation) installe
 
 ```bash
 cmake -B build -DWHISPER_SDL2=ON
-cmake --build build --config Release
+cmake --build build -j --config Release
 ./build/bin/whisper-stream -m ./models/ggml-base.en.bin -t 8 --step 500 --length 5000
 ```
 
@@ -709,7 +709,9 @@ For more details, see the conversion script [models/convert-pt-to-ggml.py](model
 ## XCFramework
 The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
 and macOS. It can be used in Swift projects without the need to compile the
-library from source. For examples:
+library from source. For example, the v1.7.5 version of the XCFramework can be
+used as follows:
+
 ```swift
 // swift-tools-version: 5.10
 // The swift-tools-version declares the minimum version of Swift required to build this package.
@@ -733,7 +735,7 @@ let package = Package(
 )
 ```
 
-### Voice Activity Detection (VAD)
+## Voice Activity Detection (VAD)
 Support for Voice Activity Detection (VAD) can be enabled using the `--vad`
 argument to `whisper-cli`. In addition to this option a VAD model is also
 required.
@@ -747,11 +749,36 @@ transcription process.
 
 The following VAD models are currently supported:
 
-#### Silero-VAD
+### Silero-VAD
 [Silero-vad](https://github.com/snakers4/silero-vad) is a lightweight VAD model
 written in Python that is fast and accurate.
 
-This model can be converted to ggml using the following command:
+Models can be downloaded by running the following command on Linux or MacOS:
+```console
+$ ./models/download-vad-model.sh silero-v5.1.2
+Downloading ggml model silero-v5.1.2 from 'https://huggingface.co/ggml-org/whisper-vad' ...
+ggml-silero-v5.1.2.bin        100%[==============================================>] 864.35K  --.-KB/s    in 0.04s
+Done! Model 'silero-v5.1.2' saved in '/path/models/ggml-silero-v5.1.2.bin'
+You can now use it like this:
+
+  $ ./build/bin/whisper-cli -vm /path/models/ggml-silero-v5.1.2.bin --vad -f samples/jfk.wav -m models/ggml-base.en.bin
+
+```
+And the following command on Windows:
+```console
+> .\models\download-vad-model.cmd silero-v5.1.2
+Downloading vad model silero-v5.1.2...
+Done! Model silero-v5.1.2 saved in C:\Users\danie\work\ai\whisper.cpp\ggml-silero-v5.1.2.bin
+You can now use it like this:
+
+C:\path\build\bin\Release\whisper-cli.exe -vm C:\path\ggml-silero-v5.1.2.bin --vad -m models/ggml-base.en.bin -f samples\jfk.wav
+
+```
+
+To see a list of all available models, run the above commands without any
+arguments.
+
+This model can be also be converted manually to ggml using the following command:
 ```console
 $ python3 -m venv venv && source venv/bin/activate
 $ (venv) pip install silero-vad
@@ -767,7 +794,7 @@ $ ./build/bin/whisper-cli \
    --vad-model ./models/silero-v5.1.2-ggml.bin
 ```
 
-#### VAD Options
+### VAD Options
 
 * --vad-threshold: Threshold probability for speech detection. A probability
 for a speech segment/frame above this threshold will be considered as speech.

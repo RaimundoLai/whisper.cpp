@@ -15,6 +15,7 @@
 build/
 build-*/
 build_*/
+tmp/
 
 # SPM
 .build/
@@ -50,6 +51,8 @@ extra/bench-gg.txt
 models/*.mlmodel
 models/*.mlmodelc
 models/*.mlpackage
+models/*-encoder-openvino.xml
+models/*-encoder-openvino-cache/
 bindings/java/.gradle/
 bindings/java/.idea/
 .idea/
@@ -61,3 +64,4 @@ cmake-build-debug/
 local.properties
 .log
 .exe
+examples/whisper.wasm/dist
