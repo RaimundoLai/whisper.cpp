@@ -80,7 +80,6 @@ jobs:
           name: addon-${{ matrix.optimized }}.node
           path: artifacts/addon-${{ matrix.optimized }}.node
 
-  # CUDA 13.0.2 requires Visual Studio 2022
   windows-cuda-13:
     runs-on: windows-2022
     steps:
@@ -109,7 +108,6 @@ jobs:
         with:
           cuda: '13.0.2'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
 
       - name: Build
         shell: powershell
