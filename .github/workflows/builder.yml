@@ -13,16 +13,14 @@ jobs:
     runs-on: windows-2019
     strategy:
       matrix:
-        cuda_version: ['11.8.0', '12.4.1', '12.2.0', '13.0.2']
+        cuda_version: ['11.8.0', '12.2.0', '12.4.1']
         include:
           - cuda_version: '11.8.0'
             optimized: 'windows-cuda-1180'
-          - cuda_version: '12.4.1'
-            optimized: 'windows-cuda-1241'
           - cuda_version: '12.2.0'
             optimized: 'windows-cuda-1220'
-          - cuda_version: '13.0.2'
-            optimized: 'windows-cuda-1302'
+          - cuda_version: '12.4.1'
+            optimized: 'windows-cuda-1241'
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
@@ -81,6 +79,66 @@ jobs:
         with:
           name: addon-${{ matrix.optimized }}.node
           path: artifacts/addon-${{ matrix.optimized }}.node
+
+  # CUDA 13.0.2 requires Visual Studio 2022
+  windows-cuda-13:
+    runs-on: windows-2022
+    steps:
+      - name: Clone whisper.cpp repository
+        uses: actions/checkout@v4
+        with:
+          repository: RaimundoLai/whisper.cpp
+          branch: dev
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        run: |
+          choco install cmake -y
+          npm install -g cmake-js
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.29
+        id: cuda-toolkit
+        with:
+          cuda: '13.0.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Build
+        shell: powershell
+        run: |
+          cd examples/addon.node
+          npm install
+          cd ../../
+          $env:CUDA_PATH = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          $env:CUDA_TOOLKIT_ROOT_DIR = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          
+          $buildParams = @(
+            "--CDBUILD_SHARED_LIBS=OFF",
+            "--CDWHISPER_STATIC=ON",
+            "--CDGGML_CUDA=ON",
+            "--runtime=electron",
+            "--runtime-version=35.1.5",
+            "--arch=x64"
+          )
+          
+          npx cmake-js compile -T addon.node -B Release $buildParams
+          
+          mkdir -p artifacts
+          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-cuda-1302.node"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-windows-cuda-1302.node
+          path: artifacts/addon-windows-cuda-1302.node
 
   windows-vulkan:
     runs-on: windows-2019
@@ -445,7 +503,7 @@ jobs:
   # Release Job
   # =================================================================================================
   create-update-release:
-    needs: [windows-cuda, windows-vulkan, windows-no-cuda, macos-arm64, macos-intel, linux-cuda, linux-vulkan, linux-no-cuda]
+    needs: [windows-cuda, windows-cuda-13, windows-vulkan, windows-no-cuda, macos-arm64, macos-intel, linux-cuda, linux-vulkan, linux-no-cuda]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
