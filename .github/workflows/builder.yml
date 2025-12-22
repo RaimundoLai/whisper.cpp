@@ -44,7 +44,7 @@ jobs:
           npm install -g cmake-js
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.22
+        uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda_version }}
@@ -106,7 +106,6 @@ jobs:
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
-          vulkan_version: 1.4.313.2
           cache: true
       - name: Build
         run: |
@@ -235,7 +234,7 @@ jobs:
             artifacts/addon-macos-arm64-coreml.node
 
   macos-intel:
-    runs-on: macos-13
+    runs-on: macos-15-intel
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
@@ -314,7 +313,7 @@ jobs:
           npm install -g cmake-js
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.22
+        uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
         with:
           cuda: ${{ matrix.cuda_version }}
@@ -336,6 +335,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release \
             --CDBUILD_SHARED_LIBS=OFF \
             --CDWHISPER_STATIC=ON \
+            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --CDGGML_CUDA=ON \
             --runtime=electron \
             --runtime-version=35.1.5 \
@@ -373,7 +373,6 @@ jobs:
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
-          vulkan_version: 1.4.313.2
           cache: true
 
       - name: Build
@@ -385,6 +384,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release \
             --CDBUILD_SHARED_LIBS=OFF \
             --CDWHISPER_STATIC=ON \
+            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --CDGGML_VULKAN=ON \
             --runtime=electron \
             --runtime-version=35.1.5 \
@@ -428,6 +428,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release \
             --CDBUILD_SHARED_LIBS=OFF \
             --CDWHISPER_STATIC=ON \
+            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --runtime=electron \
             --runtime-version=35.1.5 \
             --arch=x64
