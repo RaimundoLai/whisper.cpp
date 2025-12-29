@@ -2,6 +2,7 @@
 #include "common.h"
 #include "common-whisper.h"
 #include "whisper.h"
+#include "sense-voice.h"
 
 #include <string>
 #include <thread>
@@ -1188,12 +1189,24 @@ void WhisperStream::StreamWorkerVAD() {
         });
     }
 }
+
+// ============================================================================
+// SenseVoice ASR Implementation (in separate file)
+// ============================================================================
+
+#include "sense-voice-addon.cpp"
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
         Napi::String::New(env, "whisper"),
         Napi::Function::New(env, whisper)
     );
+    exports.Set(
+        Napi::String::New(env, "senseVoice"),
+        Napi::Function::New(env, senseVoice)
+    );
     WhisperStream::Init(env, exports);
+    SenseVoiceStream::Init(env, exports);
     return exports;
 }
 

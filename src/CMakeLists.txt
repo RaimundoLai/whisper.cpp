@@ -100,12 +100,25 @@ if (WHISPER_OPENVINO)
     set_target_properties(${TARGET} PROPERTIES FOLDER "libs")
 endif()
 
+# sense-voice sources (from SenseVoice.cpp submodule)
+set(SENSE_VOICE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third-party/SenseVoice.cpp/sense-voice/csrc)
+set(SENSE_VOICE_SOURCES
+    ${SENSE_VOICE_DIR}/common.cc
+    ${SENSE_VOICE_DIR}/sense-voice.cc
+    ${SENSE_VOICE_DIR}/sense-voice-encoder.cc
+    ${SENSE_VOICE_DIR}/sense-voice-decoder.cc
+    ${SENSE_VOICE_DIR}/sense-voice-frontend.cc
+    ${SENSE_VOICE_DIR}/silero-vad.cc
+    ${SENSE_VOICE_DIR}/fftsg.cc
+)
+
 # whisper
 
 add_library(whisper
             ../include/whisper.h
             whisper-arch.h
             whisper.cpp
+            ${SENSE_VOICE_SOURCES}
             )
 
 # Set the version numbers
@@ -114,7 +127,7 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include)
+target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR})
 target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
