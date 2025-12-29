@@ -1,0 +1,4 @@
+[submodule "third-party/SenseVoice.cpp"]
+	path = third-party/SenseVoice.cpp
+	url = git@github.com:RaimundoLai/SenseVoice.cpp.git
+	branch = dev
