@@ -373,7 +373,7 @@ public:
         sense_voice_full_params wparams = sense_voice_full_default_params(strategy);
         wparams.language = m_language.c_str();
         wparams.n_threads = m_n_threads;
-        wparams.debug_mode = false;
+        wparams.debug_mode = m_debug;
         wparams.beam_search.beam_size = m_beam_size;
 
         const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
