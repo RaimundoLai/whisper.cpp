@@ -262,6 +262,10 @@ void sense_voice_free(struct sense_voice_context * ctx) {
 
 class SenseVoiceWorker : public Napi::AsyncWorker {
 public:
+    // Abort flags - using shared_ptr to ensure they survive after worker destruction
+    std::shared_ptr<std::atomic<bool>> m_should_abort;
+    std::shared_ptr<std::atomic<bool>> m_was_aborted;
+
     SenseVoiceWorker(Napi::Function& callback, 
                      std::string model_path,
                      std::string vad_model_path,
@@ -279,7 +283,9 @@ public:
                      int speech_pad_ms,
                      bool use_beam_search,
                      int beam_size,
-                     bool debug)
+                     bool debug,
+                     Napi::Function progress_callback,
+                     Napi::Env env)
         : Napi::AsyncWorker(callback),
           m_model_path(model_path),
           m_vad_model_path(vad_model_path), 
@@ -297,7 +303,47 @@ public:
           m_speech_pad_ms(speech_pad_ms),
           m_use_beam_search(use_beam_search),
           m_beam_size(beam_size),
-          m_debug(debug) {}
+          m_debug(debug),
+          m_should_abort(std::make_shared<std::atomic<bool>>(false)),
+          m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
+        if (!progress_callback.IsEmpty()) {
+            m_tsfn = Napi::ThreadSafeFunction::New(
+                env,
+                progress_callback,
+                "SenseVoice Progress Callback",
+                0,
+                1
+            );
+        }
+    }
+
+    ~SenseVoiceWorker() {
+        if (m_tsfn) {
+            m_tsfn.Release();
+        }
+    }
+
+    void OnProgress(int progress) {
+        if (m_tsfn && !m_should_abort->load()) {
+            auto abort_flag = m_should_abort;
+            auto callback = [abort_flag, progress](Napi::Env env, Napi::Function jsCallback) {
+                try {
+                    Napi::Value result = jsCallback.Call({Napi::Number::New(env, progress)});
+                    // If callback returns false, signal abort
+                    if (result.IsBoolean() && !result.As<Napi::Boolean>().Value()) {
+                        abort_flag->store(true);
+                    }
+                } catch (...) {
+                    // Continue on error
+                }
+            };
+            m_tsfn.BlockingCall(callback);
+        }
+    }
+
+    bool ShouldAbort() const {
+        return m_should_abort->load();
+    }
 
     void Execute() override {
         // Initialize SenseVoice context
@@ -375,6 +421,14 @@ public:
                 const int64_t max_samples_per_chunk = (static_cast<int64_t>(m_max_speech_duration_ms) * sample_rate) / 1000;
                 
                 for (int i = 0; i < n_segments; i++) {
+                    // Check for abort before processing segment
+                    if (ShouldAbort()) {
+                        m_was_aborted->store(true);
+                        whisper_vad_free_segments(segments);
+                        whisper_vad_free(vctx);
+                        sense_voice_free(ctx);
+                        return;
+                    }
                     // Note: whisper_vad_segments_get_segment_t0/t1 returns centiseconds (values * 100)
                     // We need to divide by 100 to get actual seconds
                     float t0 = whisper_vad_segments_get_segment_t0(segments, i) / 100.0f;
@@ -519,6 +573,17 @@ public:
                         }
                         
                         chunk_start = chunk_end;
+                        
+                        // Report progress and check for abort
+                        int progress = static_cast<int>((chunk_end * 100) / n_samples);
+                        OnProgress(progress);
+                        if (ShouldAbort()) {
+                            m_was_aborted->store(true);
+                            whisper_vad_free_segments(segments);
+                            whisper_vad_free(vctx);
+                            sense_voice_free(ctx);
+                            return;
+                        }
                     }
                 }
 
@@ -636,6 +701,9 @@ public:
                 }
 
                 m_result.full_text = segment_text;
+                
+                // Report 100% progress for non-VAD path
+                OnProgress(100);
             }
         }
 
@@ -690,6 +758,7 @@ public:
             segments[i] = seg;
         }
         result.Set("segments", segments);
+        result.Set("aborted", Napi::Boolean::New(Env(), m_was_aborted->load()));
 
         Callback().Call({Env().Null(), result});
     }
@@ -713,6 +782,7 @@ private:
     int m_beam_size;
     bool m_debug = false;  // Debug logging flag
     sense_voice_addon_result m_result;
+    Napi::ThreadSafeFunction m_tsfn;  // Thread-safe function for progress callback
 };
 
 Napi::Value senseVoice(const Napi::CallbackInfo& info) {
@@ -844,13 +914,19 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         debug = options.Get("debug").As<Napi::Boolean>();
     }
 
+    // Progress callback (optional)
+    Napi::Function progress_callback;
+    if (options.Has("progress_callback") && options.Get("progress_callback").IsFunction()) {
+        progress_callback = options.Get("progress_callback").As<Napi::Function>();
+    }
+
     Napi::Function callback = info[1].As<Napi::Function>();
     SenseVoiceWorker* worker = new SenseVoiceWorker(
         callback, model_path, vad_model_path, language, std::move(pcmf32),
         use_gpu, flash_attn, n_threads, use_itn, use_prefix,
         vad_threshold,
         min_speech_duration_ms, max_speech_duration_ms, min_silence_duration_ms, speech_pad_ms,
-        use_beam_search, beam_size, debug);
+        use_beam_search, beam_size, debug, progress_callback, env);
     worker->Queue();
 
     return env.Undefined();
@@ -872,10 +948,12 @@ private:
     Napi::Value AddAudio(const Napi::CallbackInfo& info);
     Napi::Value Stop(const Napi::CallbackInfo& info);
     Napi::Value Finish(const Napi::CallbackInfo& info);
+    Napi::Value Pause(const Napi::CallbackInfo& info);
+    Napi::Value Resume(const Napi::CallbackInfo& info);
 
     // Worker thread
     void StreamWorker();
-    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio);
+    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms);
     std::string ExtractText(sense_voice_context* ctx, bool use_prefix);
 
     // SenseVoice context
@@ -907,7 +985,8 @@ private:
     // Audio buffer and state
     std::deque<float> m_audio_buffer;
     std::vector<double> m_pcmf32_local;
-    int64_t m_n_samples_processed = 0;
+    int64_t m_n_samples_processed = 0;      // Samples sent to model (for internal use)
+    int64_t m_n_total_samples_received = 0; // Total samples received (for timeline)
 
     std::thread m_worker_thread;
     std::atomic<StreamState> m_state;
@@ -931,6 +1010,8 @@ Napi::Object SenseVoiceStream::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("addAudio", &SenseVoiceStream::AddAudio),
         InstanceMethod("stop", &SenseVoiceStream::Stop),
         InstanceMethod("finish", &SenseVoiceStream::Finish),
+        InstanceMethod("pause", &SenseVoiceStream::Pause),
+        InstanceMethod("resume", &SenseVoiceStream::Resume),
     });
     exports.Set("SenseVoiceStream", func);
     return exports;
@@ -1131,6 +1212,21 @@ Napi::Value SenseVoiceStream::Finish(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+Napi::Value SenseVoiceStream::Pause(const Napi::CallbackInfo& info) {
+    if (m_state.load() == StreamState::RUNNING) {
+        m_state = StreamState::PAUSED;
+    }
+    return info.Env().Undefined();
+}
+
+Napi::Value SenseVoiceStream::Resume(const Napi::CallbackInfo& info) {
+    if (m_state.load() == StreamState::PAUSED) {
+        m_state = StreamState::RUNNING;
+        m_cv.notify_one();
+    }
+    return info.Env().Undefined();
+}
+
 std::string SenseVoiceStream::ExtractText(sense_voice_context* ctx, bool use_prefix) {
     std::string result_text;
     size_t start_idx = use_prefix ? 0 : 4;
@@ -1168,37 +1264,50 @@ void SenseVoiceStream::StreamWorker() {
     bool in_speech = false;
     int silence_chunk_count = 0;
     int speech_chunk_count = 0;
+    int64_t speech_start_sample = 0;  // Track when speech started (in total samples received)
+    
+    // Reset total samples counter for timeline
+    m_n_total_samples_received = 0;
+    
+    // Accumulated samples buffer (persists across loop iterations)
+    std::vector<double> accumulated_samples;
     
     while (true) {
         bool is_finishing = false;
-        std::vector<double> new_samples;
         
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [this] {
                 StreamState s = m_state.load();
-                return s == StreamState::STOPPING || s == StreamState::FINISHING || !m_audio_buffer.empty();
+                // When PAUSED, wait until RUNNING/STOPPING/FINISHING
+                return s == StreamState::STOPPING || 
+                       s == StreamState::FINISHING || 
+                       (s == StreamState::RUNNING && !m_audio_buffer.empty());
             });
 
             StreamState current_state = m_state.load();
             if (current_state == StreamState::STOPPING) {
                 break;
             }
+            if (current_state == StreamState::PAUSED) {
+                continue; // Skip this iteration, wait again
+            }
             is_finishing = (current_state == StreamState::FINISHING);
             
-            // Convert float to double and scale
+            // Append new samples to accumulated buffer (convert float to double)
             for (float sample : m_audio_buffer) {
-                new_samples.push_back(static_cast<double>(sample));
+                accumulated_samples.push_back(static_cast<double>(sample));
             }
             m_audio_buffer.clear();
         }
 
-        // Process new samples in chunks using Silero VAD
-        for (size_t i = 0; i + chunk_samples <= new_samples.size(); i += chunk_samples) {
+        // Process accumulated samples in chunks using Silero VAD
+        size_t processed_samples = 0;
+        for (size_t i = 0; i + chunk_samples <= accumulated_samples.size(); i += chunk_samples) {
             // Prepare float chunk for VAD
             std::vector<float> vad_chunk(chunk_samples);
             for (int j = 0; j < chunk_samples; j++) {
-                vad_chunk[j] = static_cast<float>(new_samples[i + j]);
+                vad_chunk[j] = static_cast<float>(accumulated_samples[i + j]);
             }
             
             // VAD detection (if enabled)
@@ -1232,9 +1341,13 @@ void SenseVoiceStream::StreamWorker() {
             }
             
             if (is_speech) {
+                // Track when speech starts
+                if (!in_speech) {
+                    speech_start_sample = m_n_total_samples_received + static_cast<int64_t>(i);
+                }
                 // Append speech chunk
                 for (int j = 0; j < chunk_samples; j++) {
-                    speech_buffer.push_back(new_samples[i + j] * 32768.0);  // Scale for model
+                    speech_buffer.push_back(accumulated_samples[i + j] * 32768.0);  // Scale for model
                 }
                 in_speech = true;
                 silence_chunk_count = 0;
@@ -1246,7 +1359,7 @@ void SenseVoiceStream::StreamWorker() {
                 // Include some silence for natural boundaries
                 if (silence_chunk_count <= min_silence_chunks) {
                     for (int j = 0; j < chunk_samples; j++) {
-                        speech_buffer.push_back(new_samples[i + j] * 32768.0);
+                        speech_buffer.push_back(accumulated_samples[i + j] * 32768.0);
                     }
                 }
                 
@@ -1254,37 +1367,57 @@ void SenseVoiceStream::StreamWorker() {
                 if (silence_chunk_count > min_silence_chunks) {
                     in_speech = false;
                     
+                    // Calculate timestamps
+                    int64_t speech_end_sample = m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples;
+                    int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
+                    int64_t end_time_ms = (speech_end_sample * 1000) / sample_rate;
+                    
                     // Process accumulated speech
                     if (!speech_buffer.empty()) {
-                        processAndOutput(wparams, speech_buffer);
+                        processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
                     }
                     speech_buffer.clear();
                     speech_chunk_count = 0;
                 }
             }
             // Skip silent chunks when not in speech (don't accumulate)
+            processed_samples = i + chunk_samples;
         }
         
-        // Handle remaining samples
-        size_t remaining = new_samples.size() % chunk_samples;
-        if (remaining > 0 && in_speech) {
-            for (size_t i = new_samples.size() - remaining; i < new_samples.size(); i++) {
-                speech_buffer.push_back(new_samples[i] * 32768.0);
-            }
+        // Remove processed samples from accumulator, keep remaining
+        if (processed_samples > 0) {
+            // Update total samples received counter for timeline
+            m_n_total_samples_received += processed_samples;
+            accumulated_samples.erase(accumulated_samples.begin(), accumulated_samples.begin() + processed_samples);
         }
         
         // Force process if max chunks exceeded
         if (speech_chunk_count >= max_speech_chunks) {
-            processAndOutput(wparams, speech_buffer);
+            // Calculate timestamps for forced processing
+            int64_t current_sample = m_n_total_samples_received;
+            int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
+            int64_t end_time_ms = (current_sample * 1000) / sample_rate;
+            
+            processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
             speech_buffer.clear();
             speech_chunk_count = 0;
+            speech_start_sample = current_sample;  // Reset for next speech segment
             in_speech = false;
         }
         
         if (is_finishing) {
+            // Add any remaining accumulated samples to speech buffer
+            for (size_t i = 0; i < accumulated_samples.size(); i++) {
+                speech_buffer.push_back(accumulated_samples[i] * 32768.0);
+            }
+            // Calculate final timestamps
+            int64_t final_sample = m_n_total_samples_received + static_cast<int64_t>(accumulated_samples.size());
+            int64_t start_time_ms = in_speech ? (speech_start_sample * 1000) / sample_rate : (m_n_total_samples_received * 1000) / sample_rate;
+            int64_t end_time_ms = (final_sample * 1000) / sample_rate;
+            
             // Process any remaining speech
             if (!speech_buffer.empty()) {
-                processAndOutput(wparams, speech_buffer);
+                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
             }
             break;
         }
@@ -1300,7 +1433,7 @@ void SenseVoiceStream::StreamWorker() {
     }
 }
 
-void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio) {
+void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms) {
     const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
     
     // Safety check
@@ -1338,43 +1471,41 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                 }
             }
             
-            // Compute token timestamps from state.ids
+            // Compute token timestamps using passed time range
             std::vector<std::tuple<int64_t, int64_t, std::string>> token_data;
-            int64_t base_offset = (m_n_samples_processed * 1000) / sample_rate;
+            int64_t segment_duration_ms = end_time_ms - start_time_ms;
             
             if (m_ctx->state->ids.size() > 4) {
-                int prev_id = 0;
-                size_t token_start_idx = 4;
-                const int frame_stride_ms = 60;  // LFR=6 * 10ms frame shift
-                
+                // Count valid tokens for uniform timestamp distribution
+                size_t n_valid_tokens = 0;
+                int prev_id = -1;
                 for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
-                    int cur_id = m_ctx->state->ids[i];
-                    if (cur_id != prev_id) {
-                        if (prev_id != 0) {
-                            int64_t t0 = base_offset + (int64_t)(token_start_idx - 4) * frame_stride_ms;
-                            int64_t t1 = base_offset + (int64_t)(i - 4) * frame_stride_ms;
-                            auto it = m_ctx->vocab.id_to_token.find(prev_id);
-                            std::string tok_text = (it != m_ctx->vocab.id_to_token.end()) ? it->second : "";
-                            token_data.push_back(std::make_tuple(t0, t1, tok_text));
-                        }
-                        if (cur_id != 0) token_start_idx = i;
+                    int id = m_ctx->state->ids[i];
+                    if (id != 0 && id != prev_id) {
+                        n_valid_tokens++;
                     }
-                    if (cur_id != 0) prev_id = cur_id; else prev_id = 0;
+                    prev_id = id;
                 }
-                if (prev_id != 0) {
-                    int64_t t0 = base_offset + (int64_t)(token_start_idx - 4) * 60;
-                    int64_t t1 = base_offset + (int64_t)(m_ctx->state->ids.size() - 4) * 60;
-                    auto it = m_ctx->vocab.id_to_token.find(prev_id);
-                    std::string tok_text = (it != m_ctx->vocab.id_to_token.end()) ? it->second : "";
-                    token_data.push_back(std::make_tuple(t0, t1, tok_text));
+                
+                // Extract tokens with estimated timestamps (uniform distribution)
+                size_t token_idx = 0;
+                prev_id = -1;
+                for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
+                    int id = m_ctx->state->ids[i];
+                    if (id != 0 && id != prev_id) {
+                        int64_t t0 = start_time_ms + (segment_duration_ms * token_idx) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
+                        int64_t t1 = start_time_ms + (segment_duration_ms * (token_idx + 1)) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
+                        auto it = m_ctx->vocab.id_to_token.find(id);
+                        std::string tok_text = (it != m_ctx->vocab.id_to_token.end()) ? it->second : "";
+                        token_data.push_back(std::make_tuple(t0, t1, tok_text));
+                        token_idx++;
+                    }
+                    prev_id = id;
                 }
             }
             
             if (!text_str.empty() && m_tsfn_callback) {
-                int64_t start_ms = (m_n_samples_processed * 1000) / sample_rate;
-                int64_t end_ms = start_ms + (audio.size() * 1000) / sample_rate;
-                
-                auto callback_data = std::make_tuple(start_ms, end_ms, text_str, lang_str, emo_str, evt_str, token_data);
+                auto callback_data = std::make_tuple(start_time_ms, end_time_ms, text_str, lang_str, emo_str, evt_str, token_data);
                 m_tsfn_callback.BlockingCall([callback_data](Napi::Env env, Napi::Function jsCallback) {
                     Napi::Object result = Napi::Object::New(env);
                     result.Set("type", "segment");
