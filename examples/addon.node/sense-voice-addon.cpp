@@ -1257,7 +1257,7 @@ void SenseVoiceStream::StreamWorker() {
     sense_voice_full_params wparams = sense_voice_full_default_params(SENSE_VOICE_SAMPLING_GREEDY);
     wparams.language = m_language.c_str();
     wparams.n_threads = m_n_threads;
-    wparams.debug_mode = false;
+    wparams.debug_mode = m_debug;
     
     m_pcmf32_local.clear();
     std::vector<double> speech_buffer;  // Only accumulate speech chunks
