@@ -2,3 +2,6 @@
 	path = third-party/SenseVoice.cpp
 	url = git@github.com:RaimundoLai/SenseVoice.cpp.git
 	branch = dev
+[submodule "third-party/tokenizers-cpp"]
+	path = third-party/tokenizers-cpp
+	url = https://github.com/RaimundoLai/tokenizers-cpp

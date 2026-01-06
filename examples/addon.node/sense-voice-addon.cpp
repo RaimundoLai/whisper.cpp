@@ -267,43 +267,26 @@ public:
     std::shared_ptr<std::atomic<bool>> m_was_aborted;
 
     SenseVoiceWorker(Napi::Function& callback, 
-                     std::string model_path,
-                     std::string vad_model_path,
-                     std::string language,
-                     std::vector<double> pcmf32,
-                     bool use_gpu,
-                     bool flash_attn,
-                     int n_threads,
-                     bool use_itn,
-                     bool use_prefix,
-                     float vad_threshold,
-                     int min_speech_duration_ms,
-                     int max_speech_duration_ms,
-                     int min_silence_duration_ms,
-                     int speech_pad_ms,
-                     bool use_beam_search,
-                     int beam_size,
-                     bool debug,
-                     Napi::Function progress_callback,
-                     Napi::Env env)
-        : Napi::AsyncWorker(callback),
-          m_model_path(model_path),
-          m_vad_model_path(vad_model_path), 
-          m_language(language),
-          m_pcmf32(std::move(pcmf32)),
-          m_use_gpu(use_gpu),
-          m_flash_attn(flash_attn),
-          m_n_threads(n_threads),
-          m_use_itn(use_itn),
-          m_use_prefix(use_prefix),
+        std::string model_path, std::string tokenizer_path, std::string vad_model_path,
+        std::string language, std::vector<double> pcmf32,
+        bool use_gpu, bool flash_attn, int n_threads, bool use_itn, bool use_prefix,
+        float vad_threshold,
+        int min_speech_duration_ms, int max_speech_duration_ms,
+        int min_silence_duration_ms, int speech_pad_ms,
+        bool use_beam_search, int beam_size, bool debug,
+        std::vector<std::string> hotwords, float hotwords_score,
+        Napi::Function progress_callback, Napi::Env env)
+        : Napi::AsyncWorker(callback), 
+          m_model_path(model_path), m_tokenizer_path(tokenizer_path), m_vad_model_path(vad_model_path),
+          m_language(language), m_pcmf32(std::move(pcmf32)), 
+          m_use_gpu(use_gpu), m_flash_attn(flash_attn), m_n_threads(n_threads), 
+          m_use_itn(use_itn), m_use_prefix(use_prefix),
           m_vad_threshold(vad_threshold),
-          m_min_speech_duration_ms(min_speech_duration_ms),
-          m_max_speech_duration_ms(max_speech_duration_ms),
-          m_min_silence_duration_ms(min_silence_duration_ms),
-          m_speech_pad_ms(speech_pad_ms),
-          m_use_beam_search(use_beam_search),
-          m_beam_size(beam_size),
+          m_min_speech_duration_ms(min_speech_duration_ms), m_max_speech_duration_ms(max_speech_duration_ms),
+          m_min_silence_duration_ms(min_silence_duration_ms), m_speech_pad_ms(speech_pad_ms),
+          m_use_beam_search(use_beam_search), m_beam_size(beam_size),
           m_debug(debug),
+          m_hotwords(std::move(hotwords)), m_hotwords_score(hotwords_score),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
         if (!progress_callback.IsEmpty()) {
@@ -351,6 +334,7 @@ public:
         cparams.use_gpu = m_use_gpu;
         cparams.use_itn = m_use_itn;
         cparams.flash_attn = m_flash_attn;
+        cparams.tokenizer_path = m_tokenizer_path.c_str();
 
         struct sense_voice_context* ctx = sense_voice_small_init_from_file_with_params(
             m_model_path.c_str(), cparams);
@@ -375,6 +359,19 @@ public:
         wparams.n_threads = m_n_threads;
         wparams.debug_mode = m_debug;
         wparams.beam_search.beam_size = m_beam_size;
+        
+        // Hot words biasing configuration
+        // Convert vector<string> to const char** for hotwords
+        std::vector<const char*> hotwords_ptrs;
+        if (!m_hotwords.empty()) {
+            hotwords_ptrs.reserve(m_hotwords.size());
+            for (const auto& hw : m_hotwords) {
+                hotwords_ptrs.push_back(hw.c_str());
+            }
+            wparams.hotwords = hotwords_ptrs.data();
+            wparams.n_hotwords = static_cast<int>(m_hotwords.size());
+        }
+        wparams.hotwords_score = m_hotwords_score;
 
         const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
         std::string full_text;
@@ -765,6 +762,7 @@ public:
 
 private:
     std::string m_model_path;
+    std::string m_tokenizer_path;
     std::string m_vad_model_path;
     std::string m_language;
     std::vector<double> m_pcmf32;
@@ -781,6 +779,8 @@ private:
     bool m_use_beam_search;
     int m_beam_size;
     bool m_debug = false;  // Debug logging flag
+    std::vector<std::string> m_hotwords;  // Hot words for biasing
+    float m_hotwords_score = 1.0f;  // Hot words log probability bonus
     sense_voice_addon_result m_result;
     Napi::ThreadSafeFunction m_tsfn;  // Thread-safe function for progress callback
 };
@@ -801,6 +801,12 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
     std::string model_path = options.Get("model").As<Napi::String>();
+
+    // Optional: tokenizer path
+    std::string tokenizer_path = "";
+    if (options.Has("tokenizer") && options.Get("tokenizer").IsString()) {
+        tokenizer_path = options.Get("tokenizer").As<Napi::String>();
+    }
 
     // Audio input: either pcmf32 (Float32Array) or file (string path to WAV file)
     std::vector<double> pcmf32;
@@ -914,6 +920,22 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         debug = options.Get("debug").As<Napi::Boolean>();
     }
 
+    // Hot words biasing parameters
+    std::vector<std::string> hotwords;
+    if (options.Has("hotwords") && options.Get("hotwords").IsArray()) {
+        Napi::Array hotwords_arr = options.Get("hotwords").As<Napi::Array>();
+        for (uint32_t i = 0; i < hotwords_arr.Length(); i++) {
+            if (hotwords_arr.Get(i).IsString()) {
+                hotwords.push_back(hotwords_arr.Get(i).As<Napi::String>());
+            }
+        }
+    }
+
+    float hotwords_score = 3.0f;
+    if (options.Has("hotwords_score") && options.Get("hotwords_score").IsNumber()) {
+        hotwords_score = options.Get("hotwords_score").As<Napi::Number>().FloatValue();
+    }
+
     // Progress callback (optional)
     Napi::Function progress_callback;
     if (options.Has("progress_callback") && options.Get("progress_callback").IsFunction()) {
@@ -922,11 +944,13 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
 
     Napi::Function callback = info[1].As<Napi::Function>();
     SenseVoiceWorker* worker = new SenseVoiceWorker(
-        callback, model_path, vad_model_path, language, std::move(pcmf32),
+        callback, model_path, tokenizer_path, vad_model_path, language, std::move(pcmf32),
         use_gpu, flash_attn, n_threads, use_itn, use_prefix,
         vad_threshold,
         min_speech_duration_ms, max_speech_duration_ms, min_silence_duration_ms, speech_pad_ms,
-        use_beam_search, beam_size, debug, progress_callback, env);
+        use_beam_search, beam_size, debug,
+        std::move(hotwords), hotwords_score,
+        progress_callback, env);
     worker->Queue();
 
     return env.Undefined();
@@ -961,6 +985,7 @@ private:
 
     // Configuration
     std::string m_model_path;
+    std::string m_tokenizer_path;
     std::string m_language;
     int m_n_threads = 4;
     bool m_use_gpu = true;
@@ -1001,6 +1026,12 @@ private:
     
     // Debug logging flag
     bool m_debug = false;
+    
+    // Hot words biasing parameters
+    std::vector<std::string> m_hotwords;  // Hot words for biasing
+    float m_hotwords_score = 3.0f;  // Hot words log probability bonus (higher = stronger bias)
+    bool m_use_beam_search = false;  // Whether to use beam search (required for hot words)
+    int m_beam_size = 3;  // Beam size for beam search
 };
 
 Napi::Object SenseVoiceStream::Init(Napi::Env env, Napi::Object exports) {
@@ -1033,6 +1064,12 @@ SenseVoiceStream::SenseVoiceStream(const Napi::CallbackInfo& info)
     } else {
         Napi::TypeError::New(env, "Constructor options must include a 'model' path").ThrowAsJavaScriptException();
         return;
+        return;
+    }
+    
+    // Tokenizer path
+    if (options.Has("tokenizer") && options.Get("tokenizer").IsString()) {
+        m_tokenizer_path = options.Get("tokenizer").As<Napi::String>();
     }
     
     // Language
@@ -1076,6 +1113,25 @@ SenseVoiceStream::SenseVoiceStream(const Napi::CallbackInfo& info)
     // Debug logging flag
     if (options.Has("debug") && options.Get("debug").IsBoolean()) 
         m_debug = options.Get("debug").As<Napi::Boolean>();
+    
+    // Hot words biasing parameters
+    if (options.Has("hotwords") && options.Get("hotwords").IsArray()) {
+        Napi::Array hotwords_arr = options.Get("hotwords").As<Napi::Array>();
+        for (uint32_t i = 0; i < hotwords_arr.Length(); i++) {
+            if (hotwords_arr.Get(i).IsString()) {
+                m_hotwords.push_back(hotwords_arr.Get(i).As<Napi::String>());
+            }
+        }
+    }
+    
+    if (options.Has("hotwords_score") && options.Get("hotwords_score").IsNumber())
+        m_hotwords_score = options.Get("hotwords_score").As<Napi::Number>().FloatValue();
+    
+    if (options.Has("use_beam_search") && options.Get("use_beam_search").IsBoolean())
+        m_use_beam_search = options.Get("use_beam_search").As<Napi::Boolean>();
+    
+    if (options.Has("beam_size") && options.Get("beam_size").IsNumber())
+        m_beam_size = options.Get("beam_size").As<Napi::Number>().Int32Value();
 }
 
 SenseVoiceStream::~SenseVoiceStream() {
@@ -1115,6 +1171,7 @@ Napi::Value SenseVoiceStream::Start(const Napi::CallbackInfo& info) {
     cparams.use_gpu = m_use_gpu;
     cparams.use_itn = m_use_itn;
     cparams.flash_attn = m_flash_attn;
+    cparams.tokenizer_path = m_tokenizer_path;
     
     m_ctx = sense_voice_small_init_from_file_with_params(m_model_path.c_str(), cparams);
     if (!m_ctx) {
@@ -1254,10 +1311,29 @@ void SenseVoiceStream::StreamWorker() {
     const int min_silence_chunks = m_min_mute_chunks;   // min silent chunks to end speech
     // Note: m_vad_threshold is used with Silero VAD (speech probability comparison)
     
-    sense_voice_full_params wparams = sense_voice_full_default_params(SENSE_VOICE_SAMPLING_GREEDY);
+    sense_voice_decoding_strategy strategy = m_use_beam_search ? 
+        SENSE_VOICE_SAMPLING_BEAM_SEARCH : SENSE_VOICE_SAMPLING_GREEDY;
+    sense_voice_full_params wparams = sense_voice_full_default_params(strategy);
     wparams.language = m_language.c_str();
     wparams.n_threads = m_n_threads;
     wparams.debug_mode = m_debug;
+    
+    // Beam search config
+    if (m_use_beam_search) {
+        wparams.beam_search.beam_size = m_beam_size;
+    }
+    
+    // Hot words biasing configuration
+    std::vector<const char*> hotwords_ptrs;
+    if (!m_hotwords.empty()) {
+        hotwords_ptrs.reserve(m_hotwords.size());
+        for (const auto& hw : m_hotwords) {
+            hotwords_ptrs.push_back(hw.c_str());
+        }
+        wparams.hotwords = hotwords_ptrs.data();
+        wparams.n_hotwords = static_cast<int>(m_hotwords.size());
+    }
+    wparams.hotwords_score = m_hotwords_score;
     
     m_pcmf32_local.clear();
     std::vector<double> speech_buffer;  // Only accumulate speech chunks
