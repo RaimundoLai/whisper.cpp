@@ -140,6 +140,16 @@ endif()
 
 target_link_libraries(whisper PUBLIC ggml)
 
+# Add tokenizers-cpp for SenseVoice support
+set(TOKENIZERS_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third-party/tokenizers-cpp")
+if(EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
+    if (NOT TARGET tokenizers_cpp)
+        add_subdirectory("${TOKENIZERS_CPP_DIR}" tokenizers_cpp)
+    endif()
+    target_link_libraries(whisper PUBLIC tokenizers_cpp)
+    target_compile_definitions(whisper PRIVATE HAVE_TOKENIZERS_CPP)
+endif()
+
 if (WHISPER_COREML)
     target_link_libraries(whisper PRIVATE whisper.coreml)
 endif()

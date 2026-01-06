@@ -793,6 +793,7 @@ private:
     bool m_translate = false;
     bool m_single_segment = false;
     bool m_no_timestamps = false;
+    std::string m_prompt;
 };
 
 // --- Implementation of WhisperStream Methods ---
@@ -848,6 +849,9 @@ WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
     if (options.Has("translate") && options.Get("translate").IsBoolean()) m_translate = options.Get("translate").As<Napi::Boolean>();
     if (options.Has("single_segment") && options.Get("single_segment").IsBoolean()) m_single_segment = options.Get("single_segment").As<Napi::Boolean>();
     if (options.Has("no_timestamps") && options.Get("no_timestamps").IsBoolean()) m_no_timestamps = options.Get("no_timestamps").As<Napi::Boolean>();
+    // Initial prompt
+    if (options.Has("prompt") && options.Get("prompt").IsString()) m_prompt = options.Get("prompt").As<Napi::String>();
+
     m_wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
 }
 
@@ -1020,6 +1024,7 @@ void WhisperStream::StreamWorker() {
     m_wparams.translate = m_translate;
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
+    m_wparams.initial_prompt = m_prompt.empty() ? nullptr : m_prompt.c_str();
 
     // VAD parameters (whisper built-in VAD)
     if (!m_vad_model.empty()) {
@@ -1109,6 +1114,7 @@ void WhisperStream::StreamWorkerVAD() {
     m_wparams.translate = m_translate;
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
+    m_wparams.initial_prompt = m_prompt.empty() ? nullptr : m_prompt.c_str();
 
     // VAD parameters (whisper built-in VAD)
     if (!m_vad_model.empty()) {
