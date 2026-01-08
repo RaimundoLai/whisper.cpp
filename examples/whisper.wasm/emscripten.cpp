@@ -9,6 +9,110 @@
 
 std::thread g_worker;
 
+// Checks if a string is a sequence of one or more valid UTF-8 characters
+bool is_valid_utf8(const std::string &s) {
+    size_t i = 0;
+    while (i < s.length()) {
+        unsigned char c = s[i];
+        int len = 0;
+        if ((c & 0x80) == 0x00) { // 1-byte
+            len = 1;
+        } else if ((c & 0xE0) == 0xC0) { // 2-byte
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) { // 3-byte
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) { // 4-byte
+            len = 4;
+        } else {
+            return false; // Invalid start byte
+        }
+
+        if (i + len > s.length()) {
+            return false; // Incomplete string
+        }
+
+        for (size_t j = 1; j < (size_t)len; ++j) {
+            if ((s[i + j] & 0xC0) != 0x80) {
+                return false; // Invalid subsequent byte
+            }
+        }
+        i += len;
+    }
+    return true;
+}
+
+// Helper function to convert string to hex for UTF-8 handling
+std::string string_to_hex(const char* text) {
+    if (text == nullptr) {
+        return "";
+    }
+    std::string hex_stream;
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(text[i]));
+        hex_stream += buf;
+    }
+    return hex_stream;
+}
+
+// Helper function to extract complete UTF-8 characters from hex string
+// Returns the extracted text and updates consumed_len
+std::string extract_complete_utf8_from_hex(const std::string& combined_hex, size_t& consumed_len) {
+    std::string complete_text;
+    consumed_len = 0;
+    
+    while (consumed_len + 2 <= combined_hex.length()) {
+        int char_length = 0;
+        unsigned int first_byte;
+        char hex_pair[3] = {combined_hex[consumed_len], combined_hex[consumed_len + 1], '\0'};
+        first_byte = (unsigned int)strtol(hex_pair, nullptr, 16);
+        
+        if ((first_byte & 0x80) == 0) { char_length = 2; }
+        else if ((first_byte & 0xE0) == 0xC0) { char_length = 4; }
+        else if ((first_byte & 0xF0) == 0xE0) { char_length = 6; }
+        else if ((first_byte & 0xF8) == 0xF0) { char_length = 8; }
+        else {
+            consumed_len += 2;
+            continue;
+        }
+        
+        if (consumed_len + char_length <= combined_hex.length()) {
+            std::string hex_char = combined_hex.substr(consumed_len, char_length);
+            std::string byte_str;
+            bool conversion_ok = true;
+            
+            for (size_t j = 0; j < hex_char.length(); j += 2) {
+                char pair[3] = {hex_char[j], hex_char[j + 1], '\0'};
+                unsigned int byte = (unsigned int)strtol(pair, nullptr, 16);
+                byte_str += static_cast<char>(byte);
+            }
+            
+            if (conversion_ok) {
+                bool valid_utf8 = true;
+                if (char_length > 2) {
+                    for (size_t k = 1; k < byte_str.length(); ++k) {
+                        if ((static_cast<unsigned char>(byte_str[k]) & 0xC0) != 0x80) {
+                            valid_utf8 = false;
+                            break;
+                        }
+                    }
+                }
+                if (valid_utf8) {
+                    complete_text += byte_str;
+                    consumed_len += char_length;
+                } else {
+                    consumed_len += 2;
+                }
+            } else {
+                consumed_len += 2;
+            }
+        } else {
+            break;
+        }
+    }
+    return complete_text;
+}
+
 static inline int mpow2(int n) {
     int p = 1;
     while (p <= n) p *= 2;
@@ -222,33 +326,128 @@ static bool output_json(
     end_obj(false);
     start_arr("transcription");
 
+    // For cross-segment UTF-8 handling (similar to addon.cpp)
+    std::string hex_buffer;
+    int64_t pending_t0 = -1;
+    
+    // First pass: collect all segments with UTF-8 handling
+    struct processed_segment {
+        std::string text;
+        int64_t t0;
+        int64_t t1;
+        int original_index; // For token lookup
+    };
+    std::vector<processed_segment> processed_segments;
+    
     for (int i = first_segment; i < n_segments; ++i) {
         const char * text = whisper_full_get_segment_text(ctx, i);
-        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-
+        int64_t current_t0 = whisper_full_get_segment_t0(ctx, i);
+        const int64_t current_t1 = whisper_full_get_segment_t1(ctx, i);
+        if (current_t0 < 0) current_t0 = 0;
+        
+        std::string current_text_hex = string_to_hex(text);
+        std::string combined_hex = hex_buffer + current_text_hex;
+        hex_buffer.clear();
+        
+        size_t consumed_len = 0;
+        std::string complete_text = extract_complete_utf8_from_hex(combined_hex, consumed_len);
+        
+        hex_buffer = combined_hex.substr(consumed_len);
+        
+        if (!complete_text.empty()) {
+            processed_segment seg;
+            seg.text = complete_text;
+            seg.t0 = (pending_t0 >= 0) ? pending_t0 : current_t0;
+            seg.t1 = current_t1;
+            seg.original_index = i;
+            processed_segments.push_back(seg);
+        }
+        
+        if (!hex_buffer.empty()) {
+            if (pending_t0 < 0) {
+                pending_t0 = current_t0;
+            }
+        } else {
+            pending_t0 = -1;
+        }
+    }
+    
+    // Handle any remaining hex_buffer
+    if (!hex_buffer.empty()) {
+        size_t consumed_len = 0;
+        std::string remaining_text = extract_complete_utf8_from_hex(hex_buffer, consumed_len);
+        if (!remaining_text.empty() && !processed_segments.empty()) {
+            processed_segments.back().text += remaining_text;
+        }
+    }
+    
+    // Now output all processed segments
+    for (size_t seg_idx = 0; seg_idx < processed_segments.size(); ++seg_idx) {
+        const auto& seg = processed_segments[seg_idx];
+        
         start_obj(nullptr);
-        times_o(t0, t1, false);
-        value_s("text", text, false);
+        times_o(seg.t0, seg.t1, false);
+        value_s("text", seg.text.c_str(), false);
 
         start_arr("tokens");
-        const int n = whisper_full_n_tokens(ctx, i);
-        for (int j = 0; j < n; ++j) {
-            auto token = whisper_full_get_token_data(ctx, i, j);
-            start_obj(nullptr);
-            // This line will now be correctly escaped
-            value_s("text", whisper_token_to_str(ctx, token.id), false);
-            if(token.t0 > -1 && token.t1 > -1) {
-                times_o(token.t0, token.t1, false);
+        const int n = whisper_full_n_tokens(ctx, seg.original_index);
+        int j = 0;
+        int output_token_count = 0;
+        while (j < n) {
+            auto token_first = whisper_full_get_token_data(ctx, seg.original_index, j);
+            std::string current_text = whisper_token_to_str(ctx, token_first.id);
+            
+            if (is_valid_utf8(current_text)) {
+                // Token is a valid UTF-8 character, add it directly
+                bool is_last = (j == n - 1);
+                start_obj(nullptr);
+                value_s("text", current_text.c_str(), false);
+                if(token_first.t0 > -1 && token_first.t1 > -1) {
+                    times_o(token_first.t0, token_first.t1, false);
+                }
+                value_i("id", token_first.id, false);
+                value_f("p", token_first.p, false);
+                value_f("t_dtw", token_first.t_dtw, true);
+                end_obj(is_last);
+                output_token_count++;
+                j++;
+            } else {
+                // Token is an incomplete UTF-8, start merging
+                std::string merged_text = current_text;
+                int64_t start_time = token_first.t0;
+                int64_t end_time = token_first.t1;
+                int k = j + 1;
+                
+                while (k < n) {
+                    auto token_next = whisper_full_get_token_data(ctx, seg.original_index, k);
+                    merged_text += whisper_token_to_str(ctx, token_next.id);
+                    
+                    if (is_valid_utf8(merged_text)) {
+                        // Becomes a valid UTF-8 character after merging
+                        end_time = token_next.t1;
+                        break;
+                    }
+                    k++;
+                }
+                
+                bool is_last = (k >= n - 1);
+                start_obj(nullptr);
+                value_s("text", merged_text.c_str(), false);
+                if(start_time > -1 && end_time > -1) {
+                    times_o(start_time, end_time, false);
+                }
+                value_i("id", token_first.id, false);
+                value_f("p", token_first.p, false);
+                value_f("t_dtw", token_first.t_dtw, true);
+                end_obj(is_last);
+                output_token_count++;
+                
+                j = k + 1; // Update the index of the main loop
             }
-            value_i("id", token.id, false);
-            value_f("p", token.p, false);
-            value_f("t_dtw", token.t_dtw, true);
-            end_obj(j == (n - 1));
         }
         end_arr(true);
 
-        end_obj(i == (n_segments - 1));
+        end_obj(seg_idx == (processed_segments.size() - 1));
     }
 
     end_arr(true);
@@ -284,7 +483,7 @@ std::vector<struct whisper_context *> g_contexts(1, nullptr);
 
 
 EMSCRIPTEN_BINDINGS(whisper) {
-    emscripten::function("full_default", emscripten::optional_override([](const std::string & path_model, const emscripten::val & audio, const std::string & model, const std::string & lang, int nthreads, bool translate) {
+    emscripten::function("full_default", emscripten::optional_override([](const std::string & path_model, const emscripten::val & audio, const std::string & model, const std::string & lang, int nthreads, bool translate, int max_len) {
         if (g_contexts[0] != nullptr) {
             printf("whisper_busy:\n");
             return 0;
@@ -307,6 +506,8 @@ EMSCRIPTEN_BINDINGS(whisper) {
         params.n_threads         = std::min(nthreads, std::min(16, mpow2(std::thread::hardware_concurrency())));
         params.offset_ms         = 0;
         params.progress_callback = progress_callback;
+        params.max_len           = max_len;
+        params.split_on_word     = false;
 
         const int n = audio["length"].as<int>();
 
