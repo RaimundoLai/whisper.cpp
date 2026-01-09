@@ -1201,6 +1201,7 @@ void WhisperStream::StreamWorkerVAD() {
 // ============================================================================
 
 #include "sense-voice-addon.cpp"
+#include "vad-addon.cpp"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
@@ -1211,8 +1212,13 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::String::New(env, "senseVoice"),
         Napi::Function::New(env, senseVoice)
     );
+    exports.Set(
+        Napi::String::New(env, "vadDetect"),
+        Napi::Function::New(env, vadDetect)
+    );
     WhisperStream::Init(env, exports);
     SenseVoiceStream::Init(env, exports);
+    VADStream::Init(env, exports);
     return exports;
 }
 

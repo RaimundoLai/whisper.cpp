@@ -267,7 +267,7 @@ public:
     std::shared_ptr<std::atomic<bool>> m_was_aborted;
 
     SenseVoiceWorker(Napi::Function& callback, 
-        std::string model_path, std::string tokenizer_path, std::string vad_model_path,
+        std::string model_path, std::string vad_model_path,
         std::string language, std::vector<double> pcmf32,
         bool use_gpu, bool flash_attn, int n_threads, bool use_itn, bool use_prefix,
         float vad_threshold,
@@ -277,7 +277,7 @@ public:
         std::vector<std::string> hotwords, float hotwords_score,
         Napi::Function progress_callback, Napi::Env env)
         : Napi::AsyncWorker(callback), 
-          m_model_path(model_path), m_tokenizer_path(tokenizer_path), m_vad_model_path(vad_model_path),
+          m_model_path(model_path), m_vad_model_path(vad_model_path),
           m_language(language), m_pcmf32(std::move(pcmf32)), 
           m_use_gpu(use_gpu), m_flash_attn(flash_attn), m_n_threads(n_threads), 
           m_use_itn(use_itn), m_use_prefix(use_prefix),
@@ -334,7 +334,6 @@ public:
         cparams.use_gpu = m_use_gpu;
         cparams.use_itn = m_use_itn;
         cparams.flash_attn = m_flash_attn;
-        cparams.tokenizer_path = m_tokenizer_path.c_str();
 
         struct sense_voice_context* ctx = sense_voice_small_init_from_file_with_params(
             m_model_path.c_str(), cparams);
@@ -762,7 +761,6 @@ public:
 
 private:
     std::string m_model_path;
-    std::string m_tokenizer_path;
     std::string m_vad_model_path;
     std::string m_language;
     std::vector<double> m_pcmf32;
@@ -801,12 +799,6 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
     std::string model_path = options.Get("model").As<Napi::String>();
-
-    // Optional: tokenizer path
-    std::string tokenizer_path = "";
-    if (options.Has("tokenizer") && options.Get("tokenizer").IsString()) {
-        tokenizer_path = options.Get("tokenizer").As<Napi::String>();
-    }
 
     // Audio input: either pcmf32 (Float32Array) or file (string path to WAV file)
     std::vector<double> pcmf32;
@@ -944,7 +936,7 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
 
     Napi::Function callback = info[1].As<Napi::Function>();
     SenseVoiceWorker* worker = new SenseVoiceWorker(
-        callback, model_path, tokenizer_path, vad_model_path, language, std::move(pcmf32),
+        callback, model_path, vad_model_path, language, std::move(pcmf32),
         use_gpu, flash_attn, n_threads, use_itn, use_prefix,
         vad_threshold,
         min_speech_duration_ms, max_speech_duration_ms, min_silence_duration_ms, speech_pad_ms,
@@ -985,7 +977,6 @@ private:
 
     // Configuration
     std::string m_model_path;
-    std::string m_tokenizer_path;
     std::string m_language;
     int m_n_threads = 4;
     bool m_use_gpu = true;
@@ -1065,11 +1056,6 @@ SenseVoiceStream::SenseVoiceStream(const Napi::CallbackInfo& info)
         Napi::TypeError::New(env, "Constructor options must include a 'model' path").ThrowAsJavaScriptException();
         return;
         return;
-    }
-    
-    // Tokenizer path
-    if (options.Has("tokenizer") && options.Get("tokenizer").IsString()) {
-        m_tokenizer_path = options.Get("tokenizer").As<Napi::String>();
     }
     
     // Language
@@ -1171,7 +1157,6 @@ Napi::Value SenseVoiceStream::Start(const Napi::CallbackInfo& info) {
     cparams.use_gpu = m_use_gpu;
     cparams.use_itn = m_use_itn;
     cparams.flash_attn = m_flash_attn;
-    cparams.tokenizer_path = m_tokenizer_path;
     
     m_ctx = sense_voice_small_init_from_file_with_params(m_model_path.c_str(), cparams);
     if (!m_ctx) {
