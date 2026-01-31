@@ -31,7 +31,18 @@ static bool is_sentence_ending_punctuation(const std::string& s, size_t pos) {
     unsigned char c = s[pos];
     
     // ASCII punctuation
-    if (c == '.' || c == '!' || c == '?' || c == ';' || c == ',') return true;
+    if (c == '.' || c == '!' || c == '?' || c == ';' || c == ',') {
+        // For period, check if it's part of a decimal number (e.g., "3.5")
+        // Skip if the period is between two digits
+        if (c == '.') {
+            bool prev_is_digit = (pos > 0 && isdigit(static_cast<unsigned char>(s[pos - 1])));
+            bool next_is_digit = (pos + 1 < s.length() && isdigit(static_cast<unsigned char>(s[pos + 1])));
+            if (prev_is_digit && next_is_digit) {
+                return false;  // This is a decimal point, not sentence-ending
+            }
+        }
+        return true;
+    }
     
     // Chinese/Japanese punctuation (UTF-8 encoded)
     if (pos + 2 < s.length()) {
@@ -1014,6 +1025,7 @@ private:
     // External Silero VAD (optional, for streaming)
     std::string m_vad_model_path;           // External VAD model path (empty for energy VAD)
     whisper_vad_context* m_vctx = nullptr;  // whisper VAD context
+
     
     // Debug logging flag
     bool m_debug = false;
@@ -1188,6 +1200,7 @@ Napi::Value SenseVoiceStream::Start(const Napi::CallbackInfo& info) {
     m_tsfn_callback = Napi::ThreadSafeFunction::New(env, callback, "SenseVoiceStreamCallback", 0, 1);
     
     m_state = StreamState::RUNNING;
+
     m_worker_thread = std::thread(&SenseVoiceStream::StreamWorker, this);
     
     return env.Undefined();
@@ -1379,12 +1392,18 @@ void SenseVoiceStream::StreamWorker() {
                 // Check if external Silero VAD is available
                 if (m_vctx) {
                     // Use Silero VAD - detect speech and get probability
-                    // Note: we need to call whisper_vad_detect_speech which handles internal state
+                    // Note: whisper_vad_detect_speech OVERWRITES probs each call (not accumulate)
                     whisper_vad_detect_speech(m_vctx, vad_chunk.data(), vad_chunk.size());
-                    // Get the last probability value
+                    
+                    // Check ALL probabilities from current call and use MAX
                     int n_probs = whisper_vad_n_probs(m_vctx);
                     if (n_probs > 0) {
-                        speech_prob = whisper_vad_probs(m_vctx)[n_probs - 1];
+                        const float* probs = whisper_vad_probs(m_vctx);
+                        for (int k = 0; k < n_probs; k++) {
+                            if (probs[k] > speech_prob) {
+                                speech_prob = probs[k];
+                            }
+                        }
                     }
                 } else {
                     // Fallback: Simple energy-based VAD
@@ -1406,9 +1425,9 @@ void SenseVoiceStream::StreamWorker() {
                 if (!in_speech) {
                     speech_start_sample = m_n_total_samples_received + static_cast<int64_t>(i);
                 }
-                // Append speech chunk
+                // Append speech chunk (no scaling - SenseVoice expects normalized audio)
                 for (int j = 0; j < chunk_samples; j++) {
-                    speech_buffer.push_back(accumulated_samples[i + j] * 32768.0);  // Scale for model
+                    speech_buffer.push_back(accumulated_samples[i + j]);
                 }
                 in_speech = true;
                 silence_chunk_count = 0;
@@ -1420,7 +1439,7 @@ void SenseVoiceStream::StreamWorker() {
                 // Include some silence for natural boundaries
                 if (silence_chunk_count <= min_silence_chunks) {
                     for (int j = 0; j < chunk_samples; j++) {
-                        speech_buffer.push_back(accumulated_samples[i + j] * 32768.0);
+                        speech_buffer.push_back(accumulated_samples[i + j]);
                     }
                 }
                 
@@ -1469,7 +1488,7 @@ void SenseVoiceStream::StreamWorker() {
         if (is_finishing) {
             // Add any remaining accumulated samples to speech buffer
             for (size_t i = 0; i < accumulated_samples.size(); i++) {
-                speech_buffer.push_back(accumulated_samples[i] * 32768.0);
+                speech_buffer.push_back(accumulated_samples[i]);
             }
             // Calculate final timestamps
             int64_t final_sample = m_n_total_samples_received + static_cast<int64_t>(accumulated_samples.size());
@@ -1518,17 +1537,17 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                 auto it_evt = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[2]);
                 if (it_evt != m_ctx->vocab.id_to_token.end()) evt_str = it_evt->second;
                 
-                // Extract text tokens (skip first 4 prefix tokens, deduplicate)
-                int prev_id = -1;
+                // Extract text tokens (skip first 4 prefix tokens)
+                // Note: Do NOT deduplicate consecutive tokens - "3000" has repeated "0"
                 for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
                     int id = m_ctx->state->ids[i];
-                    if (id != 0 && id != prev_id) {
+                    // Only filter special token IDs (0, 1, 2), NOT consecutive duplicates
+                    if (id != 0 && id != 1 && id != 2) {
                         auto it = m_ctx->vocab.id_to_token.find(id);
                         if (it != m_ctx->vocab.id_to_token.end()) {
                             text_str += it->second;
                         }
                     }
-                    prev_id = id;
                 }
             }
             
@@ -1539,21 +1558,18 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
             if (m_ctx->state->ids.size() > 4) {
                 // Count valid tokens for uniform timestamp distribution
                 size_t n_valid_tokens = 0;
-                int prev_id = -1;
                 for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
                     int id = m_ctx->state->ids[i];
-                    if (id != 0 && id != prev_id) {
+                    if (id != 0 && id != 1 && id != 2) {
                         n_valid_tokens++;
                     }
-                    prev_id = id;
                 }
                 
                 // Extract tokens with estimated timestamps (uniform distribution)
                 size_t token_idx = 0;
-                prev_id = -1;
                 for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
                     int id = m_ctx->state->ids[i];
-                    if (id != 0 && id != prev_id) {
+                    if (id != 0 && id != 1 && id != 2) {
                         int64_t t0 = start_time_ms + (segment_duration_ms * token_idx) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
                         int64_t t1 = start_time_ms + (segment_duration_ms * (token_idx + 1)) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
                         auto it = m_ctx->vocab.id_to_token.find(id);
@@ -1561,7 +1577,6 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                         token_data.push_back(std::make_tuple(t0, t1, tok_text));
                         token_idx++;
                     }
-                    prev_id = id;
                 }
             }
             

@@ -202,6 +202,23 @@ void whisper_print_segment_callback(struct whisper_context * ctx, struct whisper
     }
 }
 
+// Global log callback to suppress INFO logs unless requested
+void addon_whisper_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    // Check environment variable once
+    static bool debug_env_checked = false;
+    static bool debug_enabled = false;
+    if (!debug_env_checked) {
+        const char* env = std::getenv("WHISPER_CPP_DEBUG");
+        debug_enabled = (env != nullptr && std::string(env) == "1");
+        debug_env_checked = true;
+    }
+
+    if (!debug_enabled && level < GGML_LOG_LEVEL_WARN) {
+        return;
+    }
+    fprintf(stderr, "%s", text);
+}
+
 void cb_log_disable(enum ggml_log_level, const char *, void *) {}
 
 struct whisper_result {
@@ -1202,8 +1219,12 @@ void WhisperStream::StreamWorkerVAD() {
 
 #include "sense-voice-addon.cpp"
 #include "vad-addon.cpp"
+#include "nec-addon.cpp"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    // Set custom log callback to suppress spammy INFO logs by default
+    whisper_log_set(addon_whisper_log_callback, nullptr);
+
     exports.Set(
         Napi::String::New(env, "whisper"),
         Napi::Function::New(env, whisper)
@@ -1216,6 +1237,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::String::New(env, "vadDetect"),
         Napi::Function::New(env, vadDetect)
     );
+    InitNEC(env, exports);
     WhisperStream::Init(env, exports);
     SenseVoiceStream::Init(env, exports);
     VADStream::Init(env, exports);

@@ -112,6 +112,15 @@ set(SENSE_VOICE_SOURCES
     ${SENSE_VOICE_DIR}/fftsg.cc
 )
 
+# Add CoreML support for SenseVoice when WHISPER_COREML is enabled
+if (WHISPER_COREML)
+    set(SENSE_VOICE_COREML_SOURCE ${SENSE_VOICE_DIR}/coreml/sense-voice-encoder.mm)
+    list(APPEND SENSE_VOICE_SOURCES ${SENSE_VOICE_COREML_SOURCE})
+    set_source_files_properties(${SENSE_VOICE_COREML_SOURCE} PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set(SENSE_VOICE_COREML ON)
+    add_compile_definitions(SENSE_VOICE_USE_COREML)
+endif()
+
 # whisper
 
 add_library(whisper
@@ -153,6 +162,11 @@ endif()
 
 if (WHISPER_COREML)
     target_link_libraries(whisper PRIVATE whisper.coreml)
+    # Ensure frameworks are linked for SenseVoice mm files included in whisper target
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(COREML_FRAMEWORK CoreML)
+    target_link_libraries(whisper PRIVATE ${FOUNDATION_FRAMEWORK} ${COREML_FRAMEWORK})
+    add_definitions(-DSENSE_VOICE_USE_COREML)
 endif()
 
 if (WHISPER_OPENVINO)
