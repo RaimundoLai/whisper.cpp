@@ -1,0 +1,106 @@
+name: Test MacOS 26 Builder
+
+on:
+  push:
+    branches: [ test-macos-26 ]
+
+jobs:
+  mac26-builder:
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - name: Clone whisper.cpp repository
+        uses: actions/checkout@v4
+        with:
+          repository: RaimundoLai/whisper.cpp
+          ref: dev
+          submodules: recursive
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          brew install cmake
+          npm install -g cmake-js
+
+      - name: Build
+        run: |
+          cd examples/addon.node
+          npm install
+          cd ../../
+          mkdir -p artifacts
+          
+          # Build Metal variant
+          npx cmake-js compile -T addon.node -B Release \
+            --CDBUILD_SHARED_LIBS=OFF \
+            --CDWHISPER_STATIC=ON \
+            --CDGGML_METAL=ON \
+            --CDGGML_METAL_USE_BF16=ON \
+            --CDGGML_METAL_EMBED_LIBRARY=ON \
+            --runtime=electron \
+            --runtime-version=35.1.5 \
+            --arch=arm64
+          cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
+          
+          # Clear build cache
+          rm -rf build/CMakeCache.txt build/CMakeFiles/
+          
+          # Build CoreML variant
+          npx cmake-js compile -T addon.node -B Release \
+            --CDBUILD_SHARED_LIBS=OFF \
+            --CDWHISPER_STATIC=ON \
+            --CDWHISPER_COREML=ON \
+            --runtime=electron \
+            --runtime-version=35.1.5 \
+            --arch=arm64
+          cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-macos-arm64
+          path: |
+            artifacts/addon-macos-arm64.node
+            artifacts/addon-macos-arm64-coreml.node
+
+  # =================================================================================================
+  # Release Job
+  # =================================================================================================
+  create-update-release:
+    needs: [mac26-builder]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          
+      - name: List artifacts
+        run: ls -R artifacts/
+        
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+        
+      - name: Create Timestamped Release
+        uses: softprops/action-gh-release@v1
+        if: github.event_name != 'pull_request'
+        with:
+          tag_name: release-macos26-${{ steps.date.outputs.date }}
+          name: whisper.cpp macos-26 builds ${{ steps.date.outputs.date }}
+          body: |
+            whisper.cpp addon builds (Build date: ${{ steps.date.outputs.date }})
+            
+            **macOS 26**
+            - ARM64 (Metal & CoreML)
+            
+          files: |
+            artifacts/**/*.node
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
