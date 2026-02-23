@@ -1220,6 +1220,7 @@ void WhisperStream::StreamWorkerVAD() {
 #include "sense-voice-addon.cpp"
 #include "vad-addon.cpp"
 #include "nec-addon.cpp"
+#include "qwen-asr-addon.cpp"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // Set custom log callback to suppress spammy INFO logs by default
@@ -1237,10 +1238,20 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::String::New(env, "vadDetect"),
         Napi::Function::New(env, vadDetect)
     );
+    exports.Set(
+        Napi::String::New(env, "qwenASR"),
+        Napi::Function::New(env, qwenASR)
+    );
+    exports.Set(
+        Napi::String::New(env, "qwenASRAlign"),
+        Napi::Function::New(env, qwenASRAlign)
+    );
+
     InitNEC(env, exports);
     WhisperStream::Init(env, exports);
     SenseVoiceStream::Init(env, exports);
     VADStream::Init(env, exports);
+    QwenASRStream::Init(env, exports);
     return exports;
 }
 
