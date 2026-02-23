@@ -112,6 +112,19 @@ set(SENSE_VOICE_SOURCES
     ${SENSE_VOICE_DIR}/fftsg.cc
 )
 
+# qwen3-asr sources (from qwen3-asr-cpp)
+set(QWEN3_ASR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third-party/qwen3-asr-cpp)
+set(QWEN3_ASR_SOURCES
+    ${QWEN3_ASR_DIR}/mel_spectrogram.cpp
+    ${QWEN3_ASR_DIR}/gguf_loader.cpp
+    ${QWEN3_ASR_DIR}/audio_encoder.cpp
+    ${QWEN3_ASR_DIR}/text_decoder.cpp
+    ${QWEN3_ASR_DIR}/audio_injection.cpp
+    ${QWEN3_ASR_DIR}/qwen3_asr.cpp
+    ${QWEN3_ASR_DIR}/forced_aligner.cpp
+)
+
+
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
 if (WHISPER_COREML)
     set(SENSE_VOICE_COREML_SOURCE ${SENSE_VOICE_DIR}/coreml/sense-voice-encoder.mm)
@@ -128,7 +141,19 @@ add_library(whisper
             whisper-arch.h
             whisper.cpp
             ${SENSE_VOICE_SOURCES}
+            ${QWEN3_ASR_SOURCES}
             )
+
+# Define project version for standalone build if not set
+if(NOT DEFINED PROJECT_VERSION)
+    set(PROJECT_VERSION "1.8.2")
+endif()
+
+if(NOT DEFINED SOVERSION)
+    set(SOVERSION 1)
+endif()
+
+target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}")
 
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
@@ -136,7 +161,7 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR})
+target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR})
 target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
@@ -149,6 +174,11 @@ endif()
 
 target_link_libraries(whisper PUBLIC ggml)
 
+# Link Accelerate framework on Apple for qwen3-asr mel spectrogram
+if(APPLE)
+    target_link_libraries(whisper PRIVATE "-framework Accelerate")
+endif()
+
 # Add tokenizers-cpp for SenseVoice support
 set(TOKENIZERS_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third-party/tokenizers-cpp")
 if(EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
@@ -159,6 +189,7 @@ if(EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
     target_link_libraries(whisper PUBLIC tokenizers_cpp)
     target_compile_definitions(whisper PRIVATE HAVE_TOKENIZERS_CPP)
 endif()
+
 
 if (WHISPER_COREML)
     target_link_libraries(whisper PRIVATE whisper.coreml)

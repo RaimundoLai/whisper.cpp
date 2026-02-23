@@ -71,6 +71,7 @@ private:
     bool m_in_speech = false;
     int64_t m_speech_start_sample = 0;
     std::vector<float> m_speech_audio;  // Audio during speech
+    std::vector<float> m_prev_buffer;   // Lookback buffer for speech padding
     int m_silence_frames = 0;  // Consecutive silence frames
     
     // Streaming parameters
@@ -209,6 +210,7 @@ Napi::Value VADStream::Start(const Napi::CallbackInfo& info) {
     // Reset state
     m_audio_buffer.clear();
     m_speech_audio.clear();
+    m_prev_buffer.clear();
     m_n_samples_total = 0;
     m_in_speech = false;
     m_speech_start_sample = 0;
@@ -443,15 +445,38 @@ void VADStream::VADWorker() {
                     if (speech_frames >= min_speech_frames) {
                         // Confirmed speech start
                         m_in_speech = true;
-                        m_speech_start_sample = m_n_samples_total + frame_start - (speech_frames - 1) * chunk_samples;
+                        int speech_confirm_samples = (speech_frames - 1) * chunk_samples;
+                        m_speech_start_sample = m_n_samples_total + frame_start - speech_confirm_samples;
                         
-                        // Add padding from before speech started
+                        // Add padding from before speech started, using lookback buffer if needed
                         int pad_samples = (m_vad_params.speech_pad_ms * WHISPER_SAMPLE_RATE) / 1000;
-                        size_t start_idx = 0;
-                        if (frame_start > (size_t)pad_samples + (speech_frames - 1) * chunk_samples) {
-                            start_idx = frame_start - pad_samples - (speech_frames - 1) * chunk_samples;
+                        int total_lookback = pad_samples + speech_confirm_samples;
+                        
+                        m_speech_audio.clear();
+                        
+                        if ((int)frame_start < total_lookback && !m_prev_buffer.empty()) {
+                            // Need audio from previous buffer for padding
+                            int needed_from_prev = total_lookback - (int)frame_start;
+                            if (needed_from_prev > (int)m_prev_buffer.size()) {
+                                needed_from_prev = (int)m_prev_buffer.size();
+                            }
+                            // Append from prev_buffer
+                            m_speech_audio.insert(m_speech_audio.end(),
+                                m_prev_buffer.end() - needed_from_prev, m_prev_buffer.end());
+                            // Append from start of current process_buffer to frame_end
+                            m_speech_audio.insert(m_speech_audio.end(),
+                                process_buffer.begin(), process_buffer.begin() + frame_end);
+                            // Adjust speech start to account for extra padding
+                            m_speech_start_sample -= needed_from_prev;
+                            if (m_speech_start_sample < 0) m_speech_start_sample = 0;
+                        } else {
+                            // All padding available within current process_buffer
+                            size_t start_idx = 0;
+                            if (frame_start > (size_t)total_lookback) {
+                                start_idx = frame_start - total_lookback;
+                            }
+                            m_speech_audio.assign(process_buffer.begin() + start_idx, process_buffer.begin() + frame_end);
                         }
-                        m_speech_audio.assign(process_buffer.begin() + start_idx, process_buffer.begin() + frame_end);
                     }
                 } else {
                     // Continue speech - add audio
@@ -489,6 +514,7 @@ void VADStream::VADWorker() {
         }
         
         m_n_samples_total += process_buffer.size();
+        m_prev_buffer = std::move(process_buffer);
         process_buffer.clear();
     }
     
