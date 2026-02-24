@@ -13,12 +13,8 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        cuda_version: ['11.8.0', '12.2.0', '12.4.1']
+        cuda_version: ['12.4.1']
         include:
-          - cuda_version: '11.8.0'
-            optimized: 'windows-cuda-1180'
-          - cuda_version: '12.2.0'
-            optimized: 'windows-cuda-1220'
           - cuda_version: '12.4.1'
             optimized: 'windows-cuda-1241'
     steps:
@@ -58,8 +54,6 @@ jobs:
           cd ../../
           $env:CUDA_PATH = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           $env:CUDA_TOOLKIT_ROOT_DIR = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
-          $env:CL = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          $env:_CL_ = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
           
           $buildParams = @(
             "--CDBUILD_SHARED_LIBS=OFF",
@@ -350,14 +344,10 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        cuda_version: ['11.8.0', '12.4.1', '12.2.0', '13.0.2']
+        cuda_version: ['12.4.1', '13.0.2']
         include:
-          - cuda_version: '11.8.0'
-            optimized: 'linux-cuda-1180'
           - cuda_version: '12.4.1'
             optimized: 'linux-cuda-1241'
-          - cuda_version: '12.2.0'
-            optimized: 'linux-cuda-1220'
           - cuda_version: '13.0.2'
             optimized: 'linux-cuda-1302'
     steps:
@@ -539,8 +529,8 @@ jobs:
             whisper.cpp addon builds (Build date: ${{ steps.date.outputs.date }})
             
             **Windows**
-            - CUDA: 11.8, 12.2, 12.4, 13.0
-            - Vulkan (New!)
+            - CUDA: 12.4, 13.0
+            - Vulkan
             - CPU (No CUDA)
             
             **macOS**
@@ -548,8 +538,8 @@ jobs:
             - Intel (Metal)
             
             **Linux (Ubuntu)**
-            - CUDA: 11.8, 12.2, 12.4, 13.0
-            - Vulkan (New!)
+            - CUDA: 12.4, 13.0
+            - Vulkan
             - CPU (No CUDA)
             
           files: |
@@ -570,8 +560,8 @@ jobs:
             Last updated: ${{ steps.date.outputs.date }}
             
             **Windows**
-            - CUDA: 11.8, 12.2, 12.4, 13.0
-            - Vulkan (New!)
+            - CUDA: 12.4, 13.0
+            - Vulkan
             - CPU (No CUDA)
             
             **macOS**
@@ -579,8 +569,8 @@ jobs:
             - Intel (Metal)
             
             **Linux (Ubuntu)**
-            - CUDA: 11.8, 12.2, 12.4, 13.0
-            - Vulkan (New!)
+            - CUDA: 12.4, 13.0
+            - Vulkan
             - CPU (No CUDA)
             
           files: |
