@@ -31,7 +31,7 @@ static bool is_sentence_ending_punctuation(const std::string& s, size_t pos) {
     unsigned char c = s[pos];
     
     // ASCII punctuation
-    if (c == '.' || c == '!' || c == '?' || c == ';' || c == ',') {
+    if (c == '.' || c == '!' || c == '?') {
         // For period, check if it's part of a decimal number (e.g., "3.5")
         // Skip if the period is between two digits
         if (c == '.') {
@@ -57,12 +57,6 @@ static bool is_sentence_ending_punctuation(const std::string& s, size_t pos) {
         if (c == 0xEF && c1 == 0xBC && c2 == 0x81) return true;
         // ？(U+FF1F) = EF BC 9F
         if (c == 0xEF && c1 == 0xBC && c2 == 0x9F) return true;
-        // ；(U+FF1B) = EF BC 9B
-        if (c == 0xEF && c1 == 0xBC && c2 == 0x9B) return true;
-        // ，(U+FF0C) = EF BC 8C
-        if (c == 0xEF && c1 == 0xBC && c2 == 0x8C) return true;
-        // 、(U+3001) = E3 80 81
-        if (c == 0xE3 && c1 == 0x80 && c2 == 0x81) return true;
     }
     
     return false;
