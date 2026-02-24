@@ -36,9 +36,10 @@ static bool is_sentence_ending_punctuation(const std::string& s, size_t pos) {
         // Skip if the period is between two digits
         if (c == '.') {
             bool prev_is_digit = (pos > 0 && isdigit(static_cast<unsigned char>(s[pos - 1])));
-            bool next_is_digit = (pos + 1 < s.length() && isdigit(static_cast<unsigned char>(s[pos + 1])));
-            if (prev_is_digit && next_is_digit) {
-                return false;  // This is a decimal point, not sentence-ending
+            // If the period is preceded by a digit, assume it's part of a number
+            // to avoid incorrect splitting when a token ends with a period.
+            if (prev_is_digit) {
+                return false;
             }
         }
         return true;
