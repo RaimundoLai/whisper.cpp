@@ -58,8 +58,8 @@ jobs:
           cd ../../
           $env:CUDA_PATH = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           $env:CUDA_TOOLKIT_ROOT_DIR = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
-          $env:CXXFLAGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          $env:CUDAFLAGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+          $env:CL = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+          $env:_CL_ = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
           
           $buildParams = @(
             "--CDBUILD_SHARED_LIBS=OFF",
