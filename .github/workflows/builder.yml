@@ -10,7 +10,7 @@ jobs:
   # Windows Builds
   # =================================================================================================
   windows-cuda:
-    runs-on: windows-2019
+    runs-on: windows-2022
     strategy:
       matrix:
         cuda_version: ['11.8.0', '12.2.0', '12.4.1']
@@ -141,7 +141,7 @@ jobs:
           path: artifacts/addon-windows-cuda-1302.node
 
   windows-vulkan:
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
@@ -190,7 +190,7 @@ jobs:
           path: artifacts/addon-windows-vulkan.node
 
   windows-no-cuda:
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
