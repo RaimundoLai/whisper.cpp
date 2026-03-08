@@ -415,6 +415,11 @@ extern "C" {
     WHISPER_API float * whisper_get_logits           (struct whisper_context * ctx);
     WHISPER_API float * whisper_get_logits_from_state(struct whisper_state * state);
 
+    // Whisper encoder embeddings (output of the encoder)
+    // Rows: n_text_ctx / 2
+    // Cols: n_audio_state
+    WHISPER_API float * whisper_get_embd_enc_from_state(struct whisper_state * state);
+
     // Token Id -> String. Uses the vocabulary in the provided context
     WHISPER_API const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token);
     WHISPER_API const char * whisper_model_type_readable(struct whisper_context * ctx);
