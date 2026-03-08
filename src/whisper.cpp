@@ -4194,6 +4194,11 @@ float * whisper_get_logits_from_state(struct whisper_state * state) {
     return state->logits.data();
 }
 
+float * whisper_get_embd_enc_from_state(struct whisper_state * state) {
+    if (!state->embd_enc) return nullptr;
+    return (float *) state->embd_enc->data;
+}
+
 const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token) {
     return ctx->vocab.id_to_token.at(token).c_str();
 }

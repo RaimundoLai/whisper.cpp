@@ -1221,6 +1221,7 @@ void WhisperStream::StreamWorkerVAD() {
 #include "vad-addon.cpp"
 #include "nec-addon.cpp"
 #include "qwen-asr-addon.cpp"
+#include "ss-addon.cpp"
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // Set custom log callback to suppress spammy INFO logs by default
@@ -1245,6 +1246,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
         Napi::String::New(env, "qwenASRAlign"),
         Napi::Function::New(env, qwenASRAlign)
+    );
+    exports.Set(
+        Napi::String::New(env, "extractSSEmbedding"),
+        Napi::Function::New(env, extractSSEmbedding)
     );
 
     InitNEC(env, exports);
