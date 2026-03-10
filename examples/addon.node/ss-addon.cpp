@@ -450,6 +450,7 @@ public:
     SSEmbeddingWorker(Napi::Function& callback, 
                       const std::string& ss_model_path, 
                       const std::string& base_model_path, 
+                      whisper_context* shared_wctx,
                       const std::string& vad_model_path,
                       bool use_gpu,
                       whisper_vad_params vad_params,
@@ -457,6 +458,8 @@ public:
         : Napi::AsyncWorker(callback), 
           m_ss_path(ss_model_path), 
           m_base_path(base_model_path), 
+          m_shared_wctx(shared_wctx),
+          m_owns_wctx(shared_wctx == nullptr),
           m_vad_path(vad_model_path),
           m_use_gpu(use_gpu),
           m_vad_params(vad_params),
@@ -470,15 +473,18 @@ public:
             return;
         }
 
-        // 2. Initialize Whisper Base Context
-        struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = m_use_gpu; // Configurable GPU
-        struct whisper_context * wctx = whisper_init_from_file_with_params(m_base_path.c_str(), cparams);
-
+        // 2. Initialize Whisper Base Context (or use shared)
+        struct whisper_context * wctx = m_shared_wctx;
         if (!wctx) {
-            whisper_ss_free(ss_ctx);
-            SetError("Failed to initialize whisper base model from " + m_base_path);
-            return;
+            struct whisper_context_params cparams = whisper_context_default_params();
+            cparams.use_gpu = m_use_gpu; // Configurable GPU
+            wctx = whisper_init_from_file_with_params(m_base_path.c_str(), cparams);
+
+            if (!wctx) {
+                whisper_ss_free(ss_ctx);
+                SetError("Failed to initialize whisper base model from " + m_base_path);
+                return;
+            }
         }
 
         // 3. Process Segmentation (VAD or Whole)
@@ -489,7 +495,7 @@ public:
             whisper_vad_context* vad_ctx = whisper_vad_init_from_file_with_params(m_vad_path.c_str(), vad_cparams);
             
             if (!vad_ctx) {
-                whisper_free(wctx);
+                if (m_owns_wctx) whisper_free(wctx);
                 whisper_ss_free(ss_ctx);
                 SetError("Failed to initialize VAD context from " + m_vad_path);
                 return;
@@ -529,7 +535,9 @@ public:
         }
 
         // 4. Cleanup
-        whisper_free(wctx);
+        if (m_owns_wctx && wctx) {
+            whisper_free(wctx);
+        }
         whisper_ss_free(ss_ctx);
     }
 
@@ -562,6 +570,8 @@ public:
 private:
     std::string m_ss_path;
     std::string m_base_path;
+    whisper_context* m_shared_wctx;
+    bool m_owns_wctx;
     std::string m_vad_path;
     bool m_use_gpu;
     whisper_vad_params m_vad_params;
@@ -601,10 +611,28 @@ Napi::Value extractSSEmbedding(const Napi::CallbackInfo& info) {
     std::string model_path = options.Get("model").As<Napi::String>();
 
     std::string base_model_path = "";
-    if (options.Has("base_model") && options.Get("base_model").IsString()) {
-        base_model_path = options.Get("base_model").As<Napi::String>();
+    whisper_context* shared_wctx = nullptr;
+
+    if (options.Has("base_model")) {
+        Napi::Value base_model_val = options.Get("base_model");
+        if (base_model_val.IsString()) {
+            base_model_path = base_model_val.As<Napi::String>();
+        } else if (base_model_val.IsObject()) {
+            // Attempt to unwrap it as NEC object
+            Napi::Object obj = base_model_val.As<Napi::Object>();
+            NEC* nec_instance = Napi::ObjectWrap<NEC>::Unwrap(obj);
+            if (nec_instance) {
+                shared_wctx = nec_instance->GetContext();
+            } else {
+                Napi::TypeError::New(env, "Option 'base_model' object is not a valid NEC instance.").ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+        } else {
+            Napi::TypeError::New(env, "Option 'base_model' must be a string or a valid NEC instance.").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
     } else {
-        Napi::TypeError::New(env, "Option 'base_model' must be a string.").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Option 'base_model' is required.").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
@@ -644,7 +672,7 @@ Napi::Value extractSSEmbedding(const Napi::CallbackInfo& info) {
 
     // Queue worker
     SSEmbeddingWorker* worker = new SSEmbeddingWorker(
-        callback, model_path, base_model_path, vad_model_path, use_gpu, vad_params, pcmf32);
+        callback, model_path, base_model_path, shared_wctx, vad_model_path, use_gpu, vad_params, pcmf32);
     worker->Queue();
 
     return env.Undefined();

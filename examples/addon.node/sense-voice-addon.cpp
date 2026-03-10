@@ -483,24 +483,49 @@ public:
                                 auto it_evt = ctx->vocab.id_to_token.find(ctx->state->ids[2]);
                                 if (it_evt != ctx->vocab.id_to_token.end()) seg_event = it_evt->second;
 
-                                // Count valid tokens for timestamp estimation
+                                // Extract tokens with their frame timestamps
+                                bool has_timestamps = (ctx->state->ids.size() == ctx->state->token_timestamps.size()) && !ctx->state->token_timestamps.empty();
+                                
                                 size_t n_valid_tokens = 0;
                                 for (size_t k = 4; k < ctx->state->ids.size(); k++) {
                                     int id = ctx->state->ids[k];
                                     if (id != 0 && id != 1 && id != 2) n_valid_tokens++;
                                 }
 
-                                // Extract tokens with estimated timestamps
                                 size_t token_idx = 0;
                                 for (size_t k = 4; k < ctx->state->ids.size(); k++) {
                                     int id = ctx->state->ids[k];
                                     if (id != 0 && id != 1 && id != 2) {
                                         auto it = ctx->vocab.id_to_token.find(id);
                                         if (it != ctx->vocab.id_to_token.end()) {
-                                            // Estimate token timestamps (uniform distribution)
-                                            int64_t token_t0 = seg_start_ms + (seg_duration_ms * token_idx) / n_valid_tokens;
-                                            int64_t token_t1 = seg_start_ms + (seg_duration_ms * (token_idx + 1)) / n_valid_tokens;
-                                            
+                                            int64_t token_t0, token_t1;
+
+                                            if (has_timestamps) {
+                                                int frame_idx = ctx->state->token_timestamps[k];
+                                                int actual_frame = std::max(0, frame_idx - 4); // 扣除 4 幀偏移
+                                                token_t0 = seg_start_ms + actual_frame * 60;
+
+                                                int64_t next_token_t0 = seg_end_ms;
+                                                for (size_t next_k = k + 1; next_k < ctx->state->ids.size(); next_k++) {
+                                                    int next_id = ctx->state->ids[next_k];
+                                                    if (next_id != 0 && next_id != 1 && next_id != 2) {
+                                                        int next_frame = std::max(0, ctx->state->token_timestamps[next_k] - 4);
+                                                        next_token_t0 = seg_start_ms + next_frame * 60;
+                                                        break;
+                                                    }
+                                                }
+
+                                                const int64_t MAX_TOKEN_DURATION_MS = 400; 
+                                                token_t1 = std::min(token_t0 + MAX_TOKEN_DURATION_MS, next_token_t0);
+                                                token_t1 = std::min(token_t1, seg_end_ms);
+                                                
+                                                if (token_t1 <= token_t0) token_t1 = token_t0 + 60;
+                                            } else {
+                                                // 安全降級
+                                                token_t0 = seg_start_ms + (seg_duration_ms * token_idx) / std::max((size_t)1, n_valid_tokens);
+                                                token_t1 = seg_start_ms + (seg_duration_ms * (token_idx + 1)) / std::max((size_t)1, n_valid_tokens);
+                                            }
+
                                             sense_voice_addon_result::token_data tok;
                                             tok.id = id;
                                             tok.t0 = token_t0;
@@ -619,23 +644,49 @@ public:
                     auto it_evt = ctx->vocab.id_to_token.find(ctx->state->ids[2]);
                     if (it_evt != ctx->vocab.id_to_token.end()) seg_event = it_evt->second;
 
-                    // Count valid tokens for timestamp estimation
+                    // Extract tokens with their frame timestamps
+                    bool has_timestamps = (ctx->state->ids.size() == ctx->state->token_timestamps.size()) && !ctx->state->token_timestamps.empty();
+
                     size_t n_valid_tokens = 0;
                     for (size_t k = 4; k < ctx->state->ids.size(); k++) {
                         int id = ctx->state->ids[k];
                         if (id != 0 && id != 1 && id != 2) n_valid_tokens++;
                     }
 
-                    // Extract tokens with estimated timestamps
                     size_t token_idx = 0;
                     for (size_t k = 4; k < ctx->state->ids.size(); k++) {
                         int id = ctx->state->ids[k];
                         if (id != 0 && id != 1 && id != 2) {
                             auto it = ctx->vocab.id_to_token.find(id);
                             if (it != ctx->vocab.id_to_token.end()) {
-                                int64_t token_t0 = seg_start_ms + (seg_duration_ms * token_idx) / n_valid_tokens;
-                                int64_t token_t1 = seg_start_ms + (seg_duration_ms * (token_idx + 1)) / n_valid_tokens;
-                                
+                                int64_t token_t0, token_t1;
+
+                                if (has_timestamps) {
+                                    int frame_idx = ctx->state->token_timestamps[k];
+                                    int actual_frame = std::max(0, frame_idx - 4); // 扣除 4 幀偏移
+                                    token_t0 = seg_start_ms + actual_frame * 60;
+
+                                    int64_t next_token_t0 = seg_end_ms;
+                                    for (size_t next_k = k + 1; next_k < ctx->state->ids.size(); next_k++) {
+                                        int next_id = ctx->state->ids[next_k];
+                                        if (next_id != 0 && next_id != 1 && next_id != 2) {
+                                            int next_frame = std::max(0, ctx->state->token_timestamps[next_k] - 4);
+                                            next_token_t0 = seg_start_ms + next_frame * 60;
+                                            break;
+                                        }
+                                    }
+
+                                    const int64_t MAX_TOKEN_DURATION_MS = 400; 
+                                    token_t1 = std::min(token_t0 + MAX_TOKEN_DURATION_MS, next_token_t0);
+                                    token_t1 = std::min(token_t1, seg_end_ms);
+                                    
+                                    if (token_t1 <= token_t0) token_t1 = token_t0 + 60;
+                                } else {
+                                    // 安全降級
+                                    token_t0 = seg_start_ms + (seg_duration_ms * token_idx) / std::max((size_t)1, n_valid_tokens);
+                                    token_t1 = seg_start_ms + (seg_duration_ms * (token_idx + 1)) / std::max((size_t)1, n_valid_tokens);
+                                }
+
                                 sense_voice_addon_result::token_data tok;
                                 tok.id = id;
                                 tok.t0 = token_t0;
@@ -1551,26 +1602,53 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
             int64_t segment_duration_ms = end_time_ms - start_time_ms;
             
             if (m_ctx->state->ids.size() > 4) {
-                // Count valid tokens for uniform timestamp distribution
-                size_t n_valid_tokens = 0;
-                for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
-                    int id = m_ctx->state->ids[i];
-                    if (id != 0 && id != 1 && id != 2) {
-                        n_valid_tokens++;
-                    }
-                }
+                // Extract tokens with their frame timestamps
+                bool has_timestamps = (m_ctx->state->ids.size() == m_ctx->state->token_timestamps.size()) && !m_ctx->state->token_timestamps.empty();
                 
-                // Extract tokens with estimated timestamps (uniform distribution)
+                size_t n_valid_tokens = 0;
+                for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
+                    int id = m_ctx->state->ids[k];
+                    if (id != 0 && id != 1 && id != 2) n_valid_tokens++;
+                }
+
                 size_t token_idx = 0;
-                for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
-                    int id = m_ctx->state->ids[i];
+                for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
+                    int id = m_ctx->state->ids[k];
                     if (id != 0 && id != 1 && id != 2) {
-                        int64_t t0 = start_time_ms + (segment_duration_ms * token_idx) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
-                        int64_t t1 = start_time_ms + (segment_duration_ms * (token_idx + 1)) / (n_valid_tokens > 0 ? n_valid_tokens : 1);
                         auto it = m_ctx->vocab.id_to_token.find(id);
-                        std::string tok_text = (it != m_ctx->vocab.id_to_token.end()) ? it->second : "";
-                        token_data.push_back(std::make_tuple(t0, t1, tok_text));
-                        token_idx++;
+                        if (it != m_ctx->vocab.id_to_token.end()) {
+                            int64_t token_t0, token_t1;
+
+                            if (has_timestamps) {
+                                int frame_idx = m_ctx->state->token_timestamps[k];
+                                int actual_frame = std::max(0, frame_idx - 4); // 扣除 4 幀偏移
+                                token_t0 = start_time_ms + actual_frame * 60;
+
+                                int64_t next_token_t0 = end_time_ms;
+                                for (size_t next_k = k + 1; next_k < m_ctx->state->ids.size(); next_k++) {
+                                    int next_id = m_ctx->state->ids[next_k];
+                                    if (next_id != 0 && next_id != 1 && next_id != 2) {
+                                        int next_frame = std::max(0, m_ctx->state->token_timestamps[next_k] - 4);
+                                        next_token_t0 = start_time_ms + next_frame * 60;
+                                        break;
+                                    }
+                                }
+
+                                const int64_t MAX_TOKEN_DURATION_MS = 400; 
+                                token_t1 = std::min(token_t0 + MAX_TOKEN_DURATION_MS, next_token_t0);
+                                token_t1 = std::min(token_t1, end_time_ms);
+                                
+                                if (token_t1 <= token_t0) token_t1 = token_t0 + 60;
+                            } else {
+                                // 安全降級
+                                token_t0 = start_time_ms + (segment_duration_ms * token_idx) / std::max((size_t)1, n_valid_tokens);
+                                token_t1 = start_time_ms + (segment_duration_ms * (token_idx + 1)) / std::max((size_t)1, n_valid_tokens);
+                            }
+
+                            token_data.push_back(std::make_tuple(token_t0, token_t1, it->second));
+                            text_str += it->second;
+                            token_idx++;
+                        }
                     }
                 }
             }

@@ -135,13 +135,14 @@ public:
     NEC(const Napi::CallbackInfo& info);
     ~NEC();
 
+    whisper_context* GetContext() const { return m_ctx; }
+
 private:
     Napi::Value Correct(const Napi::CallbackInfo& info);
     Napi::Value Free(const Napi::CallbackInfo& info);
 
     whisper_context* m_ctx = nullptr;
     std::string m_model_path;
-    std::mutex m_mutex;
 };
 
 // --- Worker ---
@@ -151,7 +152,6 @@ public:
     NECPipelineWorker(
         Napi::Function& callback,
         whisper_context* ctx,
-        std::mutex& mutex,
         std::vector<float> pcmf32,
         std::string transcript,
         std::vector<std::string> candidates,
@@ -160,7 +160,6 @@ public:
         bool debug
     ) : Napi::AsyncWorker(callback),
         m_ctx(ctx),
-        m_mutex(mutex),
         m_pcmf32(std::move(pcmf32)),
         m_initial_transcript(std::move(transcript)),
         m_candidates(std::move(candidates)),
@@ -169,10 +168,15 @@ public:
         m_debug(debug) {}
 
     void Execute() override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        
         if (!m_ctx) {
             SetError("Model context is null");
+            return;
+        }
+
+        // Initialize state for thread-safe inference
+        whisper_state* wstate = whisper_init_state(m_ctx);
+        if (!wstate) {
+            SetError("Failed to initialize whisper state");
             return;
         }
 
@@ -181,16 +185,18 @@ public:
         whisper_token eot = whisper_token_eot(m_ctx);
 
         // 1. Encode Audio (ONCE)
-        // Use whisper_pcm_to_mel + whisper_encode
+        // Use whisper_pcm_to_mel_with_state + whisper_encode_with_state
         if (m_debug) fprintf(stderr, "[NEC] Audio size: %zu, Encoding...\n", m_pcmf32.size());
         
-        if (whisper_pcm_to_mel(m_ctx, m_pcmf32.data(), (int)m_pcmf32.size(), m_n_threads) != 0) {
+        if (whisper_pcm_to_mel_with_state(m_ctx, wstate, m_pcmf32.data(), (int)m_pcmf32.size(), m_n_threads) != 0) {
             SetError("Failed to compute mel spectrogram");
+            whisper_free_state(wstate);
             return;
         }
         
-        if (whisper_encode(m_ctx, 0, m_n_threads) != 0) {
+        if (whisper_encode_with_state(m_ctx, wstate, 0, m_n_threads) != 0) {
             SetError("Failed to encode audio");
+            whisper_free_state(wstate);
             return;
         }
 
@@ -205,9 +211,10 @@ public:
 
             // Run decoder with prompt
             // Note: input is empty tokens array because we provided prompt? 
-            // Actually whisper_decode takes the tokens to decode.
-            if (whisper_decode(m_ctx, prompt_tokens.data(), (int)prompt_tokens.size(), 0, m_n_threads) != 0) {
+            // Run decoder with prompt
+            if (whisper_decode_with_state(m_ctx, wstate, prompt_tokens.data(), (int)prompt_tokens.size(), 0, m_n_threads) != 0) {
                 SetError("Failed to decode prompt");
+                whisper_free_state(wstate);
                 return;
             }
 
@@ -220,7 +227,7 @@ public:
             int last_token_idx = (int)prompt_tokens.size() - 1;
 
             for (int k = 0; k < m_max_tokens; k++) {
-                float* logits = whisper_get_logits(m_ctx);
+                float* logits = whisper_get_logits_from_state(wstate);
                 if (!logits) break;
 
                 float* target_logits;
@@ -239,7 +246,7 @@ public:
                 if (s) generated_text += s;
 
                 // Decode next
-                if (whisper_decode(m_ctx, &next, 1, n_past, m_n_threads) != 0) break;
+                if (whisper_decode_with_state(m_ctx, wstate, &next, 1, n_past, m_n_threads) != 0) break;
                 n_past++;
             }
 
@@ -264,6 +271,8 @@ public:
                 if (m_debug) fprintf(stderr, "      -> No correction\n");
             }
         }
+
+        whisper_free_state(wstate);
     }
 
     void OnOK() override {
@@ -288,7 +297,6 @@ public:
 
 private:
     whisper_context* m_ctx;
-    std::mutex& m_mutex;
     std::vector<float> m_pcmf32;
     std::string m_initial_transcript;
     std::string m_current_transcript;
@@ -388,7 +396,7 @@ Napi::Value NEC::Correct(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[idx].As<Napi::Function>();
     
     NECPipelineWorker* worker = new NECPipelineWorker(
-        callback, m_ctx, m_mutex, std::move(pcmf32), transcript, std::move(candidates),
+        callback, m_ctx, std::move(pcmf32), transcript, std::move(candidates),
         n_threads, max_tokens, debug
     );
     worker->Queue();
@@ -398,7 +406,6 @@ Napi::Value NEC::Correct(const Napi::CallbackInfo& info) {
 
 Napi::Value NEC::Free(const Napi::CallbackInfo& info) {
     if (m_ctx) {
-        std::lock_guard<std::mutex> lock(m_mutex);
         whisper_free(m_ctx);
         m_ctx = nullptr;
     }
