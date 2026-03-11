@@ -264,8 +264,11 @@ static int whisper_ss_get_embedding(struct ss_model * model, struct whisper_cont
     // Get encoder features: [n_audio_ctx, 512] -> [seq_len, 512]
     int n_mels_frames = whisper_n_len_from_state(wstate); // total mel frames
     int seq_len = n_mels_frames / 2; // CNN stride 2 in whisper base
-    float * enc_out = whisper_get_embd_enc_from_state(wstate); // size is seq_len * 512
-    if (!enc_out) {
+
+    // Copy encoder output to CPU buffer (GPU-safe)
+    std::vector<float> enc_buf(seq_len * 512);
+    int copied = whisper_copy_embd_enc_from_state(wstate, enc_buf.data(), seq_len * 512);
+    if (copied <= 0) {
         whisper_free_state(wstate);
         return -1;
     }
@@ -284,7 +287,7 @@ static int whisper_ss_get_embedding(struct ss_model * model, struct whisper_cont
 
     // Inputs: whisper encoder features [seq_len, 512]. (C-array layout: [seq_len, 512], meaning ne[0]=512, ne[1]=seq_len in GGML)
     struct ggml_tensor * x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 512, seq_len);
-    memcpy(x->data, enc_out, seq_len * 512 * sizeof(float));
+    memcpy(x->data, enc_buf.data(), seq_len * 512 * sizeof(float));
 
     auto safe_reshape_2d = [&](struct ggml_tensor * a, int64_t ne0, int64_t ne1, const char * name) {
         if (ggml_nelements(a) != ne0 * ne1) {

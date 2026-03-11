@@ -4199,6 +4199,14 @@ float * whisper_get_embd_enc_from_state(struct whisper_state * state) {
     return (float *) state->embd_enc->data;
 }
 
+int whisper_copy_embd_enc_from_state(struct whisper_state * state, float * buffer, int n_elements) {
+    if (!state || !state->embd_enc || !buffer || n_elements <= 0) return -1;
+    int tensor_elements = (int)ggml_nelements(state->embd_enc);
+    int to_copy = std::min(n_elements, tensor_elements);
+    ggml_backend_tensor_get(state->embd_enc, buffer, 0, to_copy * sizeof(float));
+    return to_copy;
+}
+
 const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token) {
     return ctx->vocab.id_to_token.at(token).c_str();
 }
