@@ -420,6 +420,11 @@ extern "C" {
     // Cols: n_audio_state
     WHISPER_API float * whisper_get_embd_enc_from_state(struct whisper_state * state);
 
+    // Copy encoder embeddings safely to a provided CPU buffer (works with both GPU and CPU tensors)
+    // Returns the number of float elements copied, or -1 on error.
+    // buffer must have space for at least n_elements floats.
+    WHISPER_API int whisper_copy_embd_enc_from_state(struct whisper_state * state, float * buffer, int n_elements);
+
     // Token Id -> String. Uses the vocabulary in the provided context
     WHISPER_API const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token);
     WHISPER_API const char * whisper_model_type_readable(struct whisper_context * ctx);
