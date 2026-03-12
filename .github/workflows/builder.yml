@@ -13,10 +13,10 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        cuda_version: ['12.4.1', '13.0.2']
+        cuda_version: ['12.4.0', '13.0.2']
         include:
-          - cuda_version: '12.4.1'
-            optimized: 'windows-cuda-1241'
+          - cuda_version: '12.4.0'
+            optimized: 'windows-cuda-1240'
           - cuda_version: '13.0.2'
             optimized: 'windows-cuda-1302'
     steps:
@@ -286,10 +286,10 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        cuda_version: ['12.4.1', '13.0.2']
+        cuda_version: ['12.4.0', '13.0.2']
         include:
-          - cuda_version: '12.4.1'
-            optimized: 'linux-cuda-1241'
+          - cuda_version: '12.4.0'
+            optimized: 'linux-cuda-1240'
           - cuda_version: '13.0.2'
             optimized: 'linux-cuda-1302'
     steps:
