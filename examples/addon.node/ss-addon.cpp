@@ -1,12 +1,8 @@
-#include <napi.h>
+#include "nec-addon.h"
 #include <string>
 #include <vector>
 #include <thread>
 #include <iostream>
-
-// Standard whisper and ggml headers
-#include "whisper.h"
-
 #include <fstream>
 #include <cmath>
 #include "ggml.h"
@@ -62,7 +58,7 @@ struct ss_model {
         } \
     } while (0)
 
-static struct ss_model * whisper_ss_init_from_file(const char * path_model) {
+struct ss_model * whisper_ss_init_from_file(const char * path_model) {
     std::string path_str = path_model;
     std::ifstream is(path_str, std::ios::binary);
     SS_CHECK(is.is_open(), "failed to open ss-model.bin");
@@ -198,7 +194,7 @@ static struct ss_model * whisper_ss_init_from_file(const char * path_model) {
     return model;
 }
 
-static void whisper_ss_free(struct ss_model * model) {
+void whisper_ss_free(struct ss_model * model) {
     if (!model) return;
     
     // Free malloc'd data
@@ -454,6 +450,7 @@ public:
                       const std::string& ss_model_path, 
                       const std::string& base_model_path, 
                       whisper_context* shared_wctx,
+                      struct ss_model* shared_ss_ctx,
                       const std::string& vad_model_path,
                       bool use_gpu,
                       whisper_vad_params vad_params,
@@ -462,18 +459,23 @@ public:
           m_ss_path(ss_model_path), 
           m_base_path(base_model_path), 
           m_shared_wctx(shared_wctx),
+          m_shared_ss_ctx(shared_ss_ctx),
           m_owns_wctx(shared_wctx == nullptr),
+          m_owns_ss_ctx(shared_ss_ctx == nullptr),
           m_vad_path(vad_model_path),
           m_use_gpu(use_gpu),
           m_vad_params(vad_params),
           m_pcmf32(pcmf32) {}
 
     void Execute() override {
-        // 1. Initialize SS model
-        struct ss_model * ss_ctx = whisper_ss_init_from_file(m_ss_path.c_str());
+        // 1. Initialize SS model (or use shared)
+        struct ss_model * ss_ctx = m_shared_ss_ctx;
         if (!ss_ctx) {
-            SetError("Failed to initialize SS Model from " + m_ss_path);
-            return;
+            ss_ctx = whisper_ss_init_from_file(m_ss_path.c_str());
+            if (!ss_ctx) {
+                SetError("Failed to initialize SS Model from " + m_ss_path);
+                return;
+            }
         }
 
         // 2. Initialize Whisper Base Context (or use shared)
@@ -541,7 +543,9 @@ public:
         if (m_owns_wctx && wctx) {
             whisper_free(wctx);
         }
-        whisper_ss_free(ss_ctx);
+        if (m_owns_ss_ctx && ss_ctx) {
+            whisper_ss_free(ss_ctx);
+        }
     }
 
     void OnOK() override {
@@ -574,7 +578,9 @@ private:
     std::string m_ss_path;
     std::string m_base_path;
     whisper_context* m_shared_wctx;
+    struct ss_model* m_shared_ss_ctx;
     bool m_owns_wctx;
+    bool m_owns_ss_ctx;
     std::string m_vad_path;
     bool m_use_gpu;
     whisper_vad_params m_vad_params;
@@ -594,49 +600,46 @@ private:
 //    threshold: 0.9, ...
 // }, callback)
 // -------------------------------------------------------------------------
-Napi::Value extractSSEmbedding(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-
-    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
-        Napi::TypeError::New(env, "Usage: extractSSEmbedding(options, callback)")
-            .ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    Napi::Object options = info[0].As<Napi::Object>();
-    Napi::Function callback = info[1].As<Napi::Function>();
-
+Napi::Value QueueSSEmbeddingWorkerFromOptions(Napi::Env env, Napi::Object options, Napi::Function callback, whisper_context* shared_wctx, struct ss_model* shared_ss_ctx) {
     // Parse options
-    if (!options.Has("model") || !options.Get("model").IsString()) {
-        Napi::TypeError::New(env, "Option 'model' must be a string.").ThrowAsJavaScriptException();
-        return env.Undefined();
+    std::string model_path = "";
+    if (shared_ss_ctx == nullptr) {
+        if (!options.Has("model") || !options.Get("model").IsString()) {
+            Napi::TypeError::New(env, "Option 'model' must be a string if SS model is not pre-loaded.").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        model_path = options.Get("model").As<Napi::String>();
+    } else {
+        if (options.Has("model") && options.Get("model").IsString()) {
+            model_path = options.Get("model").As<Napi::String>();
+        }
     }
-    std::string model_path = options.Get("model").As<Napi::String>();
 
     std::string base_model_path = "";
-    whisper_context* shared_wctx = nullptr;
-
-    if (options.Has("base_model")) {
-        Napi::Value base_model_val = options.Get("base_model");
-        if (base_model_val.IsString()) {
-            base_model_path = base_model_val.As<Napi::String>();
-        } else if (base_model_val.IsObject()) {
-            // Attempt to unwrap it as NEC object
-            Napi::Object obj = base_model_val.As<Napi::Object>();
-            NEC* nec_instance = Napi::ObjectWrap<NEC>::Unwrap(obj);
-            if (nec_instance) {
-                shared_wctx = nec_instance->GetContext();
+    if (shared_wctx == nullptr) {
+        if (options.Has("base_model")) {
+            Napi::Value base_model_val = options.Get("base_model");
+            if (base_model_val.IsString()) {
+                base_model_path = base_model_val.As<Napi::String>();
+            } else if (base_model_val.IsObject()) {
+                // Attempt to unwrap it as NEC object
+                Napi::Object obj = base_model_val.As<Napi::Object>();
+                NEC* nec_instance = Napi::ObjectWrap<NEC>::Unwrap(obj);
+                if (nec_instance) {
+                    shared_wctx = nec_instance->GetContext();
+                    shared_ss_ctx = nec_instance->GetSSContext();
+                } else {
+                    Napi::TypeError::New(env, "Option 'base_model' object is not a valid NEC instance.").ThrowAsJavaScriptException();
+                    return env.Undefined();
+                }
             } else {
-                Napi::TypeError::New(env, "Option 'base_model' object is not a valid NEC instance.").ThrowAsJavaScriptException();
+                Napi::TypeError::New(env, "Option 'base_model' must be a string or a valid NEC instance.").ThrowAsJavaScriptException();
                 return env.Undefined();
             }
         } else {
-            Napi::TypeError::New(env, "Option 'base_model' must be a string or a valid NEC instance.").ThrowAsJavaScriptException();
+            Napi::TypeError::New(env, "Option 'base_model' is required.").ThrowAsJavaScriptException();
             return env.Undefined();
         }
-    } else {
-        Napi::TypeError::New(env, "Option 'base_model' is required.").ThrowAsJavaScriptException();
-        return env.Undefined();
     }
 
     if (!options.Has("pcmf32") || !options.Get("pcmf32").IsTypedArray()) {
@@ -673,10 +676,24 @@ Napi::Value extractSSEmbedding(const Napi::CallbackInfo& info) {
         vad_params.speech_pad_ms = options.Get("speech_pad_ms").As<Napi::Number>();
     }
 
-    // Queue worker
     SSEmbeddingWorker* worker = new SSEmbeddingWorker(
-        callback, model_path, base_model_path, shared_wctx, vad_model_path, use_gpu, vad_params, pcmf32);
+        callback, model_path, base_model_path, shared_wctx, shared_ss_ctx, vad_model_path, use_gpu, vad_params, pcmf32);
     worker->Queue();
 
     return env.Undefined();
+}
+
+Napi::Value extractSSEmbedding(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "Usage: extractSSEmbedding(options, callback)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    Napi::Function callback = info[1].As<Napi::Function>();
+
+    return QueueSSEmbeddingWorkerFromOptions(env, options, callback, nullptr, nullptr);
 }
