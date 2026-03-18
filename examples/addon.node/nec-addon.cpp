@@ -1,5 +1,4 @@
-#include <napi.h>
-#include "whisper.h"
+#include "nec-addon.h"
 
 #include <vector>
 #include <string>
@@ -127,23 +126,9 @@ static std::string apply_single_correction(
     return result;
 }
 
-// --- NEC Class ---
+// --- NEC Pipeline Worker ---
 
-class NEC : public Napi::ObjectWrap<NEC> {
-public:
-    static Napi::Object Init(Napi::Env env, Napi::Object exports);
-    NEC(const Napi::CallbackInfo& info);
-    ~NEC();
-
-    whisper_context* GetContext() const { return m_ctx; }
-
-private:
-    Napi::Value Correct(const Napi::CallbackInfo& info);
-    Napi::Value Free(const Napi::CallbackInfo& info);
-
-    whisper_context* m_ctx = nullptr;
-    std::string m_model_path;
-};
+// The NEC class definition is now in nec-addon.h
 
 // --- Worker ---
 
@@ -157,6 +142,7 @@ public:
         std::vector<std::string> candidates,
         int n_threads,
         int max_tokens,
+        float similarity_threshold,
         bool debug
     ) : Napi::AsyncWorker(callback),
         m_ctx(ctx),
@@ -165,6 +151,7 @@ public:
         m_candidates(std::move(candidates)),
         m_n_threads(n_threads),
         m_max_tokens(max_tokens),
+        m_similarity_threshold(similarity_threshold),
         m_debug(debug) {}
 
     void Execute() override {
@@ -303,6 +290,7 @@ private:
     std::vector<std::string> m_candidates;
     int m_n_threads;
     int m_max_tokens;
+    float m_similarity_threshold;
     bool m_debug;
     
     std::vector<std::pair<std::string, std::string>> m_corrections_log;
@@ -313,6 +301,7 @@ private:
 Napi::Object NEC::Init(Napi::Env env, Napi::Object exports) {
     Napi::Function func = DefineClass(env, "NEC", {
         InstanceMethod("correct", &NEC::Correct),
+        InstanceMethod("extractSSEmbedding", &NEC::ExtractSSEmbedding),
         InstanceMethod("free", &NEC::Free)
     });
 
@@ -331,10 +320,14 @@ NEC::NEC(const Napi::CallbackInfo& info) : Napi::ObjectWrap<NEC>(info) {
     }
     
     m_model_path = info[0].As<Napi::String>().Utf8Value();
-    bool use_gpu = true; 
+    bool use_gpu = true;
+    std::string ss_model_path = "";
     if (info.Length() > 1 && info[1].IsObject()) {
         Napi::Object opts = info[1].As<Napi::Object>();
         if (opts.Has("use_gpu")) use_gpu = opts.Get("use_gpu").As<Napi::Boolean>().Value();
+        if (opts.Has("ss_model") && opts.Get("ss_model").IsString()) {
+            ss_model_path = opts.Get("ss_model").As<Napi::String>().Utf8Value();
+        }
     }
     
     whisper_context_params cparams = whisper_context_default_params();
@@ -344,12 +337,23 @@ NEC::NEC(const Napi::CallbackInfo& info) : Napi::ObjectWrap<NEC>(info) {
     if (!m_ctx) {
         Napi::Error::New(env, "Failed to load NEC model").ThrowAsJavaScriptException();
     }
+
+    if (!ss_model_path.empty()) {
+        m_ss_ctx = whisper_ss_init_from_file(ss_model_path.c_str());
+        if (!m_ss_ctx) {
+            Napi::Error::New(env, "Failed to load SS model").ThrowAsJavaScriptException();
+        }
+    }
 }
 
 NEC::~NEC() {
     if (m_ctx) {
         whisper_free(m_ctx);
         m_ctx = nullptr;
+    }
+    if (m_ss_ctx) {
+        whisper_ss_free(m_ss_ctx);
+        m_ss_ctx = nullptr;
     }
 }
 
@@ -378,12 +382,14 @@ Napi::Value NEC::Correct(const Napi::CallbackInfo& info) {
     int idx = 3;
     int n_threads = 4;
     int max_tokens = 64;
+    float similarity_threshold = 0.6f;
     bool debug = false;
     
     if (info.Length() > 3 && info[3].IsObject()) {
         Napi::Object opts = info[3].As<Napi::Object>();
         if (opts.Has("n_threads")) n_threads = opts.Get("n_threads").As<Napi::Number>().Int32Value();
         if (opts.Has("max_tokens")) max_tokens = opts.Get("max_tokens").As<Napi::Number>().Int32Value();
+        if (opts.Has("similarity_threshold")) similarity_threshold = opts.Get("similarity_threshold").As<Napi::Number>().FloatValue();
         if (opts.Has("debug")) debug = opts.Get("debug").As<Napi::Boolean>().Value();
         idx++;
     }
@@ -397,17 +403,36 @@ Napi::Value NEC::Correct(const Napi::CallbackInfo& info) {
     
     NECPipelineWorker* worker = new NECPipelineWorker(
         callback, m_ctx, std::move(pcmf32), transcript, std::move(candidates),
-        n_threads, max_tokens, debug
+        n_threads, max_tokens, similarity_threshold, debug
     );
     worker->Queue();
     
     return env.Undefined();
 }
 
+Napi::Value NEC::ExtractSSEmbedding(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "Usage: extractSSEmbedding(options, callback)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    Napi::Function callback = info[1].As<Napi::Function>();
+
+    return QueueSSEmbeddingWorkerFromOptions(env, options, callback, this->GetContext(), this->GetSSContext());
+}
+
 Napi::Value NEC::Free(const Napi::CallbackInfo& info) {
     if (m_ctx) {
         whisper_free(m_ctx);
         m_ctx = nullptr;
+    }
+    if (m_ss_ctx) {
+        whisper_ss_free(m_ss_ctx);
+        m_ss_ctx = nullptr;
     }
     return info.Env().Undefined();
 }
