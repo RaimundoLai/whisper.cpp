@@ -7,6 +7,7 @@
 #include <chrono>
 #include <algorithm>
 #include <fstream>
+#include <map>
 
 namespace qwen3_asr {
 
@@ -78,6 +79,69 @@ transcribe_result Qwen3ASR::transcribe(const float * samples, int n_samples,
     return transcribe_internal(samples, n_samples, params);
 }
 
+static const std::map<std::string, std::vector<int32_t>> kLanguageTaskTokens = {
+    {"english", {11528, 6364, 151704}},
+    {"en", {11528, 6364, 151704}},
+    {"chinese", {11528, 8453, 151704}},
+    {"zh", {11528, 8453, 151704}},
+    {"cantonese", {11528, 72366, 2367, 151704}},
+    {"yue", {11528, 72366, 2367, 151704}},
+    {"japanese", {11528, 10769, 151704}},
+    {"ja", {11528, 10769, 151704}},
+    {"korean", {11528, 16134, 151704}},
+    {"ko", {11528, 16134, 151704}},
+    {"french", {11528, 8585, 151704}},
+    {"fr", {11528, 8585, 151704}},
+    {"german", {11528, 5938, 151704}},
+    {"de", {11528, 5938, 151704}},
+    {"spanish", {11528, 15154, 151704}},
+    {"es", {11528, 15154, 151704}},
+    {"portuguese", {11528, 42188, 151704}},
+    {"pt", {11528, 42188, 151704}},
+    {"italian", {11528, 14811, 151704}},
+    {"it", {11528, 14811, 151704}},
+    {"russian", {11528, 8522, 151704}},
+    {"ru", {11528, 8522, 151704}},
+    {"arabic", {11528, 34117, 151704}},
+    {"ar", {11528, 34117, 151704}},
+    {"hindi", {11528, 43980, 151704}},
+    {"hi", {11528, 43980, 151704}},
+    {"thai", {11528, 26392, 151704}},
+    {"th", {11528, 26392, 151704}},
+    {"vietnamese", {11528, 48477, 151704}},
+    {"vi", {11528, 48477, 151704}},
+    {"indonesian", {11528, 58829, 151704}},
+    {"id", {11528, 58829, 151704}},
+    {"malay", {11528, 79140, 151704}},
+    {"ms", {11528, 79140, 151704}},
+    {"turkish", {11528, 23734, 151704}},
+    {"tr", {11528, 23734, 151704}},
+    {"dutch", {11528, 23234, 151704}},
+    {"nl", {11528, 23234, 151704}},
+    {"swedish", {11528, 30109, 151704}},
+    {"sv", {11528, 30109, 151704}},
+    {"danish", {11528, 43680, 151704}},
+    {"da", {11528, 43680, 151704}},
+    {"finnish", {11528, 57853, 151704}},
+    {"fi", {11528, 57853, 151704}},
+    {"polish", {11528, 31984, 151704}},
+    {"pl", {11528, 31984, 151704}},
+    {"czech", {11528, 33150, 151704}},
+    {"cs", {11528, 33150, 151704}},
+    {"greek", {11528, 17860, 151704}},
+    {"el", {11528, 17860, 151704}},
+    {"hungarian", {11528, 56769, 151704}},
+    {"hu", {11528, 56769, 151704}},
+    {"romanian", {11528, 73597, 151704}},
+    {"ro", {11528, 73597, 151704}},
+    {"persian", {11528, 49861, 151704}},
+    {"fa", {11528, 49861, 151704}},
+    {"filipino", {11528, 62417, 151704}},
+    {"fil", {11528, 62417, 151704}},
+    {"macedonian", {11528, 56452, 75491, 151704}},
+    {"mk", {11528, 56452, 75491, 151704}},
+};
+
 transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_samples,
                                                  const transcribe_params & params) {
     transcribe_result result;
@@ -131,56 +195,117 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     result.t_decode_ms = get_time_ms() - t_decode_start;
     
     result.tokens = output_tokens;
-    // Identify language prefix using tokens (more robust than string parsing)
-    // Format is usually: [language] [LangName] [151704 SEPARATOR] [Transcription...]
-    const int32_t separator_token = 151704;
-    size_t sep_idx = std::string::npos;
     
-    for (size_t i = 0; i < output_tokens.size(); ++i) {
-        if (output_tokens[i] == separator_token) {
-            sep_idx = i;
-            break;
-        }
+    std::string detected_lang = params.language;
+    if (detected_lang == "auto") {
+        detected_lang = "";
     }
     
-    std::string detected_lang = "";
     std::string decoded_text = "";
-    
-    if (sep_idx != std::string::npos) {
-        // We found the separator!
-        std::vector<int32_t> lang_tokens(output_tokens.begin(), output_tokens.begin() + sep_idx);
-        std::vector<int32_t> text_tokens(output_tokens.begin() + sep_idx + 1, output_tokens.end());
+    bool prefix_removed = false;
+    const int32_t separator_token = 151704;
+
+    // 1. FIRST PRIORITY: Match known language tokens from dictionary
+    size_t match_len = 0;
+    std::string matched_lang_key = "";
+
+    for (const auto& kv : kLanguageTaskTokens) {
+        const auto& lang_tokens = kv.second;
+        size_t check_len = lang_tokens.size() > 0 ? lang_tokens.size() - 1 : 0;
         
-        std::string lang_str = decoder_.decode_tokens(lang_tokens);
-        decoded_text = decoder_.decode_tokens(text_tokens);
-        
-        // Strip "language " prefix from lang_str if present
-        while(!lang_str.empty() && lang_str[0] == ' ') lang_str.erase(0, 1);
-        if (lang_str.size() > 9 && lang_str.substr(0, 9) == "language ") {
-            lang_str = lang_str.substr(9);
+        if (check_len > 0 && output_tokens.size() >= check_len) {
+            bool match = true;
+            for (size_t i = 0; i < check_len; ++i) {
+                if (output_tokens[i] != lang_tokens[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match && check_len > match_len) {
+                match_len = check_len;
+                matched_lang_key = kv.first; // e.g., "chinese", "indonesian"
+            }
         }
-        while(!lang_str.empty() && lang_str[0] == ' ') lang_str.erase(0, 1);
-        detected_lang = lang_str;
-    } else {
-        // Fallback to original logic if separator is missing (should not happen with Qwen3 ASR)
-        decoded_text = decoder_.decode_tokens(output_tokens);
+    }
+
+    if (match_len > 0) {
+        if (detected_lang.empty()) {
+            detected_lang = matched_lang_key;
+        }
+        size_t erase_len = match_len;
+        if (output_tokens.size() > match_len && output_tokens[match_len] == separator_token) {
+            erase_len++; 
+        }
+        output_tokens.erase(output_tokens.begin(), output_tokens.begin() + erase_len);
+        prefix_removed = true;
+    }
+
+    // 2. Fallback: Search for the 151704 separator if dictionary matching failed
+    if (!prefix_removed) {
+        auto sep_it = std::find(output_tokens.begin(), output_tokens.end(), separator_token);
+        if (sep_it != output_tokens.end() && std::distance(output_tokens.begin(), sep_it) <= 10) {
+            std::vector<int32_t> lang_tokens(output_tokens.begin(), sep_it);
+            std::string parsed_lang = decoder_.decode_tokens(lang_tokens);
+            
+            output_tokens.erase(output_tokens.begin(), sep_it + 1);
+            prefix_removed = true;
+            
+            while(!parsed_lang.empty() && (parsed_lang[0] == ' ' || parsed_lang[0] == '\n')) {
+                parsed_lang.erase(0, 1);
+            }
+            if (parsed_lang.size() > 9 && parsed_lang.substr(0, 9) == "language ") {
+                parsed_lang = parsed_lang.substr(9);
+            } else if (parsed_lang.size() > 8 && parsed_lang.substr(0, 8) == "language") {
+                parsed_lang = parsed_lang.substr(8);
+            }
+            
+            if (detected_lang.empty()) {
+                detected_lang = parsed_lang; 
+            }
+        }
+    }
+
+    decoded_text = decoder_.decode_tokens(output_tokens);
+
+    // 3. Absolute string fallback
+    if (!prefix_removed) {
         std::string text_trim = decoded_text;
-        while(!text_trim.empty() && text_trim[0] == ' ') text_trim.erase(0, 1);
+        while(!text_trim.empty() && (text_trim[0] == ' ' || text_trim[0] == '\n' || text_trim[0] == '\r')) {
+            text_trim.erase(0, 1);
+        }
         
-        if (text_trim.size() > 9 && text_trim.substr(0, 9) == "language ") {
-            size_t lang_start = 9;
-            size_t lang_end = lang_start;
-            while (lang_end < text_trim.size() && 
-                  ((text_trim[lang_end] >= 'a' && text_trim[lang_end] <= 'z') || 
-                   (text_trim[lang_end] >= 'A' && text_trim[lang_end] <= 'Z'))) {
-                lang_end++;
+        if (text_trim.size() > 8 && text_trim.substr(0, 8) == "language") {
+            size_t pos = 8;
+            while (pos < text_trim.size() && (text_trim[pos] == ' ' || text_trim[pos] == ':')) pos++;
+            
+            size_t lang_start = pos;
+            while (pos < text_trim.size() && 
+                  ((text_trim[pos] >= 'a' && text_trim[pos] <= 'z') || 
+                   (text_trim[pos] >= 'A' && text_trim[pos] <= 'Z'))) {
+                pos++;
             }
-            if (lang_end > lang_start) {
-                detected_lang = text_trim.substr(lang_start, lang_end - lang_start);
-                decoded_text = text_trim.substr(lang_end);
-                while(!decoded_text.empty() && decoded_text[0] == ' ') decoded_text.erase(0, 1);
+            
+            if (pos > lang_start) {
+                if (detected_lang.empty()) {
+                    detected_lang = text_trim.substr(lang_start, pos - lang_start);
+                }
+                text_trim.erase(0, pos);
+                
+                while(!text_trim.empty() && (text_trim[0] == ' ' || text_trim[0] == '\n' || text_trim[0] == '\r')) {
+                    text_trim.erase(0, 1);
+                }
+                if (text_trim.find("<asr_text>") == 0) {
+                    text_trim.erase(0, 10);
+                }
+                while(!text_trim.empty() && (text_trim[0] == ' ' || text_trim[0] == '\n' || text_trim[0] == '\r')) {
+                    text_trim.erase(0, 1);
+                }
+                decoded_text = text_trim;
             }
         }
+    }
+    if (detected_lang.empty() && params.language == "auto") {
+        detected_lang = "auto";
     }
 
     result.text = decoded_text;
@@ -252,7 +377,15 @@ std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
     tokens.push_back(assistant_token);
     tokens.push_back(newline);
     
-    (void)language;
+    if (!language.empty()) {
+      std::string lang_lower = language;
+      std::transform(lang_lower.begin(), lang_lower.end(), lang_lower.begin(),
+                     ::tolower);
+      auto it = kLanguageTaskTokens.find(lang_lower);
+      if (it != kLanguageTaskTokens.end()) {
+        tokens.insert(tokens.end(), it->second.begin(), it->second.end());
+      }
+    }
     
     return tokens;
 }
