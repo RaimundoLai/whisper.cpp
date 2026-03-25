@@ -2406,7 +2406,9 @@ static bool whisper_encode_internal(
             ggml_backend_sched_reset(sched);
 
 #if defined(WHISPER_USE_COREML)
-            whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], (float *) mel->data, (float *) wstate.embd_enc->data);
+            std::vector<float> embd_enc_cpu(ggml_nelements(wstate.embd_enc), 0.0f);
+            whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], wstate.inp_mel.data(), embd_enc_cpu.data());
+            ggml_backend_tensor_set(wstate.embd_enc, embd_enc_cpu.data(), 0, ggml_nbytes(wstate.embd_enc));
 #elif defined(WHISPER_USE_OPENVINO)
             whisper_openvino_encode(wstate.ctx_openvino, mel, wstate.embd_enc);
 #endif
