@@ -496,7 +496,7 @@ public:
         if (!m_vad_path.empty()) {
             // VAD is enabled
             struct whisper_vad_context_params vad_cparams = whisper_vad_default_context_params();
-            vad_cparams.use_gpu = m_use_gpu;
+            vad_cparams.use_gpu = false; // Use CPU for VAD to avoid GPU/CUDA/Metal issues
             whisper_vad_context* vad_ctx = whisper_vad_init_from_file_with_params(m_vad_path.c_str(), vad_cparams);
             
             if (!vad_ctx) {
