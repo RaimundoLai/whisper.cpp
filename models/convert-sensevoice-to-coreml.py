@@ -9,7 +9,7 @@ except ImportError:
     print("Please install funasr: pip install funasr")
     exit(1)
 
-def convert_sensevoice(model_name_or_path: str, quantize_type: str = "fp16", output_dir: str = "models"):
+def convert_sensevoice(model_name_or_path: str, quantize_type: str = "fp16", output_dir: str = "models", deployment_target: str = "macOS14"):
     """
     Convert SenseVoice model to CoreML.
 
@@ -84,6 +84,11 @@ def convert_sensevoice(model_name_or_path: str, quantize_type: str = "fp16", out
     else:
         print("Using precision: FLOAT32 (will quantize later if needed)")
 
+    target = getattr(ct.target, deployment_target, None)
+    if target is None:
+        avail = sorted([n for n in dir(ct.target) if n.startswith(("macOS", "iOS"))])
+        raise SystemExit(f"Unknown deployment target: {deployment_target}. Available: {', '.join(avail)}")
+
     mlmodel = ct.convert(
         traced_encoder,
         inputs=[
@@ -92,6 +97,7 @@ def convert_sensevoice(model_name_or_path: str, quantize_type: str = "fp16", out
         ],
         outputs=[ct.TensorType(name="encoder_out")],
         convert_to="mlprogram",
+        minimum_deployment_target=target,
         compute_units=ct.ComputeUnit.ALL,
         compute_precision=precision
     )
@@ -168,7 +174,8 @@ if __name__ == "__main__":
     # quantize parameter: default is fp16. Acceptable: fp16, q8_0, float32
     parser.add_argument("--quantize", type=str, default="fp16", help="Quantization type (default: fp16). Options: fp16, q8_0, float32")
     parser.add_argument("--output-dir", type=str, default="models", help="Output directory")
+    parser.add_argument("--deployment-target", type=str, default="macOS14", help="Minimum deployment target (e.g. macOS14, macOS15)")
     
     args = parser.parse_args()
     
-    convert_sensevoice(args.model_path, args.quantize, args.output_dir)
+    convert_sensevoice(args.model_path, args.quantize, args.output_dir, args.deployment_target)
