@@ -346,7 +346,7 @@ def build_ane_encoder(config: WhisperConfig, hf_encoder_state_dict: dict):
     return encoder
 
 
-def convert_encoder_to_coreml(encoder: nn.Module, n_mels: int, quantize: bool = False):
+def convert_encoder_to_coreml(encoder: nn.Module, n_mels: int, quantize: bool = False, deployment_target: str = "macOS14"):
     """Convert encoder to CoreML format."""
     encoder.eval()
     
@@ -358,11 +358,17 @@ def convert_encoder_to_coreml(encoder: nn.Module, n_mels: int, quantize: bool = 
     traced_model = torch.jit.trace(encoder, input_data)
     
     print("  Converting to CoreML...")
+    target = getattr(ct.target, deployment_target, None)
+    if target is None:
+        avail = sorted([n for n in dir(ct.target) if n.startswith(("macOS", "iOS"))])
+        raise SystemExit(f"Unknown deployment target: {deployment_target}. Available: {', '.join(avail)}")
+
     coreml_model = ct.convert(
         traced_model,
         convert_to="mlprogram",
         inputs=[ct.TensorType(name="logmel_data", shape=input_shape)],
         outputs=[ct.TensorType(name="output")],
+        minimum_deployment_target=target,
         compute_units=ct.ComputeUnit.ALL,
     )
     
@@ -442,6 +448,10 @@ if __name__ == "__main__":
         "--skip-compile", action="store_true", default=False,
         help="Skip compilation to .mlmodelc (only save .mlpackage)"
     )
+    parser.add_argument(
+        "--deployment-target", type=str, default="macOS14",
+        help="Minimum deployment target (e.g. macOS14, macOS15)"
+    )
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
@@ -474,7 +484,8 @@ if __name__ == "__main__":
     coreml_encoder = convert_encoder_to_coreml(
         encoder, 
         n_mels=config.num_mel_bins,
-        quantize=args.quantize
+        quantize=args.quantize,
+        deployment_target=args.deployment_target
     )
     
     # Save .mlpackage
