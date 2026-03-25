@@ -117,6 +117,7 @@ struct whisper_params {
     bool flash_attn      = false;
     bool comma_in_time   = true;
     bool output_tokens   = false; // [New] Option to control whether to output token data
+    bool debug_mode      = false;
 
     std::string language = "en";
     std::string prompt;
@@ -202,6 +203,8 @@ void whisper_print_segment_callback(struct whisper_context * ctx, struct whisper
     }
 }
 
+std::atomic<bool> g_addon_debug_mode{false};
+
 // Global log callback to suppress INFO logs unless requested
 void addon_whisper_log_callback(ggml_log_level level, const char * text, void * user_data) {
     // Check environment variable once
@@ -213,7 +216,7 @@ void addon_whisper_log_callback(ggml_log_level level, const char * text, void * 
         debug_env_checked = true;
     }
 
-    if (!debug_enabled && level < GGML_LOG_LEVEL_WARN) {
+    if (!debug_enabled && !g_addon_debug_mode.load() && level < GGML_LOG_LEVEL_WARN) {
         return;
     }
     fprintf(stderr, "%s", text);
@@ -673,6 +676,10 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     if (whisper_params.Has("output_tokens") && whisper_params.Get("output_tokens").IsBoolean()) {
         params.output_tokens = whisper_params.Get("output_tokens").As<Napi::Boolean>();
     }
+    if (whisper_params.Has("debug") && whisper_params.Get("debug").IsBoolean()) {
+        params.debug_mode = whisper_params.Get("debug").As<Napi::Boolean>();
+        g_addon_debug_mode.store(params.debug_mode);
+    }
 
     Napi::Function progress_callback;
     if (whisper_params.Has("progress_callback") && whisper_params.Get("progress_callback").IsFunction()) {
@@ -811,6 +818,7 @@ private:
     bool m_single_segment = false;
     bool m_no_timestamps = false;
     std::string m_prompt;
+    bool m_debug_mode = false;
 };
 
 // --- Implementation of WhisperStream Methods ---
@@ -847,6 +855,10 @@ WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
     if (options.Has("step_ms") && options.Get("step_ms").IsNumber()) m_step_ms = options.Get("step_ms").As<Napi::Number>();
     if (options.Has("length_ms") && options.Get("length_ms").IsNumber()) m_length_ms = options.Get("length_ms").As<Napi::Number>();
     if (options.Has("keep_ms") && options.Get("keep_ms").IsNumber()) m_keep_ms = options.Get("keep_ms").As<Napi::Number>();
+    if (options.Has("debug") && options.Get("debug").IsBoolean()) {
+        m_debug_mode = options.Get("debug").As<Napi::Boolean>();
+        g_addon_debug_mode.store(m_debug_mode);
+    }
     // VAD parameters (vad_simple)
     if (options.Has("use_vad") && options.Get("use_vad").IsBoolean()) m_use_vad = options.Get("use_vad").As<Napi::Boolean>();
     if (options.Has("vad_thold") && options.Get("vad_thold").IsNumber()) m_vad_thold = options.Get("vad_thold").As<Napi::Number>().FloatValue();
