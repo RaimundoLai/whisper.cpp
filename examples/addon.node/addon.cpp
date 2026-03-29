@@ -557,49 +557,66 @@ private:
 
                 if (params.output_tokens) {
                     const int n_tokens = whisper_full_n_tokens(ctx, segment_index);
-                    int j = 0;
-                    while (j < n_tokens) {
-                        auto token_data_first = whisper_full_get_token_data(ctx, segment_index, j);
-                        std::string current_text = whisper_token_to_str(ctx, token_data_first.id);
+                    if (n_tokens > 0) {
+                        auto token_data_first_overall = whisper_full_get_token_data(ctx, segment_index, 0);
+                        int64_t segment_t0 = whisper_full_get_segment_t0(ctx, segment_index);
+                        int64_t segment_t1 = whisper_full_get_segment_t1(ctx, segment_index);
+                        
+                        // Calculate missing VAD/chunk offset
+                        int64_t missing_offset_10ms = segment_t0 - token_data_first_overall.t0;
 
-                        if (is_valid_utf8(current_text)) {
-                            // Token is a valid UTF-8 character, add it directly
-                            token_data td;
-                            td.text = current_text;
-                            td.id = token_data_first.id;
-                            td.p = token_data_first.p;
-                            td.start_timestamp = to_timestamp(token_data_first.t0, params.comma_in_time);
-                            td.end_timestamp = to_timestamp(token_data_first.t1, params.comma_in_time);
-                            seg.tokens.push_back(td);
-                            j++;
-                        } else {
-                            // Token is an incomplete UTF-8, start merging
-                            std::string merged_text = current_text;
-                            int64_t start_time = token_data_first.t0;
-                            int64_t end_time = token_data_first.t1;
-                            int k = j + 1;
-                            
-                            while (k < n_tokens) {
-                                auto token_data_next = whisper_full_get_token_data(ctx, segment_index, k);
-                                merged_text += whisper_token_to_str(ctx, token_data_next.id);
+                        int j = 0;
+                        while (j < n_tokens) {
+                            auto token_data_first = whisper_full_get_token_data(ctx, segment_index, j);
+                            std::string current_text = whisper_token_to_str(ctx, token_data_first.id);
+
+                            if (is_valid_utf8(current_text)) {
+                                // Token is a valid UTF-8 character, add it directly
+                                token_data td;
+                                td.text = current_text;
+                                td.id = token_data_first.id;
+                                td.p = token_data_first.p;
+
+                                int64_t t0 = std::max(segment_t0, std::min(segment_t1, token_data_first.t0 + missing_offset_10ms));
+                                int64_t t1 = std::max(segment_t0, std::min(segment_t1, token_data_first.t1 + missing_offset_10ms));
+
+                                td.start_timestamp = to_timestamp(t0, params.comma_in_time);
+                                td.end_timestamp = to_timestamp(t1, params.comma_in_time);
+                                seg.tokens.push_back(td);
+                                j++;
+                            } else {
+                                // Token is an incomplete UTF-8, start merging
+                                std::string merged_text = current_text;
+                                int64_t start_time = token_data_first.t0;
+                                int64_t end_time = token_data_first.t1;
+                                int k = j + 1;
                                 
-                                if (is_valid_utf8(merged_text)) {
-                                    // Becomes a valid UTF-8 character after merging
-                                    end_time = token_data_next.t1;
-                                    break;
+                                while (k < n_tokens) {
+                                    auto token_data_next = whisper_full_get_token_data(ctx, segment_index, k);
+                                    merged_text += whisper_token_to_str(ctx, token_data_next.id);
+                                    
+                                    if (is_valid_utf8(merged_text)) {
+                                        // Becomes a valid UTF-8 character after merging
+                                        end_time = token_data_next.t1;
+                                        break;
+                                    }
+                                    k++;
                                 }
-                                k++;
+
+                                token_data td;
+                                td.text = merged_text;
+                                td.id = token_data_first.id; // Use the id and p of the first token
+                                td.p = token_data_first.p;
+
+                                int64_t t0 = std::max(segment_t0, std::min(segment_t1, start_time + missing_offset_10ms));
+                                int64_t t1 = std::max(segment_t0, std::min(segment_t1, end_time + missing_offset_10ms));
+
+                                td.start_timestamp = to_timestamp(t0, params.comma_in_time);
+                                td.end_timestamp = to_timestamp(t1, params.comma_in_time);
+                                seg.tokens.push_back(td);
+
+                                j = k + 1; // Update the index of the main loop
                             }
-
-                            token_data td;
-                            td.text = merged_text;
-                            td.id = token_data_first.id; // Use the id and p of the first token
-                            td.p = token_data_first.p;
-                            td.start_timestamp = to_timestamp(start_time, params.comma_in_time);
-                            td.end_timestamp = to_timestamp(end_time, params.comma_in_time);
-                            seg.tokens.push_back(td);
-
-                            j = k + 1; // Update the index of the main loop
                         }
                     }
                 }
@@ -728,11 +745,20 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     worker->Queue();
     return env.Undefined();
 }
+struct StreamTokenData {
+    std::string text;
+    int64_t id;
+    float p;
+    int64_t start_ms;
+    int64_t end_ms;
+};
+
 struct SegmentData {
     int64_t start_ms;
     int64_t end_ms;
     std::string text;
     bool speaker_turn;
+    std::vector<StreamTokenData> tokens;
 };
 
 enum class StreamState {
@@ -819,6 +845,7 @@ private:
     bool m_no_timestamps = false;
     std::string m_prompt;
     bool m_debug_mode = false;
+    bool m_output_tokens = false;
 };
 
 // --- Implementation of WhisperStream Methods ---
@@ -878,6 +905,7 @@ WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
     if (options.Has("translate") && options.Get("translate").IsBoolean()) m_translate = options.Get("translate").As<Napi::Boolean>();
     if (options.Has("single_segment") && options.Get("single_segment").IsBoolean()) m_single_segment = options.Get("single_segment").As<Napi::Boolean>();
     if (options.Has("no_timestamps") && options.Get("no_timestamps").IsBoolean()) m_no_timestamps = options.Get("no_timestamps").As<Napi::Boolean>();
+    if (options.Has("output_tokens") && options.Get("output_tokens").IsBoolean()) m_output_tokens = options.Get("output_tokens").As<Napi::Boolean>();
     // Initial prompt
     if (options.Has("prompt") && options.Get("prompt").IsString()) m_prompt = options.Get("prompt").As<Napi::String>();
 
@@ -1021,16 +1049,100 @@ void WhisperStream::OnNewSegmentCallback(struct whisper_context * ctx, struct wh
         data.end_ms = time_offset_ms + (whisper_full_get_segment_t1_from_state(state, i) * 10);
         data.text = std::string(text_cstr);
         data.speaker_turn = whisper_full_get_segment_speaker_turn_next_from_state(state, i);
+
+        if (self->m_output_tokens) {
+            const int n_tokens = whisper_full_n_tokens_from_state(state, i);
+            if (n_tokens > 0) {
+                auto token_data_first_overall = whisper_full_get_token_data_from_state(state, i, 0);
+                int64_t segment_t0 = whisper_full_get_segment_t0_from_state(state, i);
+                int64_t missing_offset_10ms = segment_t0 - token_data_first_overall.t0;
+
+                int j = 0;
+                while (j < n_tokens) {
+                    auto token_data_first = whisper_full_get_token_data_from_state(state, i, j);
+                    std::string current_text = whisper_token_to_str(self->m_ctx, token_data_first.id);
+
+                    if (is_valid_utf8(current_text)) {
+                        StreamTokenData td;
+                        td.text = current_text;
+                        td.id = token_data_first.id;
+                        td.p = token_data_first.p;
+
+                        int64_t t0 = token_data_first.t0 + missing_offset_10ms;
+                        int64_t t1 = token_data_first.t1 + missing_offset_10ms;
+                        td.start_ms = time_offset_ms + (t0 * 10);
+                        td.end_ms = time_offset_ms + (t1 * 10);
+
+                        // Clamp to segment boundaries
+                        td.start_ms = std::max(data.start_ms, std::min(data.end_ms, td.start_ms));
+                        td.end_ms = std::max(data.start_ms, std::min(data.end_ms, td.end_ms));
+
+                        data.tokens.push_back(td);
+                        j++;
+                    } else {
+                        std::string merged_text = current_text;
+                        int64_t start_time = token_data_first.t0;
+                        int64_t end_time = token_data_first.t1;
+                        int k = j + 1;
+
+                        while (k < n_tokens) {
+                            auto token_data_next = whisper_full_get_token_data_from_state(state, i, k);
+                            merged_text += whisper_token_to_str(self->m_ctx, token_data_next.id);
+
+                            if (is_valid_utf8(merged_text)) {
+                                end_time = token_data_next.t1;
+                                break;
+                            }
+                            k++;
+                        }
+
+                        StreamTokenData td;
+                        td.text = merged_text;
+                        td.id = token_data_first.id;
+                        td.p = token_data_first.p;
+
+                        int64_t t0 = start_time + missing_offset_10ms;
+                        int64_t t1 = end_time + missing_offset_10ms;
+                        td.start_ms = time_offset_ms + (t0 * 10);
+                        td.end_ms = time_offset_ms + (t1 * 10);
+
+                        // Clamp to segment boundaries
+                        td.start_ms = std::max(data.start_ms, std::min(data.end_ms, td.start_ms));
+                        td.end_ms = std::max(data.start_ms, std::min(data.end_ms, td.end_ms));
+
+                        data.tokens.push_back(td);
+
+                        j = k + 1;
+                    }
+                }
+            }
+        }
         segments_data.push_back(data);
     }
     if (self->m_tsfn_callback && !segments_data.empty()) {
-        auto callback = [segments_data = std::move(segments_data)] (Napi::Env env, Napi::Function jsCallback) {
+        auto callback = [segments_data = std::move(segments_data), output_tokens = self->m_output_tokens] (Napi::Env env, Napi::Function jsCallback) {
             for (const auto& data : segments_data) {
                 Napi::Object result = Napi::Object::New(env);
                 result.Set("start", Napi::Number::New(env, data.start_ms));
                 result.Set("end", Napi::Number::New(env, data.end_ms));
                 result.Set("text", Napi::String::New(env, data.text));
                 result.Set("speaker_turn", Napi::Boolean::New(env, data.speaker_turn));
+
+                if (output_tokens && !data.tokens.empty()) {
+                    Napi::Array tokens_array = Napi::Array::New(env, data.tokens.size());
+                    for (size_t t = 0; t < data.tokens.size(); ++t) {
+                        const auto& tok = data.tokens[t];
+                        Napi::Object token_obj = Napi::Object::New(env);
+                        token_obj.Set("text", Napi::String::New(env, tok.text));
+                        token_obj.Set("id", Napi::Number::New(env, tok.id));
+                        token_obj.Set("p", Napi::Number::New(env, tok.p));
+                        token_obj.Set("start", Napi::Number::New(env, tok.start_ms));
+                        token_obj.Set("end", Napi::Number::New(env, tok.end_ms));
+                        tokens_array[t] = token_obj;
+                    }
+                    result.Set("tokens", tokens_array);
+                }
+
                 jsCallback.Call({env.Null(), result});
             }
         };
@@ -1053,6 +1165,7 @@ void WhisperStream::StreamWorker() {
     m_wparams.translate = m_translate;
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
+    m_wparams.token_timestamps = m_output_tokens;
     m_wparams.initial_prompt = m_prompt.empty() ? nullptr : m_prompt.c_str();
 
     // VAD parameters (whisper built-in VAD)
@@ -1143,6 +1256,7 @@ void WhisperStream::StreamWorkerVAD() {
     m_wparams.translate = m_translate;
     m_wparams.single_segment = m_single_segment;
     m_wparams.no_timestamps = m_no_timestamps;
+    m_wparams.token_timestamps = m_output_tokens;
     m_wparams.initial_prompt = m_prompt.empty() ? nullptr : m_prompt.c_str();
 
     // VAD parameters (whisper built-in VAD)
