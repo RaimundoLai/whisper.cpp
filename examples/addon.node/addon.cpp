@@ -806,6 +806,12 @@ private:
     int m_length_ms = 10000;
     int m_keep_ms = 200;
 
+    // Progressive parameters
+    bool m_progressive_update = false;
+    int m_progressive_interval_ms = 500;
+    int m_progressive_initial_ms = 5000;
+    int m_progressive_window_tokens = 3;
+
     // VAD parameters (for vad_simple - used to decide when to process audio in StreamWorkerVAD)
     bool m_use_vad = false;
     float m_vad_thold = 0.6f;
@@ -882,6 +888,10 @@ WhisperStream::WhisperStream(const Napi::CallbackInfo& info)
     if (options.Has("step_ms") && options.Get("step_ms").IsNumber()) m_step_ms = options.Get("step_ms").As<Napi::Number>();
     if (options.Has("length_ms") && options.Get("length_ms").IsNumber()) m_length_ms = options.Get("length_ms").As<Napi::Number>();
     if (options.Has("keep_ms") && options.Get("keep_ms").IsNumber()) m_keep_ms = options.Get("keep_ms").As<Napi::Number>();
+    if (options.Has("progressive_update") && options.Get("progressive_update").IsBoolean()) m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
+    if (options.Has("progressive_interval_ms") && options.Get("progressive_interval_ms").IsNumber()) m_progressive_interval_ms = options.Get("progressive_interval_ms").As<Napi::Number>().Int32Value();
+    if (options.Has("progressive_initial_ms") && options.Get("progressive_initial_ms").IsNumber()) m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
+    if (options.Has("progressive_window_tokens") && options.Get("progressive_window_tokens").IsNumber()) m_progressive_window_tokens = options.Get("progressive_window_tokens").As<Napi::Number>().Int32Value();
     if (options.Has("debug") && options.Get("debug").IsBoolean()) {
         m_debug_mode = options.Get("debug").As<Napi::Boolean>();
         g_addon_debug_mode.store(m_debug_mode);
@@ -1035,8 +1045,16 @@ Napi::Value WhisperStream::Resume(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
+struct WhisperCallbackUserData {
+    WhisperStream* self;
+    bool is_progressive;
+};
+
 void WhisperStream::OnNewSegmentCallback(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data) {
-    WhisperStream* self = static_cast<WhisperStream*>(user_data);
+    WhisperCallbackUserData* user_data_obj = static_cast<WhisperCallbackUserData*>(user_data);
+    WhisperStream* self = user_data_obj->self;
+    bool is_progressive = user_data_obj->is_progressive;
+
     const int64_t time_offset_ms = (self->m_current_callback_offset_samples * 1000) / WHISPER_SAMPLE_RATE;
     const int n_segments = whisper_full_n_segments_from_state(state);
     const int s0 = n_segments - n_new;
@@ -1120,7 +1138,7 @@ void WhisperStream::OnNewSegmentCallback(struct whisper_context * ctx, struct wh
         segments_data.push_back(data);
     }
     if (self->m_tsfn_callback && !segments_data.empty()) {
-        auto callback = [segments_data = std::move(segments_data), output_tokens = self->m_output_tokens] (Napi::Env env, Napi::Function jsCallback) {
+        auto callback = [segments_data = std::move(segments_data), output_tokens = self->m_output_tokens, is_progressive] (Napi::Env env, Napi::Function jsCallback) {
             for (const auto& data : segments_data) {
                 Napi::Object result = Napi::Object::New(env);
                 result.Set("start", Napi::Number::New(env, data.start_ms));
@@ -1143,6 +1161,12 @@ void WhisperStream::OnNewSegmentCallback(struct whisper_context * ctx, struct wh
                     result.Set("tokens", tokens_array);
                 }
 
+                if (is_progressive) {
+                    result.Set("type", "progressive");
+                } else {
+                    result.Set("type", "segment");
+                }
+
                 jsCallback.Call({env.Null(), result});
             }
         };
@@ -1156,8 +1180,13 @@ void WhisperStream::StreamWorker() {
     m_wparams.print_timestamps = false;
     m_wparams.language         = m_language.c_str();
     m_wparams.n_threads        = m_n_threads;
+
+    WhisperCallbackUserData callback_user_data;
+    callback_user_data.self = this;
+    callback_user_data.is_progressive = false;
+
     m_wparams.new_segment_callback = WhisperStream::OnNewSegmentCallback;
-    m_wparams.new_segment_callback_user_data = this;
+    m_wparams.new_segment_callback_user_data = &callback_user_data;
     m_wparams.no_context = true;
     m_wparams.audio_ctx = m_audio_ctx;
     m_wparams.tdrz_enable = m_tinydiarize;
@@ -1182,6 +1211,8 @@ void WhisperStream::StreamWorker() {
 
     const size_t n_samples_step = (m_step_ms * WHISPER_SAMPLE_RATE) / 1000;
     m_pcmf32_local.clear();
+    
+    int64_t last_progressive_sample = 0;
 
     while (true) {
         bool is_stopping = false;
@@ -1221,13 +1252,40 @@ void WhisperStream::StreamWorker() {
             }
         }
 
-        while (m_pcmf32_local.size() >= n_samples_step) {
-            m_current_callback_offset_samples = m_n_samples_processed;
-            if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), n_samples_step) != 0) {
-                fprintf(stderr, "whisper_full failed in streaming mode\n");
+        if (m_progressive_update) {
+            int64_t current_samples = m_pcmf32_local.size();
+            int64_t elapsed_since_start_ms = (current_samples * 1000) / WHISPER_SAMPLE_RATE;
+            
+            if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                int64_t elapsed_since_last_prog_ms = ((current_samples - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
+                if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                    m_current_callback_offset_samples = m_n_samples_processed;
+                    callback_user_data.is_progressive = true;
+                    if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), m_pcmf32_local.size()) != 0) {
+                        fprintf(stderr, "whisper_full failed in progressive streaming mode\n");
+                    }
+                    
+                    // Note: We do not erase here because standard WhisperStream naturally slides
+                    // its window over time using `whisper_full`. Token overlap cropping isn't
+                    // necessary since whisper retains its own internal state across chunks.
+
+                    callback_user_data.is_progressive = false;
+                    last_progressive_sample = current_samples;
+                }
             }
-            m_n_samples_processed += n_samples_step;
-            m_pcmf32_local.erase(m_pcmf32_local.begin(), m_pcmf32_local.begin() + n_samples_step);
+        }
+        
+        if (!m_progressive_update) {
+            while (m_pcmf32_local.size() >= n_samples_step) {
+                m_current_callback_offset_samples = m_n_samples_processed;
+                if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), n_samples_step) != 0) {
+                    fprintf(stderr, "whisper_full failed in streaming mode\n");
+                }
+                m_n_samples_processed += n_samples_step;
+                m_pcmf32_local.erase(m_pcmf32_local.begin(), m_pcmf32_local.begin() + n_samples_step);
+                last_progressive_sample -= n_samples_step;
+                if (last_progressive_sample < 0) last_progressive_sample = 0;
+            }
         }
     }
 
@@ -1247,8 +1305,13 @@ void WhisperStream::StreamWorkerVAD() {
     m_wparams.print_timestamps = false;
     m_wparams.language         = m_language.c_str();
     m_wparams.n_threads        = m_n_threads;
+
+    WhisperCallbackUserData callback_user_data;
+    callback_user_data.self = this;
+    callback_user_data.is_progressive = false;
+
     m_wparams.new_segment_callback = WhisperStream::OnNewSegmentCallback;
-    m_wparams.new_segment_callback_user_data = this;
+    m_wparams.new_segment_callback_user_data = &callback_user_data;
     m_wparams.no_context = true;
     m_wparams.audio_ctx = m_audio_ctx;
     m_wparams.tdrz_enable = m_tinydiarize;
@@ -1277,6 +1340,8 @@ void WhisperStream::StreamWorkerVAD() {
     const size_t n_samples_max_len = (25 * WHISPER_SAMPLE_RATE);
     m_pcmf32_local.clear();
 
+    int64_t last_progressive_sample = 0;
+
     while (true) {
         bool is_finishing = false;
         {
@@ -1304,6 +1369,31 @@ void WhisperStream::StreamWorkerVAD() {
             // Force processing for the final chunk
             should_process = true;
         } else {
+            if (m_progressive_update) {
+                int64_t current_samples = m_pcmf32_local.size();
+                int64_t elapsed_since_start_ms = (current_samples * 1000) / WHISPER_SAMPLE_RATE;
+                
+                if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                    int64_t elapsed_since_last_prog_ms = ((current_samples - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
+                    if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                        m_current_callback_offset_samples = m_n_samples_processed;
+                        callback_user_data.is_progressive = true;
+                        if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), m_pcmf32_local.size()) != 0) {
+                            fprintf(stderr, "whisper_full failed in progressive VAD streaming mode\n");
+                        }
+                        
+                        // Note: For progressive updates under StreamWorkerVAD, we are accumulating 
+                        // all audio in `m_pcmf32_local` for the final segment transcription. We process 
+                        // the entire accumulated buffer up to this point for progressive updates, 
+                        // guaranteeing no context loss, and we do NOT erase from `m_pcmf32_local` 
+                        // so the final segment is complete.
+                        
+                        callback_user_data.is_progressive = false;
+                        last_progressive_sample = current_samples;
+                    }
+                }
+            }
+            
             if ((int)m_pcmf32_local.size() >= n_samples_vad_window) {
                 std::vector<float> pcmf32_window(m_pcmf32_local.end() - n_samples_vad_window, m_pcmf32_local.end());
                 if (vad_simple(pcmf32_window, WHISPER_SAMPLE_RATE, vad_last_ms, m_vad_thold, m_freq_thold, false)) {
@@ -1322,6 +1412,7 @@ void WhisperStream::StreamWorkerVAD() {
             }
             m_n_samples_processed += m_pcmf32_local.size();
             m_pcmf32_local.clear();
+            last_progressive_sample = 0;
         }
         
         if (is_finishing) {

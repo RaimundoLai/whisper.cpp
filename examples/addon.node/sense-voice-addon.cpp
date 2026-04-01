@@ -1026,7 +1026,7 @@ private:
 
     // Worker thread
     void StreamWorker();
-    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms);
+    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, bool is_progressive = false);
     std::string ExtractText(sense_voice_context* ctx, bool use_prefix);
 
     // SenseVoice context
@@ -1054,6 +1054,12 @@ private:
     int m_min_mute_chunks = 10;     // Minimum number of mute chunks
     int m_max_nomute_chunks = 80;   // Maximum number of non-mute chunks
     float m_vad_threshold = 0.5f;   // Energy threshold
+
+    // Progressive parameters
+    bool m_progressive_update = false;
+    int m_progressive_interval_ms = 500;
+    int m_progressive_initial_ms = 5000;
+    int m_progressive_window_tokens = 3;
 
     // Audio buffer and state
     std::deque<float> m_audio_buffer;
@@ -1153,6 +1159,16 @@ SenseVoiceStream::SenseVoiceStream(const Napi::CallbackInfo& info)
     // External Silero VAD model path (optional)
     if (options.Has("vad_model") && options.Get("vad_model").IsString()) 
         m_vad_model_path = options.Get("vad_model").As<Napi::String>();
+        
+    // Progressive parameters
+    if (options.Has("progressive_update") && options.Get("progressive_update").IsBoolean()) 
+        m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
+    if (options.Has("progressive_interval_ms") && options.Get("progressive_interval_ms").IsNumber()) 
+        m_progressive_interval_ms = options.Get("progressive_interval_ms").As<Napi::Number>().Int32Value();
+    if (options.Has("progressive_initial_ms") && options.Get("progressive_initial_ms").IsNumber()) 
+        m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
+    if (options.Has("progressive_window_tokens") && options.Get("progressive_window_tokens").IsNumber()) 
+        m_progressive_window_tokens = options.Get("progressive_window_tokens").As<Napi::Number>().Int32Value();
     
     // Debug logging flag
     if (options.Has("debug") && options.Get("debug").IsBoolean()) 
@@ -1386,6 +1402,9 @@ void SenseVoiceStream::StreamWorker() {
     int speech_chunk_count = 0;
     int64_t speech_start_sample = 0;  // Track when speech started (in total samples received)
     
+    int64_t last_progressive_sample = 0;
+    int64_t progressive_start_idx = 0;
+    
     // Reset total samples counter for timeline
     m_n_total_samples_received = 0;
     
@@ -1470,6 +1489,8 @@ void SenseVoiceStream::StreamWorker() {
                 // Track when speech starts
                 if (!in_speech) {
                     speech_start_sample = m_n_total_samples_received + static_cast<int64_t>(i);
+                    last_progressive_sample = speech_start_sample;
+                    progressive_start_idx = 0;
                 }
                 // Append speech chunk (no scaling - SenseVoice expects normalized audio)
                 for (int j = 0; j < chunk_samples; j++) {
@@ -1478,6 +1499,71 @@ void SenseVoiceStream::StreamWorker() {
                 in_speech = true;
                 silence_chunk_count = 0;
                 speech_chunk_count++;
+                
+                if (m_progressive_update) {
+                    int64_t current_sample = m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples;
+                    int64_t elapsed_since_start_ms = ((current_sample - speech_start_sample) * 1000) / sample_rate;
+                    
+                    if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                        int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
+                        if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                            int64_t chunk_start_ms = ((speech_start_sample + progressive_start_idx) * 1000) / sample_rate;
+                            int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                            
+                            std::vector<double> prog_buffer;
+                            if (progressive_start_idx < (int64_t)speech_buffer.size()) {
+                                prog_buffer.assign(speech_buffer.begin() + progressive_start_idx, speech_buffer.end());
+                            }
+                            
+                            processAndOutput(wparams, prog_buffer, chunk_start_ms, chunk_end_ms, true);
+                            
+                            // Crop tracking pointer via tokens overlap logic:
+                            if (m_ctx->state->ids.size() > 4) {
+                                size_t n_valid_tokens = 0;
+                                for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
+                                    int id = m_ctx->state->ids[k];
+                                    if (id != 0 && id != 1 && id != 2) n_valid_tokens++;
+                                }
+                                
+                                if (n_valid_tokens > 0) {
+                                    size_t target_valid_idx = n_valid_tokens >= (size_t)m_progressive_window_tokens 
+                                        ? n_valid_tokens - m_progressive_window_tokens 
+                                        : 0;
+                                        
+                                    size_t valid_cnt = 0;
+                                    int target_frame = 0;
+                                    bool has_timestamps = (m_ctx->state->ids.size() == m_ctx->state->token_timestamps.size()) && !m_ctx->state->token_timestamps.empty();
+                                    
+                                    for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
+                                        int id = m_ctx->state->ids[k];
+                                        if (id != 0 && id != 1 && id != 2) {
+                                            if (valid_cnt == target_valid_idx) {
+                                                if (has_timestamps) {
+                                                    target_frame = std::max(0, m_ctx->state->token_timestamps[k] - 4);
+                                                } else {
+                                                    // Fallback
+                                                    int64_t prog_len_ms = chunk_end_ms - chunk_start_ms;
+                                                    target_frame = (prog_len_ms * valid_cnt) / (60 * n_valid_tokens);
+                                                }
+                                                break;
+                                            }
+                                            valid_cnt++;
+                                        }
+                                    }
+                                    
+                                    int64_t offset_ms = target_frame * 60;
+                                    int64_t drop_samples = (offset_ms * sample_rate) / 1000;
+                                    
+                                    if (drop_samples > 0 && drop_samples < (int64_t)prog_buffer.size()) {
+                                        progressive_start_idx += drop_samples;
+                                    }
+                                }
+                            }
+                            
+                            last_progressive_sample = current_sample;
+                        }
+                    }
+                }
             } else if (in_speech) {
                 // We were in speech, count silence chunks
                 silence_chunk_count++;
@@ -1504,6 +1590,7 @@ void SenseVoiceStream::StreamWorker() {
                     }
                     speech_buffer.clear();
                     speech_chunk_count = 0;
+                    progressive_start_idx = 0;
                 }
             }
             // Skip silent chunks when not in speech (don't accumulate)
@@ -1524,10 +1611,14 @@ void SenseVoiceStream::StreamWorker() {
             int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
             int64_t end_time_ms = (current_sample * 1000) / sample_rate;
             
-            processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
+            if (!speech_buffer.empty()) {
+                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
+            }
             speech_buffer.clear();
             speech_chunk_count = 0;
             speech_start_sample = current_sample;  // Reset for next speech segment
+            last_progressive_sample = current_sample;
+            progressive_start_idx = 0;
             in_speech = false;
         }
         
@@ -1559,7 +1650,7 @@ void SenseVoiceStream::StreamWorker() {
     }
 }
 
-void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms) {
+void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, bool is_progressive) {
     const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
     
     // Safety check
@@ -1574,6 +1665,10 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
             std::string text_str;
             std::string lang_str, emo_str, evt_str;
             
+            // Compute token timestamps using passed time range
+            std::vector<std::tuple<int64_t, int64_t, std::string>> token_data;
+            int64_t segment_duration_ms = end_time_ms - start_time_ms;
+            
             if (m_ctx->state->ids.size() > 4) {
                 // Extract prefix tokens
                 auto it_lang = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[0]);
@@ -1582,26 +1677,6 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                 if (it_emo != m_ctx->vocab.id_to_token.end()) emo_str = it_emo->second;
                 auto it_evt = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[2]);
                 if (it_evt != m_ctx->vocab.id_to_token.end()) evt_str = it_evt->second;
-                
-                // Extract text tokens (skip first 4 prefix tokens)
-                // Note: Do NOT deduplicate consecutive tokens - "3000" has repeated "0"
-                for (size_t i = 4; i < m_ctx->state->ids.size(); i++) {
-                    int id = m_ctx->state->ids[i];
-                    // Only filter special token IDs (0, 1, 2), NOT consecutive duplicates
-                    if (id != 0 && id != 1 && id != 2) {
-                        auto it = m_ctx->vocab.id_to_token.find(id);
-                        if (it != m_ctx->vocab.id_to_token.end()) {
-                            text_str += it->second;
-                        }
-                    }
-                }
-            }
-            
-            // Compute token timestamps using passed time range
-            std::vector<std::tuple<int64_t, int64_t, std::string>> token_data;
-            int64_t segment_duration_ms = end_time_ms - start_time_ms;
-            
-            if (m_ctx->state->ids.size() > 4) {
                 // Extract tokens with their frame timestamps
                 bool has_timestamps = (m_ctx->state->ids.size() == m_ctx->state->token_timestamps.size()) && !m_ctx->state->token_timestamps.empty();
                 
@@ -1655,9 +1730,13 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
             
             if (!text_str.empty() && m_tsfn_callback) {
                 auto callback_data = std::make_tuple(start_time_ms, end_time_ms, text_str, lang_str, emo_str, evt_str, token_data);
-                m_tsfn_callback.BlockingCall([callback_data](Napi::Env env, Napi::Function jsCallback) {
+                m_tsfn_callback.BlockingCall([callback_data, is_progressive](Napi::Env env, Napi::Function jsCallback) {
                     Napi::Object result = Napi::Object::New(env);
-                    result.Set("type", "segment");
+                    if (is_progressive) {
+                        result.Set("type", "progressive");
+                    } else {
+                        result.Set("type", "segment");
+                    }
                     result.Set("start", Napi::Number::New(env, std::get<0>(callback_data)));
                     result.Set("end", Napi::Number::New(env, std::get<1>(callback_data)));
                     result.Set("text", Napi::String::New(env, std::get<2>(callback_data)));

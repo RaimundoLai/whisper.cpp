@@ -687,6 +687,15 @@ public:
         if (options.Has("chunk_size_ms") && options.Get("chunk_size_ms").IsNumber()) 
             m_chunk_size_ms = options.Get("chunk_size_ms").As<Napi::Number>().Int32Value();
             
+        if (options.Has("progressive_update") && options.Get("progressive_update").IsBoolean()) 
+            m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
+        if (options.Has("progressive_window_ms") && options.Get("progressive_window_ms").IsNumber()) 
+            m_progressive_window_ms = options.Get("progressive_window_ms").As<Napi::Number>().Int32Value();
+        if (options.Has("progressive_initial_ms") && options.Get("progressive_initial_ms").IsNumber()) 
+            m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
+        if (options.Has("progressive_window_tokens") && options.Get("progressive_window_tokens").IsNumber()) 
+            m_progressive_window_tokens = options.Get("progressive_window_tokens").As<Napi::Number>().Int32Value();
+            
         if (options.Has("min_mute_chunks") && options.Get("min_mute_chunks").IsNumber()) 
             m_min_mute_chunks = options.Get("min_mute_chunks").As<Napi::Number>().Int32Value();
             
@@ -852,6 +861,9 @@ private:
         int64_t speech_start_sample = 0;
         int64_t total_samples_received = 0;
         
+        int64_t last_progressive_sample = 0;
+        int64_t progressive_start_idx = 0;
+        
         while (true) {
             bool is_finishing = false;
             {
@@ -890,19 +902,52 @@ private:
                 }
                 
                 if (is_speech) {
-                    if (!in_speech) speech_start_sample = total_samples_received + i;
+                    if (!in_speech) {
+                        speech_start_sample = total_samples_received + i;
+                        last_progressive_sample = speech_start_sample;
+                        progressive_start_idx = 0;
+                    }
                     speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
                     in_speech = true;
                     silence_chunk_count = 0;
                     speech_chunk_count++;
                     
+                    if (m_progressive_update) {
+                        int64_t current_sample = total_samples_received + i + chunk_samples;
+                        int64_t elapsed_since_start_ms = ((current_sample - speech_start_sample) * 1000) / sample_rate;
+                        
+                        if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                            int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
+                            if (elapsed_since_last_prog_ms >= m_progressive_window_ms) {
+                                int64_t chunk_start_ms = ((speech_start_sample + progressive_start_idx) * 1000) / sample_rate;
+                                int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                                
+                                std::vector<float> prog_buffer;
+                                if (progressive_start_idx < (int64_t)speech_buffer.size()) {
+                                    prog_buffer.assign(speech_buffer.begin() + progressive_start_idx, speech_buffer.end());
+                                }
+                                
+                                int64_t dropped_samples = processAndOutput(prog_buffer, tp, chunk_start_ms, chunk_end_ms, true);
+                                progressive_start_idx += dropped_samples;
+                                
+                                last_progressive_sample = current_sample;
+                            }
+                        }
+                    }
+                    
                     // Split if speech exceeds maximum duration without silence
                     if (speech_chunk_count >= m_max_nomute_chunks) {
                         int64_t current_sample = total_samples_received + i + chunk_samples;
-                        processAndOutput(speech_buffer, tp, (speech_start_sample * 1000) / sample_rate, (current_sample * 1000) / sample_rate);
+                        int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
+                        int64_t end_time_ms = (current_sample * 1000) / sample_rate;
+                        
+                        processAndOutput(speech_buffer, tp, start_time_ms, end_time_ms);
+                        
                         speech_buffer.clear();
                         speech_chunk_count = 0;
                         speech_start_sample = current_sample;
+                        last_progressive_sample = current_sample;
+                        progressive_start_idx = 0;
                         
                         // We reset silence counter and keep in_speech true so we keep adding speech,
                         // but starting a new chunk from speech_start_sample = current_sample.
@@ -920,6 +965,7 @@ private:
                         processAndOutput(speech_buffer, tp, (speech_start_sample * 1000) / sample_rate, (speech_end_sample * 1000) / sample_rate);
                         speech_buffer.clear();
                         speech_chunk_count = 0;
+                        progressive_start_idx = 0;
                     }
                 }
                 processed_samples = i + chunk_samples;
@@ -934,7 +980,9 @@ private:
                 speech_buffer.insert(speech_buffer.end(), accumulated_samples.begin(), accumulated_samples.end());
                 int64_t final_sample = total_samples_received + accumulated_samples.size();
                 int64_t start = in_speech ? (speech_start_sample * 1000) / sample_rate : (total_samples_received * 1000) / sample_rate;
-                if (!speech_buffer.empty()) processAndOutput(speech_buffer, tp, start, (final_sample * 1000) / sample_rate);
+                if (!speech_buffer.empty()) {
+                    processAndOutput(speech_buffer, tp, start, (final_sample * 1000) / sample_rate);
+                }
                 break;
             }
         }
@@ -948,12 +996,13 @@ private:
         }
     }
 
-    void processAndOutput(std::vector<float>& audio, const qwen3_asr::transcribe_params& tp, int64_t start_ms, int64_t end_ms) {
-        if (!m_asr) return;
+    int64_t processAndOutput(std::vector<float>& audio, const qwen3_asr::transcribe_params& tp, int64_t start_ms, int64_t end_ms, bool is_progressive = false) {
+        if (!m_asr) return 0;
+        
         auto res = m_asr->transcribe(audio.data(), audio.size(), tp);
         if (!res.success) {
             fprintf(stderr, "[STREAM] processAndOutput transcribe failed: %s\n", res.error_msg.c_str());
-            return;
+            return 0;
         }
         
         std::string final_text = res.text;
@@ -961,6 +1010,7 @@ private:
 
         qwen3_asr::alignment_result align_res;
         bool has_alignment = false;
+        
         if (m_aligner && !m_aligner_model_path.empty()) {
             std::string detected_lang = m_language.empty() ? stream_lang : m_language;
             align_res = m_aligner->align(audio.data(), audio.size(), final_text, detected_lang);
@@ -970,11 +1020,46 @@ private:
             }
         }
         
+        int64_t drop_samples = 0;
+        
+        if (is_progressive && m_progressive_update) {
+            if (has_alignment) {
+                size_t n_words = align_res.words.size();
+                if (n_words > 0) {
+                    size_t target_idx = n_words >= (size_t)m_progressive_window_tokens 
+                        ? n_words - m_progressive_window_tokens 
+                        : 0;
+                        
+                    float t0_s = align_res.words[target_idx].start;
+                    drop_samples = static_cast<int64_t>(t0_s * 16000);
+                }
+            } else {
+                size_t n_tokens = res.tokens.size();
+                if (n_tokens > 0) {
+                    size_t target_idx = n_tokens >= (size_t)m_progressive_window_tokens 
+                        ? n_tokens - m_progressive_window_tokens 
+                        : 0;
+                    drop_samples = (audio.size() * target_idx) / n_tokens;
+                } else {
+                    int64_t max_prog_samples = (m_progressive_initial_ms * 16000) / 1000;
+                    if (audio.size() > (size_t)max_prog_samples) {
+                        drop_samples = audio.size() - max_prog_samples;
+                    }
+                }
+            }
+            
+            // Note: We no longer erase from the audio buffer here. 
+            // The outer loop retains the full speech_buffer for the final segment.
+            if (drop_samples < 0 || drop_samples >= (int64_t)audio.size()) {
+                drop_samples = 0;
+            }
+        }
+        
         if (m_tsfn_callback) {
             auto cbk_data = std::make_tuple(start_ms, end_ms, final_text, has_alignment, align_res.words, stream_lang);
-            m_tsfn_callback.BlockingCall([cbk_data](Napi::Env env, Napi::Function jsCallback) {
+            m_tsfn_callback.BlockingCall([cbk_data, is_progressive](Napi::Env env, Napi::Function jsCallback) {
                 Napi::Object result = Napi::Object::New(env);
-                result.Set("type", "segment");
+                result.Set("type", Napi::String::New(env, is_progressive ? "progressive" : "segment"));
                 result.Set("start", Napi::Number::New(env, std::get<0>(cbk_data)));
                 result.Set("end", Napi::Number::New(env, std::get<1>(cbk_data)));
                 result.Set("text", Napi::String::New(env, std::get<2>(cbk_data)));
@@ -986,8 +1071,6 @@ private:
                     for (size_t i = 0; i < words.size(); i++) {
                         Napi::Object word = Napi::Object::New(env);
                         word.Set("word", Napi::String::New(env, words[i].word));
-                        // Original timestamps are relative to chunk start (in ms)
-                        // Add the chunk start_ms offset for global timing
                         double glob_start = words[i].start + (std::get<0>(cbk_data) / 1000.0);
                         double glob_end = words[i].end + (std::get<0>(cbk_data) / 1000.0);
                         word.Set("start", Napi::Number::New(env, glob_start));
@@ -1000,6 +1083,8 @@ private:
                 jsCallback.Call({result});
             });
         }
+        
+        return drop_samples;
     }
     // ASR State
     std::unique_ptr<qwen3_asr::Qwen3ASR> m_asr;
@@ -1008,6 +1093,10 @@ private:
     
     // Config
     std::string m_model_path;
+    bool m_progressive_update = false;
+    int m_progressive_window_ms = 500;
+    int m_progressive_initial_ms = 5000;
+    int m_progressive_window_tokens = 3;
     std::string m_aligner_model_path;
     std::string m_vad_model_path;
     std::string m_language = "";
