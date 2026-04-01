@@ -77,6 +77,11 @@ private:
     // Streaming parameters
     float m_max_speech_duration_s = 15.0f;  // Force segment end after this duration
     int m_min_silence_duration_ms_stream = 500;  // Silence duration for streaming (longer than batch)
+    
+    // Progressive parameters
+    bool m_progressive_update = false;
+    int m_progressive_interval_ms = 500;
+    int m_progressive_initial_ms = 5000;
 
     // Thread control
     std::thread m_worker_thread;
@@ -160,6 +165,17 @@ VADStream::VADStream(const Napi::CallbackInfo& info)
     // For streaming, use longer silence duration (default 500ms) unless specified
     if (options.Has("min_silence_duration_ms") && options.Get("min_silence_duration_ms").IsNumber()) {
         m_min_silence_duration_ms_stream = options.Get("min_silence_duration_ms").As<Napi::Number>();
+    }
+    
+    // Progressive parameters
+    if (options.Has("progressive_update") && options.Get("progressive_update").IsBoolean()) {
+        m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
+    }
+    if (options.Has("progressive_interval_ms") && options.Get("progressive_interval_ms").IsNumber()) {
+        m_progressive_interval_ms = options.Get("progressive_interval_ms").As<Napi::Number>().Int32Value();
+    }
+    if (options.Has("progressive_initial_ms") && options.Get("progressive_initial_ms").IsNumber()) {
+        m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
     }
     
     // Initialize session state
@@ -336,6 +352,8 @@ void VADStream::VADWorker() {
     const size_t chunk_samples = 512;  // 32ms at 16kHz
     const size_t process_buffer_size = chunk_samples * 8;  // Process 256ms at a time
     
+    int64_t last_progressive_sample = 0;
+    
     // Calculate silence/speech thresholds in frames
     // Use streaming-specific silence duration (longer for better results)
     const int min_speech_frames = (m_vad_params.min_speech_duration_ms * WHISPER_SAMPLE_RATE) / (1000 * chunk_samples);
@@ -346,15 +364,15 @@ void VADStream::VADWorker() {
     int speech_frames = 0;
     
     // Helper lambda to emit voice segment
-    auto emit_segment = [this]() {
+    auto emit_segment = [this](bool is_progressive = false) {
         if (!m_speech_audio.empty() && m_tsfn_callback) {
             float start_s = (float)m_speech_start_sample / WHISPER_SAMPLE_RATE;
             float end_s = (float)(m_speech_start_sample + m_speech_audio.size()) / WHISPER_SAMPLE_RATE;
             
             auto audio_copy = m_speech_audio;
-            auto callback = [start_s, end_s, audio_copy](Napi::Env env, Napi::Function jsCallback) {
+            auto callback = [start_s, end_s, audio_copy, is_progressive](Napi::Env env, Napi::Function jsCallback) {
                 Napi::Object result = Napi::Object::New(env);
-                result.Set("type", Napi::String::New(env, "voice"));
+                result.Set("type", Napi::String::New(env, is_progressive ? "progressive" : "voice"));
                 result.Set("start", Napi::Number::New(env, start_s));
                 result.Set("end", Napi::Number::New(env, end_s));
                 
@@ -367,9 +385,11 @@ void VADStream::VADWorker() {
             };
             m_tsfn_callback.NonBlockingCall(callback);
         }
-        m_in_speech = false;
-        m_speech_audio.clear();
-        m_silence_frames = 0;
+        if (!is_progressive) {
+            m_in_speech = false;
+            m_speech_audio.clear();
+            m_silence_frames = 0;
+        }
     };
     
     while (true) {
@@ -387,7 +407,7 @@ void VADStream::VADWorker() {
             if (current_state == VADStreamState::STOPPING) {
                 // Emit any remaining speech segment before stopping
                 if (m_in_speech) {
-                    emit_segment();
+                    emit_segment(false);
                 }
                 break;
             }
@@ -477,6 +497,8 @@ void VADStream::VADWorker() {
                             }
                             m_speech_audio.assign(process_buffer.begin() + start_idx, process_buffer.begin() + frame_end);
                         }
+                            
+                            last_progressive_sample = m_speech_start_sample;
                     }
                 } else {
                     // Continue speech - add audio
@@ -486,9 +508,22 @@ void VADStream::VADWorker() {
                             process_buffer.begin() + frame_end);
                     }
                     
+                    if (m_progressive_update) {
+                        int64_t current_sample = m_n_samples_total + frame_end;
+                        int64_t elapsed_since_start_ms = ((current_sample - m_speech_start_sample) * 1000) / WHISPER_SAMPLE_RATE;
+                        
+                        if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                            int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
+                            if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                                emit_segment(true);
+                                last_progressive_sample = current_sample;
+                            }
+                        }
+                    }
+                    
                     // Check max speech duration - force emit if too long
                     if (m_speech_audio.size() >= max_speech_samples) {
-                        emit_segment();
+                        emit_segment(false);
                         speech_frames = 0;
                     }
                 }
@@ -506,7 +541,7 @@ void VADStream::VADWorker() {
                     
                     // Check if silence is long enough to end speech
                     if (m_silence_frames >= min_silence_frames) {
-                        emit_segment();
+                        emit_segment(false);
                     }
                 }
                 speech_frames = 0;
