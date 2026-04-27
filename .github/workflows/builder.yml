@@ -210,7 +210,8 @@ jobs:
             --CDGGML_METAL_EMBED_LIBRARY=ON \
             --runtime=electron \
             --runtime-version=35.1.5 \
-            --arch=arm64
+            --arch=arm64 \
+            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
           cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
           
           # Clear build cache
@@ -223,7 +224,8 @@ jobs:
             --CDWHISPER_COREML=ON \
             --runtime=electron \
             --runtime-version=35.1.5 \
-            --arch=arm64
+            --arch=arm64 \
+            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
           cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
 
       - name: Upload artifacts
@@ -268,7 +270,8 @@ jobs:
             --CDGGML_METAL=OFF \
             --runtime=electron \
             --runtime-version=35.1.5 \
-            --arch=x64
+            --arch=x64 \
+            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
             
           mkdir -p artifacts
           cp build/Release/addon.node.node artifacts/addon-macos-x64.node
