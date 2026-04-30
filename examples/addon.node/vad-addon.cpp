@@ -18,7 +18,8 @@ enum class VADStreamState {
     IDLE,
     RUNNING,
     PAUSED,
-    STOPPING
+    STOPPING,
+    FINISHING
 };
 
 struct VADSessionState {
@@ -42,6 +43,7 @@ private:
     Napi::Value Stop(const Napi::CallbackInfo& info);
     Napi::Value Pause(const Napi::CallbackInfo& info);
     Napi::Value Resume(const Napi::CallbackInfo& info);
+    Napi::Value Finish(const Napi::CallbackInfo& info);
     Napi::Value GetSessionState(const Napi::CallbackInfo& info);
 
     // Internal worker
@@ -106,6 +108,7 @@ Napi::Object VADStream::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("stop", &VADStream::Stop),
         InstanceMethod("pause", &VADStream::Pause),
         InstanceMethod("resume", &VADStream::Resume),
+        InstanceMethod("finish", &VADStream::Finish),
         InstanceMethod("getSessionState", &VADStream::GetSessionState),
     });
     exports.Set("VADStream", func);
@@ -394,12 +397,14 @@ void VADStream::VADWorker() {
     
     while (true) {
         std::vector<float> new_audio;
-        
+        bool is_finishing = false;
+
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [this, process_buffer_size] {
                 VADStreamState s = m_state.load();
-                return s == VADStreamState::STOPPING || 
+                return s == VADStreamState::STOPPING ||
+                       s == VADStreamState::FINISHING ||
                        (s == VADStreamState::RUNNING && m_audio_buffer.size() >= process_buffer_size);
             });
             
@@ -414,143 +419,149 @@ void VADStream::VADWorker() {
             if (current_state == VADStreamState::PAUSED) {
                 continue;
             }
-            
-            // Copy audio from buffer
-            size_t to_copy = std::min(m_audio_buffer.size(), process_buffer_size);
-            new_audio.assign(m_audio_buffer.begin(), m_audio_buffer.begin() + to_copy);
-            m_audio_buffer.erase(m_audio_buffer.begin(), m_audio_buffer.begin() + to_copy);
+
+            is_finishing = (current_state == VADStreamState::FINISHING);
+
+            // If finishing, ignore process_buffer_size and consume all remaining audio
+            size_t to_copy = is_finishing ? m_audio_buffer.size() : std::min(m_audio_buffer.size(), process_buffer_size);
+            if (to_copy > 0) {
+                new_audio.assign(m_audio_buffer.begin(), m_audio_buffer.begin() + to_copy);
+                m_audio_buffer.erase(m_audio_buffer.begin(), m_audio_buffer.begin() + to_copy);
+            }
         }
-        
-        if (new_audio.empty()) {
+
+        if (new_audio.empty() && !is_finishing) {
             continue;
         }
         
         // Add to process buffer
         process_buffer.insert(process_buffer.end(), new_audio.begin(), new_audio.end());
-        
-        // Run VAD on the audio
+
+        // [Key 1]: Handle remaining audio < 512 samples in finishing state
+        if (is_finishing && !process_buffer.empty() && process_buffer.size() % chunk_samples != 0) {
+            // Zero-pad to multiple of chunk_samples for VAD processing
+            size_t padding_needed = chunk_samples - (process_buffer.size() % chunk_samples);
+            process_buffer.insert(process_buffer.end(), padding_needed, 0.0f);
+        }
+
+        // If empty after padding and finishing, finalize immediately
+        if (process_buffer.empty()) {
+            if (is_finishing) {
+                if (m_in_speech) {
+                    emit_segment(false);
+                }
+                break; // Break loop to send 'end' event
+            }
+            continue;
+        }
+
         bool success = whisper_vad_detect_speech(m_vad_ctx, process_buffer.data(), process_buffer.size());
         if (!success) {
             fprintf(stderr, "VAD detection failed\n");
             m_n_samples_total += process_buffer.size();
             process_buffer.clear();
+            if (is_finishing) {
+                if (m_in_speech) emit_segment(false);
+                break;
+            }
             continue;
         }
         
         // Get probabilities
         int n_probs = whisper_vad_n_probs(m_vad_ctx);
         float* probs = whisper_vad_probs(m_vad_ctx);
-        
-        if (n_probs <= 0 || probs == nullptr) {
-            m_n_samples_total += process_buffer.size();
-            process_buffer.clear();
-            continue;
-        }
-        
-        // Process each probability frame
-        for (int i = 0; i < n_probs; i++) {
-            float prob = probs[i];
-            bool is_speech = prob >= m_vad_params.threshold;
-            
-            // Calculate sample position for this frame
-            size_t frame_start = i * chunk_samples;
-            size_t frame_end = std::min(frame_start + chunk_samples, process_buffer.size());
-            
-            if (is_speech) {
-                m_silence_frames = 0;
-                speech_frames++;
-                
-                if (!m_in_speech) {
-                    // Potential speech start
-                    if (speech_frames >= min_speech_frames) {
-                        // Confirmed speech start
-                        m_in_speech = true;
-                        int speech_confirm_samples = (speech_frames - 1) * chunk_samples;
-                        m_speech_start_sample = m_n_samples_total + frame_start - speech_confirm_samples;
-                        
-                        // Add padding from before speech started, using lookback buffer if needed
-                        int pad_samples = (m_vad_params.speech_pad_ms * WHISPER_SAMPLE_RATE) / 1000;
-                        int total_lookback = pad_samples + speech_confirm_samples;
-                        
-                        m_speech_audio.clear();
-                        
-                        if ((int)frame_start < total_lookback && !m_prev_buffer.empty()) {
-                            // Need audio from previous buffer for padding
-                            int needed_from_prev = total_lookback - (int)frame_start;
-                            if (needed_from_prev > (int)m_prev_buffer.size()) {
-                                needed_from_prev = (int)m_prev_buffer.size();
+
+        if (n_probs > 0 && probs != nullptr) {
+            for (int i = 0; i < n_probs; i++) {
+                float prob = probs[i];
+                bool is_speech = prob >= m_vad_params.threshold;
+
+                size_t frame_start = i * chunk_samples;
+                size_t frame_end = std::min(frame_start + chunk_samples, process_buffer.size());
+
+                if (is_speech) {
+                    m_silence_frames = 0;
+                    speech_frames++;
+
+                    if (!m_in_speech) {
+                        if (speech_frames >= min_speech_frames) {
+                            m_in_speech = true;
+                            int speech_confirm_samples = (speech_frames - 1) * chunk_samples;
+                            m_speech_start_sample = m_n_samples_total + frame_start - speech_confirm_samples;
+
+                            int pad_samples = (m_vad_params.speech_pad_ms * WHISPER_SAMPLE_RATE) / 1000;
+                            int total_lookback = pad_samples + speech_confirm_samples;
+
+                            m_speech_audio.clear();
+
+                            if ((int)frame_start < total_lookback && !m_prev_buffer.empty()) {
+                                int needed_from_prev = total_lookback - (int)frame_start;
+                                if (needed_from_prev > (int)m_prev_buffer.size()) {
+                                    needed_from_prev = (int)m_prev_buffer.size();
+                                }
+                                m_speech_audio.insert(m_speech_audio.end(), m_prev_buffer.end() - needed_from_prev, m_prev_buffer.end());
+                                m_speech_audio.insert(m_speech_audio.end(), process_buffer.begin(), process_buffer.begin() + frame_end);
+                                m_speech_start_sample -= needed_from_prev;
+                                if (m_speech_start_sample < 0) m_speech_start_sample = 0;
+                            } else {
+                                size_t start_idx = 0;
+                                if (frame_start > (size_t)total_lookback) {
+                                    start_idx = frame_start - total_lookback;
+                                }
+                                m_speech_audio.assign(process_buffer.begin() + start_idx, process_buffer.begin() + frame_end);
                             }
-                            // Append from prev_buffer
-                            m_speech_audio.insert(m_speech_audio.end(),
-                                m_prev_buffer.end() - needed_from_prev, m_prev_buffer.end());
-                            // Append from start of current process_buffer to frame_end
-                            m_speech_audio.insert(m_speech_audio.end(),
-                                process_buffer.begin(), process_buffer.begin() + frame_end);
-                            // Adjust speech start to account for extra padding
-                            m_speech_start_sample -= needed_from_prev;
-                            if (m_speech_start_sample < 0) m_speech_start_sample = 0;
-                        } else {
-                            // All padding available within current process_buffer
-                            size_t start_idx = 0;
-                            if (frame_start > (size_t)total_lookback) {
-                                start_idx = frame_start - total_lookback;
-                            }
-                            m_speech_audio.assign(process_buffer.begin() + start_idx, process_buffer.begin() + frame_end);
-                        }
-                            
                             last_progressive_sample = m_speech_start_sample;
+                        }
+                    } else {
+                        if (frame_start < process_buffer.size()) {
+                            m_speech_audio.insert(m_speech_audio.end(), process_buffer.begin() + frame_start, process_buffer.begin() + frame_end);
+                        }
+
+                        if (m_progressive_update) {
+                            int64_t current_sample = m_n_samples_total + frame_end;
+                            int64_t elapsed_since_start_ms = ((current_sample - m_speech_start_sample) * 1000) / WHISPER_SAMPLE_RATE;
+
+                            if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                                int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
+                                if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                                    emit_segment(true);
+                                    last_progressive_sample = current_sample;
+                                }
+                            }
+                        }
+
+                        if (m_speech_audio.size() >= max_speech_samples) {
+                            emit_segment(false);
+                            speech_frames = 0;
+                        }
                     }
                 } else {
-                    // Continue speech - add audio
-                    if (frame_start < process_buffer.size()) {
-                        m_speech_audio.insert(m_speech_audio.end(), 
-                            process_buffer.begin() + frame_start, 
-                            process_buffer.begin() + frame_end);
-                    }
-                    
-                    if (m_progressive_update) {
-                        int64_t current_sample = m_n_samples_total + frame_end;
-                        int64_t elapsed_since_start_ms = ((current_sample - m_speech_start_sample) * 1000) / WHISPER_SAMPLE_RATE;
-                        
-                        if (elapsed_since_start_ms >= m_progressive_initial_ms) {
-                            int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
-                            if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
-                                emit_segment(true);
-                                last_progressive_sample = current_sample;
-                            }
+                    if (m_in_speech) {
+                        if (frame_start < process_buffer.size()) {
+                            m_speech_audio.insert(m_speech_audio.end(), process_buffer.begin() + frame_start, process_buffer.begin() + frame_end);
+                        }
+                        m_silence_frames++;
+                        if (m_silence_frames >= min_silence_frames) {
+                            emit_segment(false);
                         }
                     }
-                    
-                    // Check max speech duration - force emit if too long
-                    if (m_speech_audio.size() >= max_speech_samples) {
-                        emit_segment(false);
-                        speech_frames = 0;
-                    }
+                    speech_frames = 0;
                 }
-            } else {
-                // Silence
-                if (m_in_speech) {
-                    // Add audio during silence (for padding)
-                    if (frame_start < process_buffer.size()) {
-                        m_speech_audio.insert(m_speech_audio.end(),
-                            process_buffer.begin() + frame_start,
-                            process_buffer.begin() + frame_end);
-                    }
-                    
-                    m_silence_frames++;
-                    
-                    // Check if silence is long enough to end speech
-                    if (m_silence_frames >= min_silence_frames) {
-                        emit_segment(false);
-                    }
-                }
-                speech_frames = 0;
             }
         }
         
         m_n_samples_total += process_buffer.size();
         m_prev_buffer = std::move(process_buffer);
         process_buffer.clear();
+
+        // [Key 2]: Force end segment after processing final buffer in finishing state
+        if (is_finishing) {
+            if (m_in_speech) {
+                // Force emit segment regardless of silence duration
+                emit_segment(false);
+            }
+            break; // Exit worker loop
+        }
     }
     
     // Send end event
@@ -562,7 +573,16 @@ void VADStream::VADWorker() {
         });
     }
 }
-
+Napi::Value VADStream::Finish(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    VADStreamState current_state = m_state.load();
+    
+    if (current_state == VADStreamState::RUNNING || current_state == VADStreamState::PAUSED) {
+        m_state = VADStreamState::FINISHING;
+        m_cv.notify_one(); 
+    }
+    return env.Undefined();
+}
 // ============================================================================
 // Batch VAD Detection Function
 // ============================================================================
