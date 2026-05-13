@@ -2,6 +2,7 @@
 // This file is included by addon.cpp
 
 #include "sense-voice.h"
+#include "silero-vad.h"
 #include "sense-voice-frontend.h"
 #include "whisper.h"  // For whisper VAD API
 
