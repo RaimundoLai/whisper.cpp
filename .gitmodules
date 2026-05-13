@@ -1,7 +1,11 @@
 [submodule "third-party/SenseVoice.cpp"]
 	path = third-party/SenseVoice.cpp
-	url = git@github.com:RaimundoLai/SenseVoice.cpp.git
+	url = https://github.com/RaimundoLai/SenseVoice.cpp.git
 	branch = dev
 [submodule "third-party/tokenizers-cpp"]
 	path = third-party/tokenizers-cpp
 	url = https://github.com/RaimundoLai/tokenizers-cpp
+[submodule "third-party/CrispASR"]
+	path = third-party/CrispASR
+	url = https://github.com/RaimundoLai/CrispASR.git
+	branch = dev
