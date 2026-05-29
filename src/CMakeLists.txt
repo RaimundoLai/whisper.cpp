@@ -124,6 +124,17 @@ set(QWEN3_ASR_SOURCES
     ${QWEN3_ASR_DIR}/forced_aligner.cpp
 )
 
+set(CRISPASR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third-party/CrispASR)
+file(GLOB CRISPASR_SOURCES 
+    "${CRISPASR_DIR}/src/*.cpp" 
+    "${CRISPASR_DIR}/src/*.c"
+    "${CRISPASR_DIR}/src/*.cc"
+)
+file(GLOB CRISPASR_CORE_SOURCES
+    "${CRISPASR_DIR}/src/core/*.cpp"
+)
+list(APPEND CRISPASR_SOURCES ${CRISPASR_CORE_SOURCES})
+list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp")
 
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
 if (WHISPER_COREML)
@@ -142,6 +153,7 @@ add_library(whisper
             whisper.cpp
             ${SENSE_VOICE_SOURCES}
             ${QWEN3_ASR_SOURCES}
+            ${CRISPASR_SOURCES}
             )
 
 # Define project version for standalone build if not set
@@ -153,7 +165,7 @@ if(NOT DEFINED SOVERSION)
     set(SOVERSION 1)
 endif()
 
-target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}" CRISPASR_VERSION="0.6.6")
 
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
@@ -161,7 +173,7 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR})
+target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ../ggml/src)
 target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
