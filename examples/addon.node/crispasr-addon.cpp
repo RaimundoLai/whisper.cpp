@@ -3,6 +3,7 @@
 
 
 
+#include "../../third-party/CrispASR/src/parakeet.h"
 #include "whisper.h"
 
 // ============================================================================
@@ -657,6 +658,17 @@ public:
         if (options.Has("progressive_update")) m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
         if (options.Has("progressive_interval_ms")) m_progressive_interval_ms = options.Get("progressive_interval_ms").As<Napi::Number>().Int32Value();
         if (options.Has("progressive_initial_ms")) m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
+        
+        if (options.Has("vad_model") && options.Get("vad_model").IsString())
+            m_vad_model_path = options.Get("vad_model").As<Napi::String>();
+        if (options.Has("vad_threshold") && options.Get("vad_threshold").IsNumber())
+            m_vad_threshold = options.Get("vad_threshold").As<Napi::Number>().FloatValue();
+        if (options.Has("min_mute_chunks") && options.Get("min_mute_chunks").IsNumber())
+            m_min_mute_chunks = options.Get("min_mute_chunks").As<Napi::Number>().Int32Value();
+        if (options.Has("max_nomute_chunks") && options.Get("max_nomute_chunks").IsNumber())
+            m_max_nomute_chunks = options.Get("max_nomute_chunks").As<Napi::Number>().Int32Value();
+        if (options.Has("use_vad") && options.Get("use_vad").IsBoolean())
+            m_use_vad = options.Get("use_vad").As<Napi::Boolean>();
     }
 
     ~CrispASRStream() {
@@ -666,6 +678,10 @@ public:
         if (m_session) {
             crispasr_session_close(m_session);
             m_session = nullptr;
+        }
+        if (m_vctx) {
+            whisper_vad_free(m_vctx);
+            m_vctx = nullptr;
         }
     }
 
@@ -690,6 +706,14 @@ public:
             return env.Undefined();
         }
         
+        m_segment_index = 0;
+        if (!m_vad_model_path.empty()) {
+            whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
+            vad_ctx_params.n_threads = m_n_threads;
+            vad_ctx_params.use_gpu = false;
+            m_vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
+        }
+        
         m_running = true;
         m_worker_thread = std::thread(&CrispASRStream::Worker, this);
         return env.Undefined();
@@ -712,6 +736,10 @@ public:
         if (m_session) {
             crispasr_session_close(m_session);
             m_session = nullptr;
+        }
+        if (m_vctx) {
+            whisper_vad_free(m_vctx);
+            m_vctx = nullptr;
         }
         m_audio_buffer.clear();
         return info.Env().Undefined();
@@ -738,7 +766,7 @@ public:
     }
 
 private:
-    void emit_segment(crispasr_session_result* res, int64_t start_time, int64_t end_time, const std::string& type) {
+    void emit_segment(crispasr_session_result* res, int64_t start_time, int64_t end_time, int segment_index, const std::string& type) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string text = "";
         
@@ -756,149 +784,327 @@ private:
                 if (!text.empty()) text += " ";
                 text += seg_text;
             }
-            
-            int n_words = crispasr_session_result_n_words(res, i);
-            for (int j = 0; j < n_words; j++) {
-                word_item wi;
-                const char* w_text = crispasr_session_result_word_text(res, i, j);
-                wi.word = w_text ? w_text : "";
-                wi.start = start_time + crispasr_session_result_word_t0(res, i, j) * 10;
-                wi.end = start_time + crispasr_session_result_word_t1(res, i, j) * 10;
-                wi.p = crispasr_session_result_word_p(res, i, j);
-                words_list.push_back(wi);
+        }
+
+        bool should_extract_words = true;
+        if (m_backend_name.find("voxtral") != std::string::npos ||
+            m_backend_name.find("vibevoice") != std::string::npos) {
+            should_extract_words = false;
+        }
+
+        if (should_extract_words) {
+            for (int i = 0; i < n_segs; i++) {
+                int n_words = crispasr_session_result_n_words(res, i);
+                for (int j = 0; j < n_words; j++) {
+                    word_item wi;
+                    const char* w_text = crispasr_session_result_word_text(res, i, j);
+                    wi.word = w_text ? w_text : "";
+                    wi.start = start_time + crispasr_session_result_word_t0(res, i, j) * 10;
+                    wi.end = start_time + crispasr_session_result_word_t1(res, i, j) * 10;
+                    wi.p = crispasr_session_result_word_p(res, i, j);
+                    words_list.push_back(wi);
+                }
             }
         }
         
         if (!text.empty() || type == "segment") {
             auto cb_data = std::make_tuple(start_time, end_time, text, words_list, type);
-            m_tsfn.BlockingCall([cb_data](Napi::Env env, Napi::Function cb) {
+            auto callback = [cb_data, segment_index](Napi::Env env, Napi::Function cb) {
                 Napi::Object result = Napi::Object::New(env);
                 result.Set("type", Napi::String::New(env, std::get<4>(cb_data)));
+                result.Set("index", Napi::Number::New(env, segment_index));
                 result.Set("start", Napi::Number::New(env, std::get<0>(cb_data)));
                 result.Set("end", Napi::Number::New(env, std::get<1>(cb_data)));
                 result.Set("text", Napi::String::New(env, std::get<2>(cb_data)));
                 
                 const auto& wl = std::get<3>(cb_data);
-                Napi::Array words_arr = Napi::Array::New(env, wl.size());
-                for (size_t k = 0; k < wl.size(); k++) {
-                    Napi::Object w_obj = Napi::Object::New(env);
-                    w_obj.Set("word", Napi::String::New(env, wl[k].word));
-                    w_obj.Set("start", Napi::Number::New(env, wl[k].start / 1000.0));
-                    w_obj.Set("end", Napi::Number::New(env, wl[k].end / 1000.0));
-                    w_obj.Set("p", Napi::Number::New(env, wl[k].p));
-                    words_arr[k] = w_obj;
-                }
-                result.Set("words", words_arr);
+                    Napi::Array words_arr = Napi::Array::New(env, wl.size());
+                    for (size_t k = 0; k < wl.size(); k++) {
+                        Napi::Object w_obj = Napi::Object::New(env);
+                        w_obj.Set("word", Napi::String::New(env, wl[k].word));
+                        w_obj.Set("start", Napi::Number::New(env, wl[k].start / 1000.0));
+                        w_obj.Set("end", Napi::Number::New(env, wl[k].end / 1000.0));
+                        w_obj.Set("p", Napi::Number::New(env, wl[k].p));
+                        words_arr[k] = w_obj;
+                    }
+                    result.Set("words", words_arr);
                 
+                cb.Call({env.Null(), result});
+            };
+            if (type == "progressive") {
+                m_tsfn.NonBlockingCall(callback);
+            } else {
+                m_tsfn.BlockingCall(callback);
+            }
+        }
+    }
+
+    void emit_silence(double t) {
+        if (m_tsfn) {
+            m_tsfn.BlockingCall([t](Napi::Env env, Napi::Function cb) {
+                Napi::Object result = Napi::Object::New(env);
+                result.Set("type", Napi::String::New(env, "silence"));
+                result.Set("t", Napi::Number::New(env, t));
                 cb.Call({env.Null(), result});
             });
         }
     }
 
     void Worker() {
-        const size_t chunk_samples = (m_chunk_size_ms * 16000) / 1000;
+        const int sample_rate = 16000;
+        const int chunk_samples = (m_chunk_size_ms * sample_rate) / 1000;
         const char* lang_ptr = m_language.empty() ? nullptr : m_language.c_str();
-        int64_t t_offset_ms = 0;
         
-        std::vector<float> m_pcmf32_local;
+        std::vector<float> speech_buffer;
+        std::vector<float> pre_speech_cache;
+        std::vector<float> accumulated_samples;
+        bool in_speech = false;
+        int silence_chunk_count = 0;
+        int speech_chunk_count = 0;
+        int64_t speech_start_sample = 0;
+        int64_t total_samples_received = 0;
+        
         int64_t last_progressive_sample = 0;
+        double last_silence_time = 0.0;
 
         while (m_running) {
-            std::vector<float> chunk;
             bool is_finishing_step = false;
+            bool timeout = false;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                if (m_progressive_update) {
-                    m_cv.wait(lock, [this] {
-                        return !m_running || (!m_audio_buffer.empty() && !m_paused) || m_finishing;
-                    });
-                } else {
-                    m_cv.wait(lock, [this, chunk_samples] { 
-                        return !m_running || 
-                               (m_audio_buffer.size() >= chunk_samples && !m_paused) || 
-                               (m_finishing && !m_audio_buffer.empty()); 
-                    });
-                }
+                timeout = !m_cv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
+                    return !m_running || !m_audio_buffer.empty() || m_finishing;
+                });
                 
                 if (!m_running) break;
+                is_finishing_step = m_finishing;
                 
-                if (m_progressive_update) {
-                    is_finishing_step = m_finishing;
-                    if (!m_paused) {
-                        m_pcmf32_local.insert(m_pcmf32_local.end(), m_audio_buffer.begin(), m_audio_buffer.end());
-                        m_audio_buffer.clear();
-                    }
-                } else {
-                    if (m_audio_buffer.size() >= chunk_samples) {
-                        chunk.assign(m_audio_buffer.begin(), m_audio_buffer.begin() + chunk_samples);
-                        m_audio_buffer.erase(m_audio_buffer.begin(), m_audio_buffer.begin() + chunk_samples);
-                    } else if (m_finishing && !m_audio_buffer.empty()) {
-                        chunk.assign(m_audio_buffer.begin(), m_audio_buffer.end());
-                        m_audio_buffer.clear();
-                    }
+                if (!m_paused) {
+                    accumulated_samples.insert(accumulated_samples.end(), m_audio_buffer.begin(), m_audio_buffer.end());
+                    m_audio_buffer.clear();
                 }
             }
-
-            if (m_progressive_update) {
-                if (is_finishing_step && m_pcmf32_local.empty()) {
-                    break;
+            
+            if (timeout && m_running) {
+                double current_time_sec = (double)total_samples_received / sample_rate;
+                emit_silence(current_time_sec);
+                last_silence_time = current_time_sec;
+                continue;
+            }
+            
+            size_t processed_samples = 0;
+            size_t n_chunks = accumulated_samples.size() / chunk_samples;
+            std::vector<bool> chunks_is_speech;
+            chunks_is_speech.reserve(n_chunks);
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t offset = c * chunk_samples;
+                std::vector<float> vad_chunk(accumulated_samples.begin() + offset, accumulated_samples.begin() + offset + chunk_samples);
+                bool is_speech = true;
+                if (m_use_vad) {
+                    if (!m_vad_model_path.empty() && m_vctx) {
+                        whisper_vad_detect_speech(m_vctx, vad_chunk.data(), vad_chunk.size());
+                        float speech_prob = 0.0f;
+                        int n_probs = whisper_vad_n_probs(m_vctx);
+                        if (n_probs > 0) {
+                            const float* probs = whisper_vad_probs(m_vctx);
+                            for (int k = 0; k < n_probs; k++) if (probs[k] > speech_prob) speech_prob = probs[k];
+                        }
+                        is_speech = speech_prob >= m_vad_threshold;
+                    } else {
+                        float energy = 0.0f;
+                        for (int j = 0; j < chunk_samples; j++) energy += vad_chunk[j] * vad_chunk[j];
+                        energy = std::sqrt(energy / chunk_samples);
+                        is_speech = energy > 0.01f;
+                    }
                 }
+                chunks_is_speech.push_back(is_speech);
+            }
+
+            auto will_segment_end = [&](size_t start_chunk, bool curr_in_speech, int curr_silence_count, int curr_speech_count) -> bool {
+                bool temp_in_speech = curr_in_speech;
+                int temp_silence_count = curr_silence_count;
+                int temp_speech_count = curr_speech_count;
                 
-                bool should_finalize = (m_pcmf32_local.size() >= chunk_samples) || is_finishing_step;
+                for (size_t next_c = start_chunk; next_c < chunks_is_speech.size(); ++next_c) {
+                    bool next_is_speech = chunks_is_speech[next_c];
+                    if (next_is_speech) {
+                        if (!temp_in_speech) {
+                            temp_in_speech = true;
+                        }
+                        temp_silence_count = 0;
+                        temp_speech_count++;
+                        if (temp_speech_count >= m_max_nomute_chunks) {
+                            return true;
+                        }
+                    } else {
+                        if (temp_in_speech) {
+                            temp_silence_count++;
+                            if (temp_silence_count > m_min_mute_chunks) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            };
+
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t i = c * chunk_samples;
+                std::vector<float> vad_chunk(accumulated_samples.begin() + i, accumulated_samples.begin() + i + chunk_samples);
                 
-                if (should_finalize) {
-                    if (!m_pcmf32_local.empty()) {
-                        std::vector<float> transcribe_pcm = m_pcmf32_local;
+                bool is_speech = chunks_is_speech[c];
+                
+                if (is_speech) {
+                    if (!in_speech) {
+                        speech_start_sample = total_samples_received + i - pre_speech_cache.size();
+                        if (speech_start_sample < 0) {
+                            speech_start_sample = 0;
+                        }
+                        last_progressive_sample = speech_start_sample;
+                        m_segment_index++;
+                        speech_buffer.insert(speech_buffer.end(), pre_speech_cache.begin(), pre_speech_cache.end());
+                        pre_speech_cache.clear();
+                    }
+                    speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
+                    in_speech = true;
+                    silence_chunk_count = 0;
+                    speech_chunk_count++;
+                    
+                    if (m_progressive_update) {
+                        int64_t current_sample = total_samples_received + i + chunk_samples;
+                        int64_t elapsed_since_start_ms = ((current_sample - speech_start_sample) * 1000) / sample_rate;
+                        
+                        if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                            int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
+                            if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
+                                bool has_pending_audio = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(m_mutex);
+                                    has_pending_audio = !m_audio_buffer.empty();
+                                }
+                                bool skip_progressive = is_finishing_step || 
+                                                        has_pending_audio || 
+                                                        will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
+                                if (!skip_progressive) {
+                                    std::vector<float> transcribe_pcm = speech_buffer;
+                                    if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
+                                        transcribe_pcm.resize(32000, 0.0f);
+                                    }
+                                    crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
+                                    if (res) {
+                                        int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                                        int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                                        emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "progressive");
+                                        crispasr_session_result_free(res);
+                                    }
+                                    last_progressive_sample = current_sample;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (speech_chunk_count >= m_max_nomute_chunks) {
+                        int64_t current_sample = total_samples_received + i + chunk_samples;
+                        std::vector<float> transcribe_pcm = speech_buffer;
                         if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
                             transcribe_pcm.resize(32000, 0.0f);
                         }
-                        
                         crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
                         if (res) {
-                            emit_segment(res, t_offset_ms, t_offset_ms + (m_pcmf32_local.size() * 1000) / 16000, "segment");
+                            int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                            int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                            emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment");
                             crispasr_session_result_free(res);
                         }
-                        
-                        t_offset_ms += (m_pcmf32_local.size() * 1000) / 16000;
-                        m_pcmf32_local.clear();
-                        last_progressive_sample = 0;
-                    }
-                    if (is_finishing_step) {
-                        break;
+                        speech_buffer.clear();
+                        speech_chunk_count = 0;
+                        speech_start_sample = current_sample;
+                        last_progressive_sample = current_sample;
+                        m_segment_index++;
+                        silence_chunk_count = 0;
+                        in_speech = true;
                     }
                 } else {
-                    int64_t current_samples = m_pcmf32_local.size();
-                    int64_t elapsed_since_start_ms = (current_samples * 1000) / 16000;
-                    if (elapsed_since_start_ms >= m_progressive_initial_ms) {
-                        int64_t elapsed_since_last_prog_ms = ((current_samples - last_progressive_sample) * 1000) / 16000;
-                        if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
-                            std::vector<float> transcribe_pcm = m_pcmf32_local;
-                            if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
-                                transcribe_pcm.resize(32000, 0.0f);
+                    if (in_speech) {
+                        silence_chunk_count++;
+                        if (silence_chunk_count <= m_min_mute_chunks) {
+                            speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
+                        }
+                        if (silence_chunk_count > m_min_mute_chunks) {
+                            in_speech = false;
+                            int64_t speech_end_sample = total_samples_received + i + chunk_samples;
+                            int64_t actual_end_sample = speech_end_sample - (silence_chunk_count * chunk_samples);
+                            if (actual_end_sample < speech_start_sample) {
+                                actual_end_sample = speech_end_sample;
                             }
-                            
+
+                            std::vector<float> transcribe_pcm = speech_buffer;
+                            size_t silence_samples = std::min(silence_chunk_count, m_min_mute_chunks) * chunk_samples;
+                            size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
+                            if (silence_samples > post_speech_pad_samples) {
+                                size_t trim_samples = silence_samples - post_speech_pad_samples;
+                                if (transcribe_pcm.size() > trim_samples) {
+                                    transcribe_pcm.resize(transcribe_pcm.size() - trim_samples);
+                                }
+                            }
+
+                            if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
+                                  transcribe_pcm.resize(32000, 0.0f);
+                            }
                             crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
                             if (res) {
-                                emit_segment(res, t_offset_ms, t_offset_ms + (m_pcmf32_local.size() * 1000) / 16000, "progressive");
+                                int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                                int64_t chunk_end_ms = (actual_end_sample * 1000) / sample_rate;
+                                emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment");
                                 crispasr_session_result_free(res);
                             }
-                            last_progressive_sample = current_samples;
+                            speech_buffer.clear();
+                            speech_chunk_count = 0;
+                            pre_speech_cache.clear();
                         }
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    
+                    if (!in_speech) {
+                        pre_speech_cache.insert(pre_speech_cache.end(), vad_chunk.begin(), vad_chunk.end());
+                        size_t pre_speech_pad_samples = (300 * sample_rate) / 1000;
+                        if (pre_speech_cache.size() > pre_speech_pad_samples) {
+                            pre_speech_cache.erase(pre_speech_cache.begin(), pre_speech_cache.end() - pre_speech_pad_samples);
+                        }
+
+                        double current_time_sec = (double)(total_samples_received + i + chunk_samples) / sample_rate;
+                        if (current_time_sec - last_silence_time >= 1.0) {
+                            emit_silence(current_time_sec);
+                            last_silence_time = current_time_sec;
+                        }
+                    }
                 }
-            } else {
-                if (!chunk.empty()) {
-                    crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, chunk.data(), chunk.size(), lang_ptr);
+                processed_samples = i + chunk_samples;
+            }
+            
+            if (processed_samples > 0) {
+                total_samples_received += processed_samples;
+                accumulated_samples.erase(accumulated_samples.begin(), accumulated_samples.begin() + processed_samples);
+            }
+            
+            if (is_finishing_step) {
+                speech_buffer.insert(speech_buffer.end(), accumulated_samples.begin(), accumulated_samples.end());
+                int64_t final_sample = total_samples_received + accumulated_samples.size();
+                int64_t start = in_speech ? (speech_start_sample * 1000) / sample_rate : (total_samples_received * 1000) / sample_rate;
+                if (!speech_buffer.empty()) {
+                    if (!in_speech) {
+                        m_segment_index++;
+                    }
+                    std::vector<float> transcribe_pcm = speech_buffer;
+                    if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
+                        transcribe_pcm.resize(32000, 0.0f);
+                    }
+                    crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
                     if (res) {
-                        emit_segment(res, t_offset_ms, t_offset_ms + (chunk.size() * 1000) / 16000, "segment");
+                        emit_segment(res, start, (final_sample * 1000) / sample_rate, m_segment_index, "segment");
                         crispasr_session_result_free(res);
                     }
-                    t_offset_ms += (chunk.size() * 1000) / 16000;
                 }
-                if (m_finishing && m_audio_buffer.empty()) {
-                    break;
-                }
+                break;
             }
         }
 
@@ -929,6 +1135,13 @@ private:
     bool m_progressive_update = false;
     int m_progressive_interval_ms = 500;
     int m_progressive_initial_ms = 1000;
+    int m_segment_index = 0;
+    std::string m_vad_model_path;
+    float m_vad_threshold = 0.5f;
+    int m_min_mute_chunks = 30;
+    int m_max_nomute_chunks = 1875;
+    bool m_use_vad = true;
+    whisper_vad_context* m_vctx = nullptr;
     crispasr_session* m_session = nullptr;
     std::vector<float> m_audio_buffer;
     std::mutex m_mutex;
