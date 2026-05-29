@@ -3,7 +3,6 @@
 
 
 
-#include "../../third-party/CrispASR/src/parakeet.h"
 #include "whisper.h"
 
 // ============================================================================
@@ -173,107 +172,6 @@ Napi::Value parakeetASR(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-// ============================================================================
-// Parakeet Stream Implementation
-// ============================================================================
-
-class ParakeetStream : public Napi::ObjectWrap<ParakeetStream> {
-public:
-    static Napi::Object Init(Napi::Env env, Napi::Object exports) {
-        Napi::Function func = DefineClass(env, "ParakeetStream", {
-            InstanceMethod("start", &ParakeetStream::Start),
-            InstanceMethod("addAudio", &ParakeetStream::AddAudio),
-            InstanceMethod("stop", &ParakeetStream::Stop),
-        });
-        exports.Set("ParakeetStream", func);
-        return exports;
-    }
-
-    ParakeetStream(const Napi::CallbackInfo& info) : Napi::ObjectWrap<ParakeetStream>(info) {
-        Napi::Env env = info.Env();
-        Napi::Object options = info[0].As<Napi::Object>();
-        m_model_path = options.Get("model").As<Napi::String>();
-        if (options.Has("n_threads")) m_n_threads = options.Get("n_threads").As<Napi::Number>().Int32Value();
-        if (options.Has("use_gpu")) m_use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
-        if (options.Has("chunk_size_ms")) m_chunk_size_ms = options.Get("chunk_size_ms").As<Napi::Number>().Int32Value();
-    }
-
-    ~ParakeetStream() {
-        m_running = false;
-        m_cv.notify_all();
-        if (m_worker_thread.joinable()) m_worker_thread.join();
-        if (m_ctx) parakeet_free(m_ctx);
-    }
-
-    Napi::Value Start(const Napi::CallbackInfo& info) {
-        Napi::Env env = info.Env();
-        Napi::Function callback = info[0].As<Napi::Function>();
-        m_tsfn = Napi::ThreadSafeFunction::New(env, callback, "ParakeetStream", 0, 1);
-        
-        struct parakeet_context_params params = parakeet_context_default_params();
-        params.n_threads = m_n_threads;
-        params.use_gpu = m_use_gpu;
-        m_ctx = parakeet_init_from_file(m_model_path.c_str(), params);
-        
-        m_running = true;
-        m_worker_thread = std::thread(&ParakeetStream::Worker, this);
-        return env.Undefined();
-    }
-
-    Napi::Value AddAudio(const Napi::CallbackInfo& info) {
-        Napi::Float32Array arr = info[0].As<Napi::Float32Array>();
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_audio_buffer.insert(m_audio_buffer.end(), arr.Data(), arr.Data() + arr.ElementLength());
-        m_cv.notify_one();
-        return info.Env().Undefined();
-    }
-
-    Napi::Value Stop(const Napi::CallbackInfo& info) {
-        m_running = false;
-        m_cv.notify_all();
-        if (m_worker_thread.joinable()) m_worker_thread.join();
-        return info.Env().Undefined();
-    }
-
-private:
-    void Worker() {
-        const size_t chunk_samples = (m_chunk_size_ms * 16000) / 1000;
-        int64_t t_offset_cs = 0;
-
-        while (m_running) {
-            std::vector<float> chunk;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this, chunk_samples] { return !m_running || m_audio_buffer.size() >= chunk_samples; });
-                if (!m_running) break;
-                chunk.assign(m_audio_buffer.begin(), m_audio_buffer.begin() + chunk_samples);
-                m_audio_buffer.erase(m_audio_buffer.begin(), m_audio_buffer.begin() + chunk_samples);
-            }
-
-            struct parakeet_result* res = parakeet_transcribe_ex(m_ctx, chunk.data(), chunk.size(), t_offset_cs);
-            if (res) {
-                std::string text = res->text ? res->text : "";
-                m_tsfn.BlockingCall([text](Napi::Env env, Napi::Function cb) {
-                    cb.Call({env.Null(), Napi::String::New(env, text)});
-                });
-                parakeet_result_free(res);
-            }
-            t_offset_cs += m_chunk_size_ms / 10;
-        }
-    }
-
-    std::string m_model_path;
-    int m_n_threads = 4;
-    bool m_use_gpu = true;
-    int m_chunk_size_ms = 2000;
-    struct parakeet_context* m_ctx = nullptr;
-    std::vector<float> m_audio_buffer;
-    std::mutex m_mutex;
-    std::condition_variable m_cv;
-    std::thread m_worker_thread;
-    std::atomic<bool> m_running{false};
-    Napi::ThreadSafeFunction m_tsfn;
-};
 
 // ============================================================================
 // Distil-Whisper Implementation
@@ -1047,6 +945,5 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("parakeetASR", Napi::Function::New(env, parakeetASR));
     exports.Set("crispasrASR", Napi::Function::New(env, crispasrASR));
     exports.Set("distilWhisper", Napi::Function::New(env, distilWhisper));
-    ParakeetStream::Init(env, exports);
     CrispASRStream::Init(env, exports);
 }
