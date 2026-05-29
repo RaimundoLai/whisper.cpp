@@ -134,7 +134,7 @@ file(GLOB CRISPASR_CORE_SOURCES
     "${CRISPASR_DIR}/src/core/*.cpp"
 )
 list(APPEND CRISPASR_SOURCES ${CRISPASR_CORE_SOURCES})
-list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp")
+list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp")
 
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
 if (WHISPER_COREML)

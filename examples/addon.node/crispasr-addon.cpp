@@ -5,6 +5,72 @@
 
 #include "../../third-party/CrispASR/src/parakeet.h"
 #include "whisper.h"
+#include "forced_aligner.h"
+
+static std::string extract_clean_text_if_json(const std::string& input) {
+    if (input.empty()) return "";
+    size_t start_idx = 0;
+    while (start_idx < input.length() && (input[start_idx] == ' ' || input[start_idx] == '\n' || input[start_idx] == '\r' || input[start_idx] == '\t')) {
+        start_idx++;
+    }
+    if (start_idx >= input.length()) return input;
+    if (input[start_idx] != '[' && input[start_idx] != '{') {
+        return input;
+    }
+    
+    std::string clean_text = "";
+    size_t pos = start_idx;
+    while (true) {
+        size_t next_content = input.find("\"Content\":", pos);
+        if (next_content == std::string::npos) next_content = input.find("\"content\":", pos);
+        if (next_content == std::string::npos) next_content = input.find("\"text\":", pos);
+        if (next_content == std::string::npos) break;
+        
+        size_t val_start = input.find("\"", next_content + 9);
+        if (val_start == std::string::npos) break;
+        val_start++;
+        
+        size_t val_end = val_start;
+        while (val_end < input.length()) {
+            if (input[val_end] == '\\') val_end += 2;
+            else if (input[val_end] == '"') break;
+            else val_end++;
+        }
+        if (val_end >= input.length()) break;
+        
+        std::string value = input.substr(val_start, val_end - val_start);
+        std::string unescaped = "";
+        for (size_t i = 0; i < value.length(); i++) {
+            if (value[i] == '\\' && i + 1 < value.length()) {
+                char c = value[i+1];
+                if (c == '"' || c == '\\' || c == '/') unescaped += c;
+                else if (c == 'n') unescaped += '\n';
+                else if (c == 't') unescaped += '\t';
+                else { unescaped += value[i]; unescaped += c; }
+                i++;
+            } else {
+                unescaped += value[i];
+            }
+        }
+        
+        if (!unescaped.empty()) {
+            size_t s = 0;
+            while (s < unescaped.length() && (unescaped[s] == ' ' || unescaped[s] == '\t')) s++;
+            size_t e = unescaped.length();
+            while (e > s && (unescaped[e-1] == ' ' || unescaped[e-1] == '\t')) e--;
+            std::string trimmed = unescaped.substr(s, e - s);
+            
+            if (trimmed.length() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
+                // Ignore bracketed non-speech events
+            } else {
+                if (!clean_text.empty()) clean_text += " ";
+                clean_text += trimmed;
+            }
+        }
+        pos = val_end + 1;
+    }
+    return clean_text.empty() ? input : clean_text;
+}
 
 // ============================================================================
 // Parakeet ASR Implementation
@@ -214,6 +280,9 @@ extern "C" {
     float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
     void crispasr_session_result_free(crispasr_session_result* r);
     void crispasr_session_close(crispasr_session* s);
+    int crispasr_session_set_translate(crispasr_session* s, int enable);
+    int crispasr_session_set_target_language(crispasr_session* s, const char* lang);
+    int crispasr_session_set_ask(crispasr_session* s, const char* prompt);
 }
 
 struct crispasr_addon_result {
@@ -251,6 +320,10 @@ public:
                    bool use_gpu,
                    bool debug,
                    std::string language,
+                   bool translate,
+                   std::string target_language,
+                   std::string context,
+                   std::string aligner_model_path,
                    std::string vad_model_path,
                    float vad_threshold,
                    int min_speech_ms,
@@ -267,6 +340,10 @@ public:
           m_use_gpu(use_gpu),
           m_debug(debug),
           m_language(std::move(language)),
+          m_translate(translate),
+          m_target_language(std::move(target_language)),
+          m_context(std::move(context)),
+          m_aligner_model_path(std::move(aligner_model_path)),
           m_vad_model_path(std::move(vad_model_path)),
           m_vad_threshold(vad_threshold),
           m_min_speech_ms(min_speech_ms),
@@ -313,7 +390,7 @@ public:
         return m_should_abort->load();
     }
 
-    void process_result(crispasr_session_result* res, int64_t offset_ms) {
+    void process_result(crispasr_session_result* res, int64_t offset_ms, const qwen3_asr::alignment_result* align_res = nullptr) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string full_text = m_result.text;
 
@@ -329,17 +406,37 @@ public:
             }
             full_text += sd.text;
 
+            bool has_words = false;
             int n_words = crispasr_session_result_n_words(res, i);
-            for (int j = 0; j < n_words; j++) {
-                crispasr_addon_result::word_data wd;
-                const char* w_text = crispasr_session_result_word_text(res, i, j);
-                wd.text = w_text ? w_text : "";
-                wd.start_ms = offset_ms + crispasr_session_result_word_t0(res, i, j) * 10;
-                wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
-                wd.p = crispasr_session_result_word_p(res, i, j);
+            if (n_words > 0) {
+                for (int j = 0; j < n_words; j++) {
+                    crispasr_addon_result::word_data wd;
+                    const char* w_text = crispasr_session_result_word_text(res, i, j);
+                    wd.text = w_text ? w_text : "";
+                    wd.start_ms = offset_ms + crispasr_session_result_word_t0(res, i, j) * 10;
+                    wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
+                    wd.p = crispasr_session_result_word_p(res, i, j);
 
-                sd.words.push_back(wd);
-                m_result.words.push_back(wd);
+                    sd.words.push_back(wd);
+                    m_result.words.push_back(wd);
+                }
+                has_words = true;
+            }
+
+            if (!has_words && align_res && align_res->success) {
+                for (const auto& word : align_res->words) {
+                    int64_t w_start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
+                    int64_t w_end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
+                    if (n_segs == 1 || (w_start_ms >= sd.start_ms - 200 && w_start_ms <= sd.end_ms + 200)) {
+                        crispasr_addon_result::word_data wd;
+                        wd.text = word.word;
+                        wd.start_ms = w_start_ms;
+                        wd.end_ms = w_end_ms;
+                        wd.p = 0.99f;
+                        sd.words.push_back(wd);
+                        m_result.words.push_back(wd);
+                    }
+                }
             }
 
             m_result.segments.push_back(std::move(sd));
@@ -366,6 +463,26 @@ public:
             return;
         }
 
+        // Apply translate, target language, and context parameters
+        crispasr_session_set_translate(session, m_translate ? 1 : 0);
+        if (!m_target_language.empty()) {
+            crispasr_session_set_target_language(session, m_target_language.c_str());
+        }
+        if (!m_context.empty()) {
+            crispasr_session_set_ask(session, m_context.c_str());
+        }
+
+        // Load ForcedAligner if path provided
+        qwen3_asr::ForcedAligner aligner;
+        bool use_aligner = !m_aligner_model_path.empty();
+        if (use_aligner) {
+            if (!aligner.load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                crispasr_session_close(session);
+                SetError("Failed to load aligner model: " + aligner.get_error());
+                return;
+            }
+        }
+
         m_result.backend = crispasr_session_backend(session);
         const char* lang_ptr = m_language.empty() ? nullptr : m_language.c_str();
 
@@ -379,7 +496,24 @@ public:
 
             crispasr_session_result* res = crispasr_session_transcribe_lang(session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
             if (res) {
-                process_result(res, 0);
+                qwen3_asr::alignment_result align_res;
+                if (use_aligner) {
+                    int n_segs = crispasr_session_result_n_segments(res);
+                    std::string total_txt = "";
+                    for (int i = 0; i < n_segs; i++) {
+                        const char* s_text = crispasr_session_result_segment_text(res, i);
+                        if (s_text) {
+                            if (!total_txt.empty()) total_txt += " ";
+                            total_txt += s_text;
+                        }
+                    }
+                    if (!total_txt.empty()) {
+                        std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                        std::string clean_txt = extract_clean_text_if_json(total_txt);
+                        align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+                    }
+                }
+                process_result(res, 0, use_aligner ? &align_res : nullptr);
                 crispasr_session_result_free(res);
             } else {
                 SetError("CrispASR transcription failed");
@@ -447,7 +581,24 @@ public:
 
                         crispasr_session_result* res = crispasr_session_transcribe_lang(session, chunk.data(), chunk.size(), lang_ptr);
                         if (res) {
-                            process_result(res, static_cast<int64_t>(chunk_t0 * 1000));
+                            qwen3_asr::alignment_result align_res;
+                            if (use_aligner) {
+                                int n_segs = crispasr_session_result_n_segments(res);
+                                std::string total_txt = "";
+                                for (int k = 0; k < n_segs; k++) {
+                                    const char* s_text = crispasr_session_result_segment_text(res, k);
+                                    if (s_text) {
+                                        if (!total_txt.empty()) total_txt += " ";
+                                        total_txt += s_text;
+                                    }
+                                }
+                                if (!total_txt.empty()) {
+                                    std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                                    std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    align_res = aligner.align(chunk.data(), chunk.size(), clean_txt, detected_lang);
+                                }
+                            }
+                            process_result(res, static_cast<int64_t>(chunk_t0 * 1000), use_aligner ? &align_res : nullptr);
                             crispasr_session_result_free(res);
                         }
 
@@ -516,6 +667,10 @@ private:
     bool m_use_gpu;
     bool m_debug;
     std::string m_language;
+    bool m_translate;
+    std::string m_target_language;
+    std::string m_context;
+    std::string m_aligner_model_path;
     std::string m_vad_model_path;
     float m_vad_threshold;
     int m_min_speech_ms;
@@ -582,6 +737,30 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         language = options.Get("language").As<Napi::String>();
     }
 
+    bool translate = false;
+    if (options.Has("translate") && options.Get("translate").IsBoolean()) {
+        translate = options.Get("translate").As<Napi::Boolean>();
+    }
+
+    std::string target_language = "";
+    if (options.Has("target_language") && options.Get("target_language").IsString()) {
+        target_language = options.Get("target_language").As<Napi::String>();
+    }
+
+    std::string context = "";
+    if (options.Has("context") && options.Get("context").IsString()) {
+        context = options.Get("context").As<Napi::String>();
+    }
+
+    std::string aligner_model_path = "";
+    if (options.Has("aligner_model") && options.Get("aligner_model").IsString()) {
+        aligner_model_path = options.Get("aligner_model").As<Napi::String>();
+    } else if (options.Has("aligner") && options.Get("aligner").IsString()) {
+        aligner_model_path = options.Get("aligner").As<Napi::String>();
+    } else if (options.Has("alignerModel") && options.Get("alignerModel").IsString()) {
+        aligner_model_path = options.Get("alignerModel").As<Napi::String>();
+    }
+
     // Additional VAD parameters
     std::string vad_model_path = "";
     if (options.Has("vad_model") && options.Get("vad_model").IsString()) {
@@ -621,6 +800,7 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[1].As<Napi::Function>();
     CrispASRWorker* worker = new CrispASRWorker(
         callback, model_path, backend_name, std::move(pcmf32), n_threads, use_gpu, debug, language,
+        translate, target_language, context, aligner_model_path,
         vad_model_path, vad_threshold, min_speech_ms, min_silence_ms, speech_pad_ms, max_speech_ms,
         progress_callback, env
     );
@@ -631,6 +811,13 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
 
 class CrispASRStream : public Napi::ObjectWrap<CrispASRStream> {
 public:
+    struct stream_word_item {
+        std::string word;
+        int64_t start;
+        int64_t end;
+        float p;
+    };
+
     static Napi::Object Init(Napi::Env env, Napi::Object exports) {
         Napi::Function func = DefineClass(env, "CrispASRStream", {
             InstanceMethod("start", &CrispASRStream::Start),
@@ -655,6 +842,18 @@ public:
         if (options.Has("use_gpu")) m_use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
         if (options.Has("chunk_size_ms")) m_chunk_size_ms = options.Get("chunk_size_ms").As<Napi::Number>().Int32Value();
         
+        if (options.Has("translate")) m_translate = options.Get("translate").As<Napi::Boolean>();
+        if (options.Has("target_language")) m_target_language = options.Get("target_language").As<Napi::String>();
+        if (options.Has("context")) m_context = options.Get("context").As<Napi::String>();
+        if (options.Has("aligner") && options.Get("aligner").IsString()) {
+            m_aligner_model_path = options.Get("aligner").As<Napi::String>();
+        } else if (options.Has("aligner_model") && options.Get("aligner_model").IsString()) {
+            m_aligner_model_path = options.Get("aligner_model").As<Napi::String>();
+        } else if (options.Has("alignerModel") && options.Get("alignerModel").IsString()) {
+            m_aligner_model_path = options.Get("alignerModel").As<Napi::String>();
+        }
+        if (options.Has("debug")) m_debug = options.Get("debug").As<Napi::Boolean>();
+
         if (options.Has("progressive_update")) m_progressive_update = options.Get("progressive_update").As<Napi::Boolean>();
         if (options.Has("progressive_interval_ms")) m_progressive_interval_ms = options.Get("progressive_interval_ms").As<Napi::Number>().Int32Value();
         if (options.Has("progressive_initial_ms")) m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
@@ -683,6 +882,7 @@ public:
             whisper_vad_free(m_vctx);
             m_vctx = nullptr;
         }
+        m_aligner.reset();
     }
 
     Napi::Value Start(const Napi::CallbackInfo& info) {
@@ -704,6 +904,21 @@ public:
         if (!m_session) {
             Napi::Error::New(env, "Failed to open CrispASR session").ThrowAsJavaScriptException();
             return env.Undefined();
+        }
+
+        crispasr_session_set_translate(m_session, m_translate ? 1 : 0);
+        if (!m_target_language.empty()) {
+            crispasr_session_set_target_language(m_session, m_target_language.c_str());
+        }
+        if (!m_context.empty()) {
+            crispasr_session_set_ask(m_session, m_context.c_str());
+        }
+
+        if (!m_aligner_model_path.empty()) {
+            m_aligner = std::make_unique<qwen3_asr::ForcedAligner>();
+            if (!m_aligner->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                fprintf(stderr, "[STREAM] Warning: Failed to load Forced Align model\n");
+            }
         }
         
         m_segment_index = 0;
@@ -741,6 +956,7 @@ public:
             whisper_vad_free(m_vctx);
             m_vctx = nullptr;
         }
+        m_aligner.reset();
         m_audio_buffer.clear();
         return info.Env().Undefined();
     }
@@ -766,17 +982,10 @@ public:
     }
 
 private:
-    void emit_segment(crispasr_session_result* res, int64_t start_time, int64_t end_time, int segment_index, const std::string& type) {
+    void emit_segment(crispasr_session_result* res, int64_t start_time, int64_t end_time, int segment_index, const std::string& type, const std::vector<stream_word_item>& align_words = {}) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string text = "";
-        
-        struct word_item {
-            std::string word;
-            int64_t start;
-            int64_t end;
-            float p;
-        };
-        std::vector<word_item> words_list;
+        std::vector<stream_word_item> words_list = align_words;
         
         for (int i = 0; i < n_segs; i++) {
             const char* seg_text = crispasr_session_result_segment_text(res, i);
@@ -792,11 +1001,11 @@ private:
             should_extract_words = false;
         }
 
-        if (should_extract_words) {
+        if (should_extract_words && words_list.empty()) {
             for (int i = 0; i < n_segs; i++) {
                 int n_words = crispasr_session_result_n_words(res, i);
                 for (int j = 0; j < n_words; j++) {
-                    word_item wi;
+                    stream_word_item wi;
                     const char* w_text = crispasr_session_result_word_text(res, i, j);
                     wi.word = w_text ? w_text : "";
                     wi.start = start_time + crispasr_session_result_word_t0(res, i, j) * 10;
@@ -818,16 +1027,16 @@ private:
                 result.Set("text", Napi::String::New(env, std::get<2>(cb_data)));
                 
                 const auto& wl = std::get<3>(cb_data);
-                    Napi::Array words_arr = Napi::Array::New(env, wl.size());
-                    for (size_t k = 0; k < wl.size(); k++) {
-                        Napi::Object w_obj = Napi::Object::New(env);
-                        w_obj.Set("word", Napi::String::New(env, wl[k].word));
-                        w_obj.Set("start", Napi::Number::New(env, wl[k].start / 1000.0));
-                        w_obj.Set("end", Napi::Number::New(env, wl[k].end / 1000.0));
-                        w_obj.Set("p", Napi::Number::New(env, wl[k].p));
-                        words_arr[k] = w_obj;
-                    }
-                    result.Set("words", words_arr);
+                Napi::Array words_arr = Napi::Array::New(env, wl.size());
+                for (size_t k = 0; k < wl.size(); k++) {
+                    Napi::Object w_obj = Napi::Object::New(env);
+                    w_obj.Set("word", Napi::String::New(env, wl[k].word));
+                    w_obj.Set("start", Napi::Number::New(env, wl[k].start / 1000.0));
+                    w_obj.Set("end", Napi::Number::New(env, wl[k].end / 1000.0));
+                    w_obj.Set("p", Napi::Number::New(env, wl[k].p));
+                    words_arr[k] = w_obj;
+                }
+                result.Set("words", words_arr);
                 
                 cb.Call({env.Null(), result});
             };
@@ -994,7 +1203,34 @@ private:
                                     if (res) {
                                         int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
                                         int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                                        emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "progressive");
+                                        std::vector<stream_word_item> aligned_words;
+                                        if (m_aligner && !m_aligner_model_path.empty()) {
+                                            int n_segs = crispasr_session_result_n_segments(res);
+                                            std::string total_txt = "";
+                                            for (int k = 0; k < n_segs; k++) {
+                                                const char* s_text = crispasr_session_result_segment_text(res, k);
+                                                if (s_text) {
+                                                    if (!total_txt.empty()) total_txt += " ";
+                                                    total_txt += s_text;
+                                                }
+                                            }
+                                            if (!total_txt.empty()) {
+                                                std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                                                std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                                auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+                                                if (align_res.success) {
+                                                    for (const auto& w : align_res.words) {
+                                                        stream_word_item wi;
+                                                        wi.word = w.word;
+                                                        wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
+                                                        wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
+                                                        wi.p = 0.99f;
+                                                        aligned_words.push_back(wi);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "progressive", aligned_words);
                                         crispasr_session_result_free(res);
                                     }
                                     last_progressive_sample = current_sample;
@@ -1013,7 +1249,34 @@ private:
                         if (res) {
                             int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
                             int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                            emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment");
+                            std::vector<stream_word_item> aligned_words;
+                            if (m_aligner && !m_aligner_model_path.empty()) {
+                                int n_segs = crispasr_session_result_n_segments(res);
+                                std::string total_txt = "";
+                                for (int k = 0; k < n_segs; k++) {
+                                    const char* s_text = crispasr_session_result_segment_text(res, k);
+                                    if (s_text) {
+                                        if (!total_txt.empty()) total_txt += " ";
+                                        total_txt += s_text;
+                                    }
+                                }
+                                if (!total_txt.empty()) {
+                                    std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                                    std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+                                    if (align_res.success) {
+                                        for (const auto& w : align_res.words) {
+                                            stream_word_item wi;
+                                            wi.word = w.word;
+                                            wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
+                                            wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
+                                            wi.p = 0.99f;
+                                            aligned_words.push_back(wi);
+                                        }
+                                    }
+                                }
+                            }
+                            emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment", aligned_words);
                             crispasr_session_result_free(res);
                         }
                         speech_buffer.clear();
@@ -1055,7 +1318,34 @@ private:
                             if (res) {
                                 int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
                                 int64_t chunk_end_ms = (actual_end_sample * 1000) / sample_rate;
-                                emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment");
+                                std::vector<stream_word_item> aligned_words;
+                                if (m_aligner && !m_aligner_model_path.empty()) {
+                                    int n_segs = crispasr_session_result_n_segments(res);
+                                    std::string total_txt = "";
+                                    for (int k = 0; k < n_segs; k++) {
+                                        const char* s_text = crispasr_session_result_segment_text(res, k);
+                                        if (s_text) {
+                                            if (!total_txt.empty()) total_txt += " ";
+                                            total_txt += s_text;
+                                        }
+                                    }
+                                    if (!total_txt.empty()) {
+                                        std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                                        std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                        auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+                                        if (align_res.success) {
+                                            for (const auto& w : align_res.words) {
+                                                stream_word_item wi;
+                                                wi.word = w.word;
+                                                wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
+                                                wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
+                                                wi.p = 0.99f;
+                                                aligned_words.push_back(wi);
+                                            }
+                                        }
+                                    }
+                                }
+                                emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment", aligned_words);
                                 crispasr_session_result_free(res);
                             }
                             speech_buffer.clear();
@@ -1100,7 +1390,34 @@ private:
                     }
                     crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
                     if (res) {
-                        emit_segment(res, start, (final_sample * 1000) / sample_rate, m_segment_index, "segment");
+                        std::vector<stream_word_item> aligned_words;
+                        if (m_aligner && !m_aligner_model_path.empty()) {
+                            int n_segs = crispasr_session_result_n_segments(res);
+                            std::string total_txt = "";
+                            for (int k = 0; k < n_segs; k++) {
+                                const char* s_text = crispasr_session_result_segment_text(res, k);
+                                if (s_text) {
+                                    if (!total_txt.empty()) total_txt += " ";
+                                    total_txt += s_text;
+                                }
+                            }
+                            if (!total_txt.empty()) {
+                                std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                                std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+                                if (align_res.success) {
+                                    for (const auto& w : align_res.words) {
+                                        stream_word_item wi;
+                                        wi.word = w.word;
+                                        wi.start = start + static_cast<int64_t>(w.start * 1000.0);
+                                        wi.end = start + static_cast<int64_t>(w.end * 1000.0);
+                                        wi.p = 0.99f;
+                                        aligned_words.push_back(wi);
+                                    }
+                                }
+                            }
+                        }
+                        emit_segment(res, start, (final_sample * 1000) / sample_rate, m_segment_index, "segment", aligned_words);
                         crispasr_session_result_free(res);
                     }
                 }
@@ -1129,6 +1446,11 @@ private:
     std::string m_model_path;
     std::string m_backend_name;
     std::string m_language;
+    bool m_translate = false;
+    std::string m_target_language = "";
+    std::string m_context = "";
+    std::string m_aligner_model_path = "";
+    bool m_debug = false;
     int m_n_threads = 4;
     bool m_use_gpu = true;
     int m_chunk_size_ms = 2000;
@@ -1143,6 +1465,7 @@ private:
     bool m_use_vad = true;
     whisper_vad_context* m_vctx = nullptr;
     crispasr_session* m_session = nullptr;
+    std::unique_ptr<qwen3_asr::ForcedAligner> m_aligner;
     std::vector<float> m_audio_buffer;
     std::mutex m_mutex;
     std::condition_variable m_cv;
