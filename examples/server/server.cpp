@@ -300,7 +300,7 @@ std::string generate_temp_filename(const std::string &path, const std::string &p
 
     std::stringstream ss;
     ss << path
-       << std::filesystem::path::preferred_separator
+       << (char)std::filesystem::path::preferred_separator
        << prefix
        << "-"
        << std::put_time(std::localtime(&now_time_t), "%Y%m%d-%H%M%S")

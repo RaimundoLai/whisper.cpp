@@ -8077,6 +8077,54 @@ float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int 
     return ctx->state->result_all[i_segment].tokens[i_token].p;
 }
 
+extern "C" {
+WHISPER_API int whisper_full_get_token_n_alts(struct whisper_context * ctx, int i_segment, int i_token) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    return 0;
+}
+
+WHISPER_API int whisper_full_get_token_n_alts_from_state(struct whisper_state * state, int i_segment, int i_token) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    return 0;
+}
+
+WHISPER_API whisper_token whisper_full_get_token_alt_id(struct whisper_context * ctx, int i_segment, int i_token, int i_alt) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0;
+}
+
+WHISPER_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0;
+}
+
+WHISPER_API float whisper_full_get_token_alt_p(struct whisper_context * ctx, int i_segment, int i_token, int i_alt) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0.0f;
+}
+
+WHISPER_API float whisper_full_get_token_alt_p_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0.0f;
+}
+}
+
 float whisper_full_get_segment_no_speech_prob(struct whisper_context * ctx, int i_segment) {
     return ctx->state->result_all[i_segment].no_speech_prob;
 }

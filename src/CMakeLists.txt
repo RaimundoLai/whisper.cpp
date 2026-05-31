@@ -125,6 +125,8 @@ set(QWEN3_ASR_SOURCES
 )
 
 set(CRISPASR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third-party/CrispASR)
+set(CRISP_AUDIO_DIR ${CRISPASR_DIR}/crisp_audio)
+
 file(GLOB CRISPASR_SOURCES 
     "${CRISPASR_DIR}/src/*.cpp" 
     "${CRISPASR_DIR}/src/*.c"
@@ -133,7 +135,20 @@ file(GLOB CRISPASR_SOURCES
 file(GLOB CRISPASR_CORE_SOURCES
     "${CRISPASR_DIR}/src/core/*.cpp"
 )
+set(CRISPASR_RNNOISE_SOURCES
+    "${CRISPASR_DIR}/src/rnnoise/denoise.c"
+    "${CRISPASR_DIR}/src/rnnoise/rnn.c"
+    "${CRISPASR_DIR}/src/rnnoise/rnn_data.c"
+    "${CRISPASR_DIR}/src/rnnoise/pitch.c"
+    "${CRISPASR_DIR}/src/rnnoise/celt_lpc.c"
+    "${CRISPASR_DIR}/src/rnnoise/kiss_fft.c"
+)
+set(CRISP_AUDIO_SOURCES
+    "${CRISP_AUDIO_DIR}/src/audio_tower.cpp"
+)
 list(APPEND CRISPASR_SOURCES ${CRISPASR_CORE_SOURCES})
+list(APPEND CRISPASR_SOURCES ${CRISPASR_RNNOISE_SOURCES})
+list(APPEND CRISPASR_SOURCES ${CRISP_AUDIO_SOURCES})
 list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp")
 
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
@@ -165,7 +180,7 @@ if(NOT DEFINED SOVERSION)
     set(SOVERSION 1)
 endif()
 
-target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}" CRISPASR_VERSION="0.6.6")
+target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}" CRISPASR_VERSION="0.6.6" CRISPASR_RNNOISE=1)
 
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
@@ -173,8 +188,8 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ../ggml/src)
-target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
+target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ${CRISP_AUDIO_DIR}/include ../ggml/src)
+target_compile_features   (whisper PUBLIC cxx_std_20)
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_BIG_ENDIAN)
