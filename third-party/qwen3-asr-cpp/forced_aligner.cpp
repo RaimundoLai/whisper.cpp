@@ -453,10 +453,8 @@ bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_conte
     ggml_backend_dev_t gpu_dev = use_gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
     bool copy_needed = false;
     if (gpu_dev) {
-#if defined(__APPLE__) && defined(__aarch64__)
-        if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Device is GPU (Apple Silicon). Calling buf_from_host_ptr\n");
+        if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Device is GPU. Calling buf_from_host_ptr\n");
         model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
-#endif
         if (!model_.buffer) {
             if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Allocating VRAM for fallback deep copy\n");
             // Unify memory failed or not supported (e.g. CUDA on PC). Allocate actual VRAM buffer and set flag to deep copy.
@@ -672,21 +670,21 @@ bool ForcedAligner::encode_audio(const float * mel_data, int n_mel, int n_frames
         struct ggml_tensor * bias = ggml_reshape_4d(ctx0, model_.conv2d1_b, 1, 1, hp.audio_conv_channels, 1);
         cur = ggml_add(ctx0, cur, bias);
     }
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
 
     cur = ggml_conv_2d(ctx0, model_.conv2d2_w, cur, 2, 2, 1, 1, 1, 1);
     if (model_.conv2d2_b) {
         struct ggml_tensor * bias = ggml_reshape_4d(ctx0, model_.conv2d2_b, 1, 1, hp.audio_conv_channels, 1);
         cur = ggml_add(ctx0, cur, bias);
     }
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
 
     cur = ggml_conv_2d(ctx0, model_.conv2d3_w, cur, 2, 2, 1, 1, 1, 1);
     if (model_.conv2d3_b) {
         struct ggml_tensor * bias = ggml_reshape_4d(ctx0, model_.conv2d3_b, 1, 1, hp.audio_conv_channels, 1);
         cur = ggml_add(ctx0, cur, bias);
     }
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
 
     // [out_w, out_h, out_c, n_chunks] -> permute -> conv_out -> [n_state, out_w, n_chunks]
     int64_t conv_out_w = cur->ne[0];
@@ -874,7 +872,7 @@ bool ForcedAligner::encode_audio(const float * mel_data, int n_mel, int n_frames
             cur = ggml_add(ctx0, cur, layer.ffn_up_b);
         }
 
-        cur = ggml_gelu(ctx0, cur);
+        cur = ggml_gelu_erf(ctx0, cur);
 
         cur = ggml_mul_mat(ctx0, layer.ffn_down_w, cur);
         if (layer.ffn_down_b) {
@@ -899,7 +897,7 @@ bool ForcedAligner::encode_audio(const float * mel_data, int n_mel, int n_frames
         if (model_.proj1_b) {
             cur = ggml_add(ctx0, cur, model_.proj1_b);
         }
-        cur = ggml_gelu(ctx0, cur);
+        cur = ggml_gelu_erf(ctx0, cur);
     }
 
     if (model_.proj2_w) {

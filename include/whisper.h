@@ -681,6 +681,16 @@ extern "C" {
     WHISPER_API float whisper_full_get_token_p           (struct whisper_context * ctx, int i_segment, int i_token);
     WHISPER_API float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
 
+    // Top-N alternative candidates for a sampled token. Returns 0 / 0 / 0.0f
+    // when alts are not captured (wparams.alt_n == 0, beam search, or i_alt
+    // out of range). The chosen token is not present in the alts list.
+    WHISPER_API int           whisper_full_get_token_n_alts           (struct whisper_context * ctx, int i_segment, int i_token);
+    WHISPER_API int           whisper_full_get_token_n_alts_from_state(struct whisper_state * state, int i_segment, int i_token);
+    WHISPER_API whisper_token whisper_full_get_token_alt_id           (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    WHISPER_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt);
+    WHISPER_API float         whisper_full_get_token_alt_p            (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    WHISPER_API float         whisper_full_get_token_alt_p_from_state (struct whisper_state * state, int i_segment, int i_token, int i_alt);
+
     //
     // Voice Activity Detection (VAD)
     //

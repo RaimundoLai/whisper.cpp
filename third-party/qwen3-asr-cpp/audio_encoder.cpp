@@ -120,7 +120,7 @@ struct ggml_cgraph * AudioEncoder::build_graph_conv(int n_frames) {
     }
     ggml_set_name(cur, "after_conv1_pre_gelu");
     ggml_set_output(cur);
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
     ggml_set_name(cur, "after_conv1");
     ggml_set_output(cur);
     
@@ -129,14 +129,14 @@ struct ggml_cgraph * AudioEncoder::build_graph_conv(int n_frames) {
         struct ggml_tensor * bias = ggml_reshape_4d(ctx0, model_.conv2d2_b, 1, 1, conv_ch, 1);
         cur = ggml_add(ctx0, cur, bias);
     }
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
     
     cur = ggml_conv_2d(ctx0, model_.conv2d3_w, cur, 2, 2, 1, 1, 1, 1);
     if (model_.conv2d3_b) {
         struct ggml_tensor * bias = ggml_reshape_4d(ctx0, model_.conv2d3_b, 1, 1, conv_ch, 1);
         cur = ggml_add(ctx0, cur, bias);
     }
-    cur = ggml_gelu(ctx0, cur);
+    cur = ggml_gelu_erf(ctx0, cur);
     
     ggml_set_name(cur, "after_conv3");
     ggml_set_output(cur);
@@ -272,7 +272,7 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder(int n_ctx) {
                 cur = ggml_add(ctx0, cur, layer.ffn_up_b);
             }
             
-            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_gelu_erf(ctx0, cur);
             
             cur = ggml_mul_mat(ctx0, layer.ffn_down_w, cur);
             if (layer.ffn_down_b) {
@@ -524,7 +524,7 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
                 cur = ggml_add(enc_ctx, cur, layer.ffn_up_b);
             }
             
-            cur = ggml_gelu(enc_ctx, cur);
+            cur = ggml_gelu_erf(enc_ctx, cur);
             
             cur = ggml_mul_mat(enc_ctx, layer.ffn_down_w, cur);
             if (layer.ffn_down_b) {
@@ -550,7 +550,7 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
         if (model_.proj1_b) {
             cur = ggml_add(enc_ctx, cur, model_.proj1_b);
         }
-        cur = ggml_gelu(enc_ctx, cur);
+        cur = ggml_gelu_erf(enc_ctx, cur);
     }
     
     if (model_.proj2_w) {
@@ -778,7 +778,7 @@ bool AudioEncoder::encode_no_chunk(const float * mel_data, int n_mel, int n_fram
                 cur = ggml_add(enc_ctx, cur, layer.ffn_up_b);
             }
             
-            cur = ggml_gelu(enc_ctx, cur);
+            cur = ggml_gelu_erf(enc_ctx, cur);
             
             cur = ggml_mul_mat(enc_ctx, layer.ffn_down_w, cur);
             if (layer.ffn_down_b) {
@@ -804,7 +804,7 @@ bool AudioEncoder::encode_no_chunk(const float * mel_data, int n_mel, int n_fram
         if (model_.proj1_b) {
             cur = ggml_add(enc_ctx, cur, model_.proj1_b);
         }
-        cur = ggml_gelu(enc_ctx, cur);
+        cur = ggml_gelu_erf(enc_ctx, cur);
     }
     
     if (model_.proj2_w) {

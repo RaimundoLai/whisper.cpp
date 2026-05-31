@@ -2,6 +2,7 @@
 // This file is included by addon.cpp
 
 #include "sense-voice.h"
+#include "silero-vad.h"
 #include "sense-voice-frontend.h"
 #include "whisper.h"  // For whisper VAD API
 
@@ -1026,7 +1027,8 @@ private:
 
     // Worker thread
     void StreamWorker();
-    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, bool is_progressive = false);
+    void emit_silence(double t);
+    void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, int segment_index, bool is_progressive = false);
     std::string ExtractText(sense_voice_context* ctx, bool use_prefix);
 
     // SenseVoice context
@@ -1066,6 +1068,7 @@ private:
     std::vector<double> m_pcmf32_local;
     int64_t m_n_samples_processed = 0;      // Samples sent to model (for internal use)
     int64_t m_n_total_samples_received = 0; // Total samples received (for timeline)
+    int m_segment_index = 0;
 
     std::thread m_worker_thread;
     std::atomic<StreamState> m_state;
@@ -1261,6 +1264,7 @@ Napi::Value SenseVoiceStream::Start(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[0].As<Napi::Function>();
     m_tsfn_callback = Napi::ThreadSafeFunction::New(env, callback, "SenseVoiceStreamCallback", 0, 1);
     
+    m_segment_index = 0;
     m_state = StreamState::RUNNING;
 
     m_worker_thread = std::thread(&SenseVoiceStream::StreamWorker, this);
@@ -1366,10 +1370,9 @@ void SenseVoiceStream::StreamWorker() {
     const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
     
     // Chunk-based VAD parameters
-    const int chunk_samples = (m_chunk_size_ms * sample_rate) / 1000;  // samples per chunk (512 for 32ms)
+    const int chunk_samples = (m_chunk_size_ms * sample_rate) / 1000;  // samples per chunk
     const int max_speech_chunks = m_max_nomute_chunks;  // max chunks before processing
     const int min_silence_chunks = m_min_mute_chunks;   // min silent chunks to end speech
-    // Note: m_vad_threshold is used with Silero VAD (speech probability comparison)
     
     sense_voice_decoding_strategy strategy = m_use_beam_search ? 
         SENSE_VOICE_SAMPLING_BEAM_SEARCH : SENSE_VOICE_SAMPLING_GREEDY;
@@ -1397,13 +1400,14 @@ void SenseVoiceStream::StreamWorker() {
     
     m_pcmf32_local.clear();
     std::vector<double> speech_buffer;  // Only accumulate speech chunks
+    std::vector<double> pre_speech_cache; // Rolling cache of silent/pre-speech audio
     bool in_speech = false;
     int silence_chunk_count = 0;
     int speech_chunk_count = 0;
-    int64_t speech_start_sample = 0;  // Track when speech started (in total samples received)
+    int64_t speech_start_sample = 0;  // Track when speech started
     
     int64_t last_progressive_sample = 0;
-    int64_t progressive_start_idx = 0;
+    double last_silence_time = 0.0;
     
     // Reset total samples counter for timeline
     m_n_total_samples_received = 0;
@@ -1413,10 +1417,11 @@ void SenseVoiceStream::StreamWorker() {
     
     while (true) {
         bool is_finishing = false;
+        bool timeout = false;
         
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_cv.wait(lock, [this] {
+            timeout = !m_cv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
                 StreamState s = m_state.load();
                 // When PAUSED, wait until RUNNING/STOPPING/FINISHING
                 return s == StreamState::STOPPING || 
@@ -1440,27 +1445,30 @@ void SenseVoiceStream::StreamWorker() {
             m_audio_buffer.clear();
         }
 
+        if (timeout && m_state.load() == StreamState::RUNNING) {
+            double current_time_sec = (double)m_n_total_samples_received / sample_rate;
+            emit_silence(current_time_sec);
+            last_silence_time = current_time_sec;
+            continue;
+        }
+
         // Process accumulated samples in chunks using Silero VAD
         size_t processed_samples = 0;
-        for (size_t i = 0; i + chunk_samples <= accumulated_samples.size(); i += chunk_samples) {
-            // Prepare float chunk for VAD
+        size_t n_chunks = accumulated_samples.size() / chunk_samples;
+        std::vector<bool> chunks_is_speech;
+        chunks_is_speech.reserve(n_chunks);
+        for (size_t c = 0; c < n_chunks; ++c) {
+            size_t offset = c * chunk_samples;
             std::vector<float> vad_chunk(chunk_samples);
             for (int j = 0; j < chunk_samples; j++) {
-                vad_chunk[j] = static_cast<float>(accumulated_samples[i + j]);
+                vad_chunk[j] = static_cast<float>(accumulated_samples[offset + j]);
             }
             
-            // VAD detection (if enabled)
             bool is_speech;
             if (m_use_vad) {
                 float speech_prob = 0.0f;
-                
-                // Check if external Silero VAD is available
                 if (m_vctx) {
-                    // Use Silero VAD - detect speech and get probability
-                    // Note: whisper_vad_detect_speech OVERWRITES probs each call (not accumulate)
                     whisper_vad_detect_speech(m_vctx, vad_chunk.data(), vad_chunk.size());
-                    
-                    // Check ALL probabilities from current call and use MAX
                     int n_probs = whisper_vad_n_probs(m_vctx);
                     if (n_probs > 0) {
                         const float* probs = whisper_vad_probs(m_vctx);
@@ -1471,26 +1479,68 @@ void SenseVoiceStream::StreamWorker() {
                         }
                     }
                 } else {
-                    // Fallback: Simple energy-based VAD
                     float energy = 0.0f;
                     for (int j = 0; j < chunk_samples; j++) {
                         energy += vad_chunk[j] * vad_chunk[j];
                     }
                     energy = std::sqrt(energy / chunk_samples);
-                    speech_prob = energy > 0.01f ? 1.0f : 0.0f;  // Simple threshold
+                    speech_prob = energy > 0.01f ? 1.0f : 0.0f;
                 }
                 is_speech = (speech_prob >= m_vad_threshold);
             } else {
-                // VAD disabled - treat all audio as speech
                 is_speech = true;
             }
+            chunks_is_speech.push_back(is_speech);
+        }
+
+        auto will_segment_end = [&](size_t start_chunk, bool curr_in_speech, int curr_silence_count, int curr_speech_count) -> bool {
+            bool temp_in_speech = curr_in_speech;
+            int temp_silence_count = curr_silence_count;
+            int temp_speech_count = curr_speech_count;
+            
+            for (size_t next_c = start_chunk; next_c < chunks_is_speech.size(); ++next_c) {
+                bool next_is_speech = chunks_is_speech[next_c];
+                if (next_is_speech) {
+                    if (!temp_in_speech) {
+                        temp_in_speech = true;
+                    }
+                    temp_silence_count = 0;
+                    temp_speech_count++;
+                    if (temp_speech_count >= max_speech_chunks) {
+                        return true;
+                    }
+                } else {
+                    if (temp_in_speech) {
+                        temp_silence_count++;
+                        if (temp_silence_count > min_silence_chunks) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+        for (size_t c = 0; c < n_chunks; ++c) {
+            size_t i = c * chunk_samples;
+            std::vector<float> vad_chunk(chunk_samples);
+            for (int j = 0; j < chunk_samples; j++) {
+                vad_chunk[j] = static_cast<float>(accumulated_samples[i + j]);
+            }
+            
+            bool is_speech = chunks_is_speech[c];
             
             if (is_speech) {
                 // Track when speech starts
                 if (!in_speech) {
-                    speech_start_sample = m_n_total_samples_received + static_cast<int64_t>(i);
+                    speech_start_sample = m_n_total_samples_received + static_cast<int64_t>(i) - pre_speech_cache.size();
+                    if (speech_start_sample < 0) {
+                        speech_start_sample = 0;
+                    }
                     last_progressive_sample = speech_start_sample;
-                    progressive_start_idx = 0;
+                    m_segment_index++;
+                    speech_buffer.insert(speech_buffer.end(), pre_speech_cache.begin(), pre_speech_cache.end());
+                    pre_speech_cache.clear();
                 }
                 // Append speech chunk (no scaling - SenseVoice expects normalized audio)
                 for (int j = 0; j < chunk_samples; j++) {
@@ -1507,60 +1557,22 @@ void SenseVoiceStream::StreamWorker() {
                     if (elapsed_since_start_ms >= m_progressive_initial_ms) {
                         int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
                         if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
-                            int64_t chunk_start_ms = ((speech_start_sample + progressive_start_idx) * 1000) / sample_rate;
-                            int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                            
-                            std::vector<double> prog_buffer;
-                            if (progressive_start_idx < (int64_t)speech_buffer.size()) {
-                                prog_buffer.assign(speech_buffer.begin() + progressive_start_idx, speech_buffer.end());
+                            bool has_pending_audio = false;
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                has_pending_audio = !m_audio_buffer.empty();
                             }
-                            
-                            processAndOutput(wparams, prog_buffer, chunk_start_ms, chunk_end_ms, true);
-                            
-                            // Crop tracking pointer via tokens overlap logic:
-                            if (m_ctx->state->ids.size() > 4) {
-                                size_t n_valid_tokens = 0;
-                                for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
-                                    int id = m_ctx->state->ids[k];
-                                    if (id != 0 && id != 1 && id != 2) n_valid_tokens++;
-                                }
+                            bool skip_progressive = is_finishing || 
+                                                    has_pending_audio || 
+                                                    will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
+                            if (!skip_progressive) {
+                                int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                                int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
                                 
-                                if (n_valid_tokens > 0) {
-                                    size_t target_valid_idx = n_valid_tokens >= (size_t)m_progressive_window_tokens 
-                                        ? n_valid_tokens - m_progressive_window_tokens 
-                                        : 0;
-                                        
-                                    size_t valid_cnt = 0;
-                                    int target_frame = 0;
-                                    bool has_timestamps = (m_ctx->state->ids.size() == m_ctx->state->token_timestamps.size()) && !m_ctx->state->token_timestamps.empty();
-                                    
-                                    for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
-                                        int id = m_ctx->state->ids[k];
-                                        if (id != 0 && id != 1 && id != 2) {
-                                            if (valid_cnt == target_valid_idx) {
-                                                if (has_timestamps) {
-                                                    target_frame = std::max(0, m_ctx->state->token_timestamps[k] - 4);
-                                                } else {
-                                                    // Fallback
-                                                    int64_t prog_len_ms = chunk_end_ms - chunk_start_ms;
-                                                    target_frame = (prog_len_ms * valid_cnt) / (60 * n_valid_tokens);
-                                                }
-                                                break;
-                                            }
-                                            valid_cnt++;
-                                        }
-                                    }
-                                    
-                                    int64_t offset_ms = target_frame * 60;
-                                    int64_t drop_samples = (offset_ms * sample_rate) / 1000;
-                                    
-                                    if (drop_samples > 0 && drop_samples < (int64_t)prog_buffer.size()) {
-                                        progressive_start_idx += drop_samples;
-                                    }
-                                }
+                                processAndOutput(wparams, speech_buffer, chunk_start_ms, chunk_end_ms, m_segment_index, true);
+                                
+                                last_progressive_sample = current_sample;
                             }
-                            
-                            last_progressive_sample = current_sample;
                         }
                     }
                 }
@@ -1581,16 +1593,46 @@ void SenseVoiceStream::StreamWorker() {
                     
                     // Calculate timestamps
                     int64_t speech_end_sample = m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples;
+                    int64_t actual_end_sample = speech_end_sample - (silence_chunk_count * chunk_samples);
+                    if (actual_end_sample < speech_start_sample) {
+                        actual_end_sample = speech_end_sample;
+                    }
+                    
                     int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
-                    int64_t end_time_ms = (speech_end_sample * 1000) / sample_rate;
+                    int64_t end_time_ms = (actual_end_sample * 1000) / sample_rate;
                     
                     // Process accumulated speech
                     if (!speech_buffer.empty()) {
-                        processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
+                        std::vector<double> transcribe_pcm = speech_buffer;
+                        size_t silence_samples = std::min(silence_chunk_count, min_silence_chunks) * chunk_samples;
+                        size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
+                        if (silence_samples > post_speech_pad_samples) {
+                            size_t trim_samples = silence_samples - post_speech_pad_samples;
+                            if (transcribe_pcm.size() > trim_samples) {
+                                transcribe_pcm.resize(transcribe_pcm.size() - trim_samples);
+                            }
+                        }
+                        processAndOutput(wparams, transcribe_pcm, start_time_ms, end_time_ms, m_segment_index, false);
                     }
                     speech_buffer.clear();
                     speech_chunk_count = 0;
-                    progressive_start_idx = 0;
+                    pre_speech_cache.clear();
+                }
+            } else {
+                // Keep rolling pre-speech cache
+                for (int j = 0; j < chunk_samples; j++) {
+                    pre_speech_cache.push_back(accumulated_samples[i + j]);
+                }
+                size_t pre_speech_pad_samples = (300 * sample_rate) / 1000;
+                if (pre_speech_cache.size() > pre_speech_pad_samples) {
+                    pre_speech_cache.erase(pre_speech_cache.begin(), pre_speech_cache.end() - pre_speech_pad_samples);
+                }
+
+                // Track silence heartbeat
+                double current_time_sec = (double)(m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples) / sample_rate;
+                if (current_time_sec - last_silence_time >= 1.0) {
+                    emit_silence(current_time_sec);
+                    last_silence_time = current_time_sec;
                 }
             }
             // Skip silent chunks when not in speech (don't accumulate)
@@ -1612,14 +1654,15 @@ void SenseVoiceStream::StreamWorker() {
             int64_t end_time_ms = (current_sample * 1000) / sample_rate;
             
             if (!speech_buffer.empty()) {
-                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
+                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms, m_segment_index, false);
             }
             speech_buffer.clear();
             speech_chunk_count = 0;
             speech_start_sample = current_sample;  // Reset for next speech segment
             last_progressive_sample = current_sample;
-            progressive_start_idx = 0;
-            in_speech = false;
+            m_segment_index++;
+            silence_chunk_count = 0;
+            in_speech = true;
         }
         
         if (is_finishing) {
@@ -1634,7 +1677,10 @@ void SenseVoiceStream::StreamWorker() {
             
             // Process any remaining speech
             if (!speech_buffer.empty()) {
-                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms);
+                if (!in_speech) {
+                    m_segment_index++;
+                }
+                processAndOutput(wparams, speech_buffer, start_time_ms, end_time_ms, m_segment_index, false);
             }
             break;
         }
@@ -1650,7 +1696,18 @@ void SenseVoiceStream::StreamWorker() {
     }
 }
 
-void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, bool is_progressive) {
+void SenseVoiceStream::emit_silence(double t) {
+    if (m_tsfn_callback) {
+        m_tsfn_callback.BlockingCall([t](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("type", Napi::String::New(env, "silence"));
+            result.Set("t", Napi::Number::New(env, t));
+            jsCallback.Call({env.Null(), result});
+        });
+    }
+}
+
+void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, int segment_index, bool is_progressive) {
     const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
     
     // Safety check
@@ -1730,13 +1787,14 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
             
             if (!text_str.empty() && m_tsfn_callback) {
                 auto callback_data = std::make_tuple(start_time_ms, end_time_ms, text_str, lang_str, emo_str, evt_str, token_data);
-                m_tsfn_callback.BlockingCall([callback_data, is_progressive](Napi::Env env, Napi::Function jsCallback) {
+                auto callback = [callback_data, is_progressive, segment_index](Napi::Env env, Napi::Function jsCallback) {
                     Napi::Object result = Napi::Object::New(env);
                     if (is_progressive) {
                         result.Set("type", "progressive");
                     } else {
                         result.Set("type", "segment");
                     }
+                    result.Set("index", Napi::Number::New(env, segment_index));
                     result.Set("start", Napi::Number::New(env, std::get<0>(callback_data)));
                     result.Set("end", Napi::Number::New(env, std::get<1>(callback_data)));
                     result.Set("text", Napi::String::New(env, std::get<2>(callback_data)));
@@ -1744,7 +1802,7 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                     result.Set("emotion", Napi::String::New(env, std::get<4>(callback_data)));
                     result.Set("event", Napi::String::New(env, std::get<5>(callback_data)));
                     
-                    // Add token timestamps
+                    // Add token timestamps (converted to seconds)
                     const auto& tokens = std::get<6>(callback_data);
                     Napi::Array tokensArr = Napi::Array::New(env, tokens.size());
                     for (size_t i = 0; i < tokens.size(); i++) {
@@ -1757,7 +1815,12 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                     result.Set("tokens", tokensArr);
                     
                     jsCallback.Call({env.Null(), result});
-                });
+                };
+                if (is_progressive) {
+                    m_tsfn_callback.NonBlockingCall(callback);
+                } else {
+                    m_tsfn_callback.BlockingCall(callback);
+                }
             }
         }
         
@@ -1766,6 +1829,3 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
         // Catch any exception to prevent crash
     }
 }
-
-
-

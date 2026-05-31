@@ -18,3 +18,7 @@ This project extends [whisper.cpp](https://github.com/ggerganov/whisper.cpp) wit
 * **Source:** [mlc-ai/tokenizers-cpp](https://github.com/mlc-ai/tokenizers-cpp)
 * **License:** Apache License 2.0
 * **Note:** This component is included as a git submodule. Please refer to the submodule directory for its original license and source code.
+
+### 4. CrispASR (Modified Fork)
+* **Source:** [CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)
+* **License:** MIT

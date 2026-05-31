@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 
 project(whisper.cpp)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(WHISPER_LIB_DIR ${CMAKE_SOURCE_DIR}/../../../../../../..)
 
 # Get whisper.cpp version
