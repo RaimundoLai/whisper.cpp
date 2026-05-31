@@ -209,7 +209,7 @@ jobs:
             --CDGGML_METAL_USE_BF16=ON \
             --CDGGML_METAL_EMBED_LIBRARY=ON \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=arm64 \
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
           cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
@@ -222,8 +222,11 @@ jobs:
             --CDBUILD_SHARED_LIBS=OFF \
             --CDWHISPER_STATIC=ON \
             --CDWHISPER_COREML=ON \
+            --CDGGML_METAL=ON \
+            --CDGGML_METAL_USE_BF16=ON \
+            --CDGGML_METAL_EMBED_LIBRARY=ON \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=arm64 \
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
           cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
