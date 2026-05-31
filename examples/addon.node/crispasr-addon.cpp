@@ -1,8 +1,6 @@
 // crispasr-addon.cpp - CrispASR (Parakeet, Distil-Whisper) N-API bindings
 // This file is included by addon.cpp
 
-
-
 #include "../../third-party/CrispASR/src/parakeet.h"
 #include "whisper.h"
 #include "forced_aligner.h"
@@ -162,9 +160,9 @@ public:
         Napi::Array tokens = Napi::Array::New(Env(), m_result.tokens.size());
         for (size_t i = 0; i < m_result.tokens.size(); i++) {
             Napi::Object tok = Napi::Object::New(Env());
-            tok.Set("text", Napi::String::New(Env(), m_result.tokens[i].text));
-            tok.Set("start", Napi::Number::New(Env(), m_result.tokens[i].start_ms));
-            tok.Set("end", Napi::Number::New(Env(), m_result.tokens[i].end_ms));
+            tok.Set("word", Napi::String::New(Env(), m_result.tokens[i].text));
+            tok.Set("start", Napi::Number::New(Env(), m_result.tokens[i].start_ms / 1000.0));
+            tok.Set("end", Napi::Number::New(Env(), m_result.tokens[i].end_ms / 1000.0));
             tok.Set("p", Napi::Number::New(Env(), m_result.tokens[i].p));
             tokens[i] = tok;
         }
@@ -173,9 +171,9 @@ public:
         Napi::Array words = Napi::Array::New(Env(), m_result.words.size());
         for (size_t i = 0; i < m_result.words.size(); i++) {
             Napi::Object word = Napi::Object::New(Env());
-            word.Set("text", Napi::String::New(Env(), m_result.words[i].text));
-            word.Set("start", Napi::Number::New(Env(), m_result.words[i].start_ms));
-            word.Set("end", Napi::Number::New(Env(), m_result.words[i].end_ms));
+            word.Set("word", Napi::String::New(Env(), m_result.words[i].text));
+            word.Set("start", Napi::Number::New(Env(), m_result.words[i].start_ms / 1000.0));
+            word.Set("end", Napi::Number::New(Env(), m_result.words[i].end_ms / 1000.0));
             word.Set("p", Napi::Number::New(Env(), m_result.words[i].p));
             words[i] = word;
         }
@@ -294,7 +292,6 @@ struct crispasr_addon_result {
         int64_t end_ms;
         float p;
     };
-    std::vector<word_data> words;
 
     struct segment_data {
         std::string text;
@@ -393,6 +390,8 @@ public:
     void process_result(crispasr_session_result* res, int64_t offset_ms, const qwen3_asr::alignment_result* align_res = nullptr) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string full_text = m_result.text;
+        
+        bool use_aligner_words = (align_res && align_res->success);
 
         for (int i = 0; i < n_segs; i++) {
             crispasr_addon_result::segment_data sd;
@@ -401,48 +400,60 @@ public:
             sd.start_ms = offset_ms + crispasr_session_result_segment_t0(res, i) * 10;
             sd.end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
 
-            if (!full_text.empty() && !sd.text.empty()) {
+            std::string clean_seg_text = extract_clean_text_if_json(sd.text);
+            if (!full_text.empty() && !clean_seg_text.empty()) {
                 full_text += " ";
             }
-            full_text += sd.text;
+            full_text += clean_seg_text;
 
-            bool has_words = false;
-            int n_words = crispasr_session_result_n_words(res, i);
-            if (n_words > 0) {
+            if (!use_aligner_words) {
+                int n_words = crispasr_session_result_n_words(res, i);
                 for (int j = 0; j < n_words; j++) {
                     crispasr_addon_result::word_data wd;
                     const char* w_text = crispasr_session_result_word_text(res, i, j);
                     wd.text = w_text ? w_text : "";
-                    wd.start_ms = offset_ms + crispasr_session_result_word_t0(res, i, j) * 10;
+                    
+                    int64_t t0 = crispasr_session_result_word_t0(res, i, j);
+                    if (t0 < 0) continue; 
+
+                    wd.start_ms = offset_ms + t0 * 10;
                     wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
                     wd.p = crispasr_session_result_word_p(res, i, j);
 
                     sd.words.push_back(wd);
-                    m_result.words.push_back(wd);
-                }
-                has_words = true;
-            }
-
-            if (!has_words && align_res && align_res->success) {
-                for (const auto& word : align_res->words) {
-                    int64_t w_start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
-                    int64_t w_end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
-                    if (n_segs == 1 || (w_start_ms >= sd.start_ms - 200 && w_start_ms <= sd.end_ms + 200)) {
-                        crispasr_addon_result::word_data wd;
-                        wd.text = word.word;
-                        wd.start_ms = w_start_ms;
-                        wd.end_ms = w_end_ms;
-                        wd.p = 0.99f;
-                        sd.words.push_back(wd);
-                        m_result.words.push_back(wd);
-                    }
                 }
             }
-
+            
             m_result.segments.push_back(std::move(sd));
         }
 
         m_result.text = full_text;
+
+        if (use_aligner_words) {
+            for (const auto& word : align_res->words) {
+                crispasr_addon_result::word_data wd;
+                wd.text = word.word;
+                wd.start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
+                wd.end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
+                wd.p = 0.99f;
+                
+                if (m_result.segments.size() == 1) {
+                    m_result.segments.back().words.push_back(wd);
+                } else if (m_result.segments.size() > 1) {
+                    bool distributed = false;
+                    for (auto& sd : m_result.segments) {
+                        if (wd.start_ms >= (sd.start_ms - 500) && wd.start_ms <= (sd.end_ms + 500)) {
+                            sd.words.push_back(wd);
+                            distributed = true;
+                            break;
+                        }
+                    }
+                    if (!distributed) {
+                        m_result.segments.back().words.push_back(wd);
+                    }
+                }
+            }
+        }
     }
 
     void Execute() override {
@@ -622,18 +633,6 @@ public:
         result.Set("backend", Napi::String::New(Env(), m_result.backend));
         result.Set("aborted", Napi::Boolean::New(Env(), m_was_aborted->load()));
 
-        // Set flat words
-        Napi::Array words = Napi::Array::New(Env(), m_result.words.size());
-        for (size_t i = 0; i < m_result.words.size(); i++) {
-            Napi::Object w_obj = Napi::Object::New(Env());
-            w_obj.Set("text", Napi::String::New(Env(), m_result.words[i].text));
-            w_obj.Set("start", Napi::Number::New(Env(), m_result.words[i].start_ms));
-            w_obj.Set("end", Napi::Number::New(Env(), m_result.words[i].end_ms));
-            w_obj.Set("p", Napi::Number::New(Env(), m_result.words[i].p));
-            words[i] = w_obj;
-        }
-        result.Set("words", words);
-
         // Set segments
         Napi::Array segments = Napi::Array::New(Env(), m_result.segments.size());
         for (size_t i = 0; i < m_result.segments.size(); i++) {
@@ -645,9 +644,9 @@ public:
             Napi::Array s_words = Napi::Array::New(Env(), m_result.segments[i].words.size());
             for (size_t j = 0; j < m_result.segments[i].words.size(); j++) {
                 Napi::Object w_obj = Napi::Object::New(Env());
-                w_obj.Set("text", Napi::String::New(Env(), m_result.segments[i].words[j].text));
-                w_obj.Set("start", Napi::Number::New(Env(), m_result.segments[i].words[j].start_ms));
-                w_obj.Set("end", Napi::Number::New(Env(), m_result.segments[i].words[j].end_ms));
+                w_obj.Set("word", Napi::String::New(Env(), m_result.segments[i].words[j].text));
+                w_obj.Set("start", Napi::Number::New(Env(), m_result.segments[i].words[j].start_ms / 1000.0));
+                w_obj.Set("end", Napi::Number::New(Env(), m_result.segments[i].words[j].end_ms / 1000.0));
                 w_obj.Set("p", Napi::Number::New(Env(), m_result.segments[i].words[j].p));
                 s_words[j] = w_obj;
             }
@@ -883,6 +882,12 @@ public:
             m_vctx = nullptr;
         }
         m_aligner.reset();
+        
+        if (m_tsfn) {
+            m_tsfn.Abort();
+            m_tsfn.Release();
+            m_tsfn = nullptr;
+        }
     }
 
     Napi::Value Start(const Napi::CallbackInfo& info) {
@@ -957,7 +962,12 @@ public:
             m_vctx = nullptr;
         }
         m_aligner.reset();
-        m_audio_buffer.clear();
+        std::vector<float>().swap(m_audio_buffer);
+
+        if (m_tsfn) {
+            m_tsfn.Release();
+            m_tsfn = nullptr;
+        }
         return info.Env().Undefined();
     }
 
@@ -1016,7 +1026,7 @@ private:
             }
         }
         
-        if (!text.empty() || type == "segment") {
+        if ((!text.empty() || type == "segment") && m_tsfn) {
             auto cb_data = std::make_tuple(start_time, end_time, text, words_list, type);
             auto callback = [cb_data, segment_index](Napi::Env env, Napi::Function cb) {
                 Napi::Object result = Napi::Object::New(env);
@@ -1066,7 +1076,7 @@ private:
         
         std::vector<float> speech_buffer;
         std::vector<float> pre_speech_cache;
-        std::vector<float> accumulated_samples;
+        std::deque<float> accumulated_samples;
         bool in_speech = false;
         int silence_chunk_count = 0;
         int speech_chunk_count = 0;
