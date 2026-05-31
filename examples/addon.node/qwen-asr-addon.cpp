@@ -764,6 +764,7 @@ public:
         
         Napi::Function callback = info[0].As<Napi::Function>();
         m_tsfn_callback = Napi::ThreadSafeFunction::New(env, callback, "QwenASRStreamCallback", 0, 1);
+        m_segment_index = 0;
         m_state = StreamState::RUNNING;
         m_worker_thread = std::thread(&QwenASRStream::StreamWorker, this);
         return env.Undefined();
@@ -854,6 +855,7 @@ private:
         tp.print_timing = false;
         
         std::vector<float> speech_buffer;
+        std::vector<float> pre_speech_cache;
         std::vector<float> accumulated_samples;
         bool in_speech = false;
         int silence_chunk_count = 0;
@@ -862,13 +864,14 @@ private:
         int64_t total_samples_received = 0;
         
         int64_t last_progressive_sample = 0;
-        int64_t progressive_start_idx = 0;
+        double last_silence_time = 0.0;
         
         while (true) {
             bool is_finishing = false;
+            bool timeout = false;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this] {
+                timeout = !m_cv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
                     StreamState s = m_state.load();
                     return s == StreamState::STOPPING || s == StreamState::FINISHING || (s == StreamState::RUNNING && !m_audio_buffer.empty());
                 });
@@ -880,10 +883,20 @@ private:
                 m_audio_buffer.clear();
             }
             
+            if (timeout && m_state.load() == StreamState::RUNNING) {
+                double current_time_sec = (double)total_samples_received / sample_rate;
+                emit_silence(current_time_sec);
+                last_silence_time = current_time_sec;
+                continue;
+            }
+            
             size_t processed_samples = 0;
-            for (size_t i = 0; i + chunk_samples <= accumulated_samples.size(); i += chunk_samples) {
-                std::vector<float> vad_chunk(accumulated_samples.begin() + i, accumulated_samples.begin() + i + chunk_samples);
-                
+            size_t n_chunks = accumulated_samples.size() / chunk_samples;
+            std::vector<bool> chunks_is_speech;
+            chunks_is_speech.reserve(n_chunks);
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t offset = c * chunk_samples;
+                std::vector<float> vad_chunk(accumulated_samples.begin() + offset, accumulated_samples.begin() + offset + chunk_samples);
                 bool is_speech = true;
                 if (m_vad_model_path.empty()) {
                     float energy = 0.0f;
@@ -900,12 +913,53 @@ private:
                     }
                     is_speech = speech_prob >= m_vad_threshold;
                 }
+                chunks_is_speech.push_back(is_speech);
+            }
+
+            auto will_segment_end = [&](size_t start_chunk, bool curr_in_speech, int curr_silence_count, int curr_speech_count) -> bool {
+                bool temp_in_speech = curr_in_speech;
+                int temp_silence_count = curr_silence_count;
+                int temp_speech_count = curr_speech_count;
+                
+                for (size_t next_c = start_chunk; next_c < chunks_is_speech.size(); ++next_c) {
+                    bool next_is_speech = chunks_is_speech[next_c];
+                    if (next_is_speech) {
+                        if (!temp_in_speech) {
+                            temp_in_speech = true;
+                        }
+                        temp_silence_count = 0;
+                        temp_speech_count++;
+                        if (temp_speech_count >= m_max_nomute_chunks) {
+                            return true;
+                        }
+                    } else {
+                        if (temp_in_speech) {
+                            temp_silence_count++;
+                            if (temp_silence_count > m_min_mute_chunks) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            };
+
+            for (size_t c = 0; c < n_chunks; ++c) {
+                size_t i = c * chunk_samples;
+                std::vector<float> vad_chunk(accumulated_samples.begin() + i, accumulated_samples.begin() + i + chunk_samples);
+                
+                bool is_speech = chunks_is_speech[c];
                 
                 if (is_speech) {
                     if (!in_speech) {
-                        speech_start_sample = total_samples_received + i;
+                        speech_start_sample = total_samples_received + i - pre_speech_cache.size();
+                        if (speech_start_sample < 0) {
+                            speech_start_sample = 0;
+                        }
                         last_progressive_sample = speech_start_sample;
-                        progressive_start_idx = 0;
+                        m_segment_index++;
+                        speech_buffer.insert(speech_buffer.end(), pre_speech_cache.begin(), pre_speech_cache.end());
+                        pre_speech_cache.clear();
                     }
                     speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
                     in_speech = true;
@@ -919,18 +973,21 @@ private:
                         if (elapsed_since_start_ms >= m_progressive_initial_ms) {
                             int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
                             if (elapsed_since_last_prog_ms >= m_progressive_window_ms) {
-                                int64_t chunk_start_ms = ((speech_start_sample + progressive_start_idx) * 1000) / sample_rate;
-                                int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                                
-                                std::vector<float> prog_buffer;
-                                if (progressive_start_idx < (int64_t)speech_buffer.size()) {
-                                    prog_buffer.assign(speech_buffer.begin() + progressive_start_idx, speech_buffer.end());
+                                bool has_pending_audio = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(m_mutex);
+                                    has_pending_audio = !m_audio_buffer.empty();
                                 }
-                                
-                                int64_t dropped_samples = processAndOutput(prog_buffer, tp, chunk_start_ms, chunk_end_ms, true);
-                                progressive_start_idx += dropped_samples;
-                                
-                                last_progressive_sample = current_sample;
+                                bool skip_progressive = is_finishing || 
+                                                        has_pending_audio || 
+                                                        will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
+                                if (!skip_progressive) {
+                                    int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                                    int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                                    
+                                    processAndOutput(speech_buffer, tp, chunk_start_ms, chunk_end_ms, m_segment_index, true);
+                                    last_progressive_sample = current_sample;
+                                }
                             }
                         }
                     }
@@ -941,31 +998,59 @@ private:
                         int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
                         int64_t end_time_ms = (current_sample * 1000) / sample_rate;
                         
-                        processAndOutput(speech_buffer, tp, start_time_ms, end_time_ms);
+                        processAndOutput(speech_buffer, tp, start_time_ms, end_time_ms, m_segment_index, false);
                         
                         speech_buffer.clear();
                         speech_chunk_count = 0;
                         speech_start_sample = current_sample;
                         last_progressive_sample = current_sample;
-                        progressive_start_idx = 0;
-                        
-                        // We reset silence counter and keep in_speech true so we keep adding speech,
-                        // but starting a new chunk from speech_start_sample = current_sample.
+                        m_segment_index++;
                         silence_chunk_count = 0;
                         in_speech = true;
                     }
-                } else if (in_speech) {
-                    silence_chunk_count++;
-                    if (silence_chunk_count <= m_min_mute_chunks) {
-                        speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
+                } else {
+                    if (in_speech) {
+                        silence_chunk_count++;
+                        if (silence_chunk_count <= m_min_mute_chunks) {
+                            speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
+                        }
+                        if (silence_chunk_count > m_min_mute_chunks) {
+                            in_speech = false;
+                            int64_t speech_end_sample = total_samples_received + i + chunk_samples;
+                            int64_t actual_end_sample = speech_end_sample - (silence_chunk_count * chunk_samples);
+                            if (actual_end_sample < speech_start_sample) {
+                                actual_end_sample = speech_end_sample;
+                            }
+
+                            std::vector<float> transcribe_pcm = speech_buffer;
+                            size_t silence_samples = std::min(silence_chunk_count, m_min_mute_chunks) * chunk_samples;
+                            size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
+                            if (silence_samples > post_speech_pad_samples) {
+                                size_t trim_samples = silence_samples - post_speech_pad_samples;
+                                if (transcribe_pcm.size() > trim_samples) {
+                                    transcribe_pcm.resize(transcribe_pcm.size() - trim_samples);
+                                }
+                            }
+
+                            processAndOutput(transcribe_pcm, tp, (speech_start_sample * 1000) / sample_rate, (actual_end_sample * 1000) / sample_rate, m_segment_index, false);
+                            speech_buffer.clear();
+                            speech_chunk_count = 0;
+                            pre_speech_cache.clear();
+                        }
                     }
-                    if (silence_chunk_count > m_min_mute_chunks) {
-                        in_speech = false;
-                        int64_t speech_end_sample = total_samples_received + i + chunk_samples;
-                        processAndOutput(speech_buffer, tp, (speech_start_sample * 1000) / sample_rate, (speech_end_sample * 1000) / sample_rate);
-                        speech_buffer.clear();
-                        speech_chunk_count = 0;
-                        progressive_start_idx = 0;
+                    
+                    if (!in_speech) {
+                        pre_speech_cache.insert(pre_speech_cache.end(), vad_chunk.begin(), vad_chunk.end());
+                        size_t pre_speech_pad_samples = (300 * sample_rate) / 1000;
+                        if (pre_speech_cache.size() > pre_speech_pad_samples) {
+                            pre_speech_cache.erase(pre_speech_cache.begin(), pre_speech_cache.end() - pre_speech_pad_samples);
+                        }
+
+                        double current_time_sec = (double)(total_samples_received + i + chunk_samples) / sample_rate;
+                        if (current_time_sec - last_silence_time >= 1.0) {
+                            emit_silence(current_time_sec);
+                            last_silence_time = current_time_sec;
+                        }
                     }
                 }
                 processed_samples = i + chunk_samples;
@@ -981,7 +1066,10 @@ private:
                 int64_t final_sample = total_samples_received + accumulated_samples.size();
                 int64_t start = in_speech ? (speech_start_sample * 1000) / sample_rate : (total_samples_received * 1000) / sample_rate;
                 if (!speech_buffer.empty()) {
-                    processAndOutput(speech_buffer, tp, start, (final_sample * 1000) / sample_rate);
+                    if (!in_speech) {
+                        m_segment_index++;
+                    }
+                    processAndOutput(speech_buffer, tp, start, (final_sample * 1000) / sample_rate, m_segment_index, false);
                 }
                 break;
             }
@@ -991,18 +1079,29 @@ private:
             m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function jsCallback) {
                 Napi::Object result = Napi::Object::New(env);
                 result.Set("type", "end");
-                jsCallback.Call({result});
+                jsCallback.Call({env.Null(), result});
             });
         }
     }
 
-    int64_t processAndOutput(std::vector<float>& audio, const qwen3_asr::transcribe_params& tp, int64_t start_ms, int64_t end_ms, bool is_progressive = false) {
-        if (!m_asr) return 0;
+    void emit_silence(double t) {
+        if (m_tsfn_callback) {
+            m_tsfn_callback.BlockingCall([t](Napi::Env env, Napi::Function jsCallback) {
+                Napi::Object result = Napi::Object::New(env);
+                result.Set("type", Napi::String::New(env, "silence"));
+                result.Set("t", Napi::Number::New(env, t));
+                jsCallback.Call({env.Null(), result});
+            });
+        }
+    }
+
+    void processAndOutput(std::vector<float>& audio, const qwen3_asr::transcribe_params& tp, int64_t start_ms, int64_t end_ms, int segment_index, bool is_progressive = false) {
+        if (!m_asr) return;
         
         auto res = m_asr->transcribe(audio.data(), audio.size(), tp);
         if (!res.success) {
             fprintf(stderr, "[STREAM] processAndOutput transcribe failed: %s\n", res.error_msg.c_str());
-            return 0;
+            return;
         }
         
         std::string final_text = res.text;
@@ -1020,46 +1119,12 @@ private:
             }
         }
         
-        int64_t drop_samples = 0;
-        
-        if (is_progressive && m_progressive_update) {
-            if (has_alignment) {
-                size_t n_words = align_res.words.size();
-                if (n_words > 0) {
-                    size_t target_idx = n_words >= (size_t)m_progressive_window_tokens 
-                        ? n_words - m_progressive_window_tokens 
-                        : 0;
-                        
-                    float t0_s = align_res.words[target_idx].start;
-                    drop_samples = static_cast<int64_t>(t0_s * 16000);
-                }
-            } else {
-                size_t n_tokens = res.tokens.size();
-                if (n_tokens > 0) {
-                    size_t target_idx = n_tokens >= (size_t)m_progressive_window_tokens 
-                        ? n_tokens - m_progressive_window_tokens 
-                        : 0;
-                    drop_samples = (audio.size() * target_idx) / n_tokens;
-                } else {
-                    int64_t max_prog_samples = (m_progressive_initial_ms * 16000) / 1000;
-                    if (audio.size() > (size_t)max_prog_samples) {
-                        drop_samples = audio.size() - max_prog_samples;
-                    }
-                }
-            }
-            
-            // Note: We no longer erase from the audio buffer here. 
-            // The outer loop retains the full speech_buffer for the final segment.
-            if (drop_samples < 0 || drop_samples >= (int64_t)audio.size()) {
-                drop_samples = 0;
-            }
-        }
-        
         if (m_tsfn_callback) {
             auto cbk_data = std::make_tuple(start_ms, end_ms, final_text, has_alignment, align_res.words, stream_lang);
-            m_tsfn_callback.BlockingCall([cbk_data, is_progressive](Napi::Env env, Napi::Function jsCallback) {
+            auto callback = [cbk_data, is_progressive, segment_index](Napi::Env env, Napi::Function jsCallback) {
                 Napi::Object result = Napi::Object::New(env);
                 result.Set("type", Napi::String::New(env, is_progressive ? "progressive" : "segment"));
+                result.Set("index", Napi::Number::New(env, segment_index));
                 result.Set("start", Napi::Number::New(env, std::get<0>(cbk_data)));
                 result.Set("end", Napi::Number::New(env, std::get<1>(cbk_data)));
                 result.Set("text", Napi::String::New(env, std::get<2>(cbk_data)));
@@ -1080,13 +1145,17 @@ private:
                     result.Set("words", wordsArr);
                 }
                 
-                jsCallback.Call({result});
-            });
+                jsCallback.Call({env.Null(), result});
+            };
+            if (is_progressive) {
+                m_tsfn_callback.NonBlockingCall(callback);
+            } else {
+                m_tsfn_callback.BlockingCall(callback);
+            }
         }
-        
-        return drop_samples;
     }
     // ASR State
+    int m_segment_index = 0;
     std::unique_ptr<qwen3_asr::Qwen3ASR> m_asr;
     std::unique_ptr<qwen3_asr::ForcedAligner> m_aligner;
     whisper_vad_context* m_vctx = nullptr;

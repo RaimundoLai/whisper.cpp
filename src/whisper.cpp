@@ -8,6 +8,7 @@
 
 #ifdef WHISPER_USE_COREML
 #include "coreml/whisper-encoder.h"
+#include <sys/stat.h>
 #endif
 
 #ifdef WHISPER_USE_OPENVINO
@@ -1296,7 +1297,11 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & pa
     if (params.use_gpu) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev_cur) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev_cur) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev_cur);
+            const char * dev_name = ggml_backend_dev_name(dev_cur);
+            WHISPER_LOG_INFO("%s: device %zu: %s (type: %d)\n", __func__, i, dev_name, dev_type);
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                WHISPER_LOG_INFO("%s: found GPU device %zu: %s (type: %d, cnt: %d)\n", __func__, i, dev_name, dev_type, cnt);
                 if (cnt == params.gpu_device) {
                     dev = dev_cur;
                 }
@@ -2503,7 +2508,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     const float KQscale = pow(float(n_state_head), -0.25);
 
-    struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD), 1);
+    struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1);
     ggml_set_name(KQ_mask, "KQ_mask");
     ggml_set_input(KQ_mask);
 
@@ -2927,7 +2932,7 @@ static bool whisper_decode_internal(
                     }
                 }
 
-                for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
+                for (int i = n_tokens; i < n_tokens; ++i) {
                     for (int j = 0; j < n_kv; ++j) {
                         data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
                     }
@@ -3438,18 +3443,25 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
 #ifdef WHISPER_USE_COREML
     const auto path_coreml = whisper_get_coreml_path_encoder(ctx->path_model);
 
-    WHISPER_LOG_INFO("%s: loading Core ML model from '%s'\n", __func__, path_coreml.c_str());
-    WHISPER_LOG_INFO("%s: first run on a device may take a while ...\n", __func__);
+    struct stat st;
+    const bool coreml_exists = (stat(path_coreml.c_str(), &st) == 0);
 
-    state->ctx_coreml = whisper_coreml_init(path_coreml.c_str());
-    if (!state->ctx_coreml) {
-        WHISPER_LOG_ERROR("%s: failed to load Core ML model from '%s'\n", __func__, path_coreml.c_str());
+    if (coreml_exists) {
+        WHISPER_LOG_INFO("%s: loading Core ML model from '%s'\n", __func__, path_coreml.c_str());
+        WHISPER_LOG_INFO("%s: first run on a device may take a while ...\n", __func__);
+
+        state->ctx_coreml = whisper_coreml_init(path_coreml.c_str());
+        if (!state->ctx_coreml) {
+            WHISPER_LOG_ERROR("%s: failed to load Core ML model from '%s'\n", __func__, path_coreml.c_str());
 #ifndef WHISPER_COREML_ALLOW_FALLBACK
-        whisper_free_state(state);
-        return nullptr;
+            whisper_free_state(state);
+            return nullptr;
 #endif
+        } else {
+            WHISPER_LOG_INFO("%s: Core ML model loaded\n", __func__);
+        }
     } else {
-        WHISPER_LOG_INFO("%s: Core ML model loaded\n", __func__);
+        WHISPER_LOG_INFO("%s: Core ML model not found at '%s', skipping Core ML initialization\n", __func__, path_coreml.c_str());
     }
 #endif
 
@@ -6704,7 +6716,7 @@ static bool whisper_vad(
             }
 
             segment_start_samples = std::min(segment_start_samples, n_samples - 1);
-            segment_end_samples = std::min(segment_end_samples, n_samples);
+            segment_end_samples = std::min(segment_end_samples, n_samples - 1);
             int segment_length = segment_end_samples - segment_start_samples;
             if (segment_length > 0) {
                 whisper_state::vad_segment_info segment;
@@ -8063,6 +8075,54 @@ float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_se
 
 float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token) {
     return ctx->state->result_all[i_segment].tokens[i_token].p;
+}
+
+extern "C" {
+WHISPER_API int whisper_full_get_token_n_alts(struct whisper_context * ctx, int i_segment, int i_token) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    return 0;
+}
+
+WHISPER_API int whisper_full_get_token_n_alts_from_state(struct whisper_state * state, int i_segment, int i_token) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    return 0;
+}
+
+WHISPER_API whisper_token whisper_full_get_token_alt_id(struct whisper_context * ctx, int i_segment, int i_token, int i_alt) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0;
+}
+
+WHISPER_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0;
+}
+
+WHISPER_API float whisper_full_get_token_alt_p(struct whisper_context * ctx, int i_segment, int i_token, int i_alt) {
+    (void) ctx;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0.0f;
+}
+
+WHISPER_API float whisper_full_get_token_alt_p_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt) {
+    (void) state;
+    (void) i_segment;
+    (void) i_token;
+    (void) i_alt;
+    return 0.0f;
+}
 }
 
 float whisper_full_get_segment_no_speech_prob(struct whisper_context * ctx, int i_segment) {

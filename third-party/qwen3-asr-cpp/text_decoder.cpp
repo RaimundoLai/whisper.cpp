@@ -314,10 +314,8 @@ bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context
     ggml_backend_dev_t gpu_dev = use_gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
     bool copy_needed = false;
     if (gpu_dev) {
-#if defined(__APPLE__) && defined(__aarch64__)
-        if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (decoder): Device is GPU (Apple Silicon). Calling buf_from_host_ptr\n");
+        if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (decoder): Device is GPU. Calling buf_from_host_ptr\n");
         model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
-#endif
         if (!model_.buffer) {
             if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (decoder): Allocating VRAM for fallback deep copy\n");
             // Unify memory failed or not supported (e.g. CUDA on PC). Allocate actual VRAM buffer and set flag to deep copy.
