@@ -61,6 +61,10 @@ jobs:
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
             "--CDCMAKE_CUDA_ARCHITECTURES=50;61;70;75;80;86;89",
+            "--CDGGML_NATIVE=OFF",
+            "--CDGGML_AVX2=ON",
+            "--CDGGML_FMA=ON",
+            "--CDGGML_F16C=ON",
             "--runtime=electron",
             "--runtime-version=35.1.5",
             "--arch=x64"
