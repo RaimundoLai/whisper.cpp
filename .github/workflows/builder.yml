@@ -97,41 +97,21 @@ jobs:
         id: date
         run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
         
-      - name: Create CUDA Test Release
+      - name: Update Test CUDA Release
         uses: softprops/action-gh-release@v1
         if: github.event_name != 'pull_request'
         with:
-          tag_name: cuda-test-${{ steps.date.outputs.date }}
-          name: whisper.cpp CUDA test builds ${{ steps.date.outputs.date }}
+          tag_name: test-cuda
+          name: test cuda
           body: |
-            whisper.cpp CUDA test addon builds (Build date: ${{ steps.date.outputs.date }})
-            
-            **Windows**
-            - CUDA: 12.4, 13.0
-            
-          files: |
-            artifacts/**/*.node
-          draft: false
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Update Latest CUDA Test Release
-        uses: softprops/action-gh-release@v1
-        if: github.event_name != 'pull_request'
-        with:
-          tag_name: cuda-test-latest
-          name: Latest whisper.cpp CUDA test builds
-          body: |
-            Latest whisper.cpp CUDA test addon builds.
+            whisper.cpp Windows CUDA test builds.
             Last updated: ${{ steps.date.outputs.date }}
             
-            **Windows**
-            - CUDA: 12.4, 13.0
-            
+            This release is overwritten on every push to the test-cuda branch.
           files: |
             artifacts/**/*.node
           draft: false
           prerelease: true
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
