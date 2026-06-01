@@ -3,7 +3,7 @@ name: Build whisper.cpp addons
 on:
   workflow_dispatch:
   push:
-    branches: [ builder ]
+    branches: [ test-cuda ]
 
 jobs:
   # =================================================================================================
@@ -78,381 +78,11 @@ jobs:
           name: addon-${{ matrix.optimized }}.node
           path: artifacts/addon-${{ matrix.optimized }}.node
 
-  windows-vulkan:
-    runs-on: windows-2022
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Install dependencies
-        run: |
-          choco install cmake -y
-          npm install -g cmake-js
-      - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          cache: true
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          
-          npx cmake-js compile -T addon.node -B Release `
-            --CDBUILD_SHARED_LIBS=OFF `
-            --CDWHISPER_STATIC=ON `
-            --CDGGML_VULKAN=ON `
-            --runtime=electron `
-            --runtime-version=35.1.5 `
-            --arch=x64 `
-            
-          mkdir -p artifacts
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-vulkan.node"
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-windows-vulkan
-          path: artifacts/addon-windows-vulkan.node
-
-  windows-no-cuda:
-    runs-on: windows-2022
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Install dependencies
-        run: |
-          choco install cmake -y
-          npm install -g cmake-js
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          npx cmake-js compile -T addon.node -B Release `
-            --CDBUILD_SHARED_LIBS=OFF `
-            --CDWHISPER_STATIC=ON `
-            --runtime=electron `
-            --runtime-version=35.1.5 `
-            --arch=x64 `
-            
-          mkdir -p artifacts
-          
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-no-cuda.node"
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-windows-no-cuda
-          path: artifacts/addon-windows-no-cuda.node
-
-  # =================================================================================================
-  # macOS Builds
-  # =================================================================================================
-  macos-arm64:
-    runs-on: macos-15
-    env:
-      MACOSX_DEPLOYMENT_TARGET: '12.0'
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: |
-          brew install cmake
-          npm install -g cmake-js
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          mkdir -p artifacts
-          
-          # Build Metal variant
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDGGML_METAL=ON \
-            --CDGGML_METAL_USE_BF16=ON \
-            --CDGGML_METAL_EMBED_LIBRARY=ON \
-            --runtime=electron \
-            --runtime-version=39.8.10 \
-            --arch=arm64 \
-            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
-          cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
-          
-          # Clear build cache
-          rm -rf build/CMakeCache.txt build/CMakeFiles/
-          
-          # Build CoreML variant
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDWHISPER_COREML=ON \
-            --CDGGML_METAL=ON \
-            --CDGGML_METAL_USE_BF16=ON \
-            --CDGGML_METAL_EMBED_LIBRARY=ON \
-            --runtime=electron \
-            --runtime-version=39.8.10 \
-            --arch=arm64 \
-            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
-          cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-macos-arm64
-          path: |
-            artifacts/addon-macos-arm64.node
-            artifacts/addon-macos-arm64-coreml.node
-
-  macos-intel:
-    runs-on: macos-15-intel
-    env:
-      MACOSX_DEPLOYMENT_TARGET: '12.0'
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: |
-          brew install cmake
-          npm install -g cmake-js
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDGGML_METAL=OFF \
-            --runtime=electron \
-            --runtime-version=35.1.5 \
-            --arch=x64 \
-            --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
-            
-          mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-macos-x64.node
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-macos-x64
-          path: artifacts/addon-macos-x64.node
-
-  # =================================================================================================
-  # Linux Builds
-  # =================================================================================================
-  linux-cuda:
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        cuda_version: ['12.4.0', '13.0.2']
-        include:
-          - cuda_version: '12.4.0'
-            optimized: 'linux-cuda-1240'
-          - cuda_version: '13.0.2'
-            optimized: 'linux-cuda-1302'
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
-          npm install -g cmake-js
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.29
-        id: cuda-toolkit
-        with:
-          cuda: ${{ matrix.cuda_version }}
-          method: 'network'
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          
-          export CUDA_PATH="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
-          export PATH="$CUDA_PATH/bin:$PATH"
-          export LD_LIBRARY_PATH="$CUDA_PATH/lib64:$LD_LIBRARY_PATH"
-          
-          outputName="addon-${{ matrix.optimized }}.node"
-          
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            --CDGGML_CUDA=ON \
-            --runtime=electron \
-            --runtime-version=35.1.5 \
-            --arch=x64
-          
-          mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/$outputName
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-${{ matrix.optimized }}.node
-          path: artifacts/addon-${{ matrix.optimized }}.node
-
-  linux-vulkan:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
-          npm install -g cmake-js
-
-      - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          cache: true
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            --CDGGML_VULKAN=ON \
-            --runtime=electron \
-            --runtime-version=35.1.5 \
-            --arch=x64
-            
-          mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-linux-vulkan.node
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-linux-vulkan
-          path: artifacts/addon-linux-vulkan.node
-
-  linux-no-cuda:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Clone whisper.cpp repository
-        uses: actions/checkout@v4
-        with:
-          repository: RaimundoLai/whisper.cpp
-          ref: dev
-          submodules: recursive
-          
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
-          npm install -g cmake-js
-
-      - name: Build
-        run: |
-          cd examples/addon.node
-          npm install
-          cd ../../
-          
-          npx cmake-js compile -T addon.node -B Release \
-            --CDBUILD_SHARED_LIBS=OFF \
-            --CDWHISPER_STATIC=ON \
-            --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            --runtime=electron \
-            --runtime-version=35.1.5 \
-            --arch=x64
-            
-          mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-linux-no-cuda.node
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: addon-linux-no-cuda
-          path: artifacts/addon-linux-no-cuda.node
-
   # =================================================================================================
   # Release Job
   # =================================================================================================
   create-update-release:
-    needs: [windows-cuda, windows-vulkan, windows-no-cuda, macos-arm64, macos-intel, linux-cuda, linux-vulkan, linux-no-cuda]
+    needs: [windows-cuda]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -467,63 +97,41 @@ jobs:
         id: date
         run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
         
-      - name: Create Timestamped Release
+      - name: Create CUDA Test Release
         uses: softprops/action-gh-release@v1
         if: github.event_name != 'pull_request'
         with:
-          tag_name: release-${{ steps.date.outputs.date }}
-          name: whisper.cpp builds ${{ steps.date.outputs.date }}
+          tag_name: cuda-test-${{ steps.date.outputs.date }}
+          name: whisper.cpp CUDA test builds ${{ steps.date.outputs.date }}
           body: |
-            whisper.cpp addon builds (Build date: ${{ steps.date.outputs.date }})
+            whisper.cpp CUDA test addon builds (Build date: ${{ steps.date.outputs.date }})
             
             **Windows**
             - CUDA: 12.4, 13.0
-            - Vulkan
-            - CPU (No CUDA)
-            
-            **macOS**
-            - ARM64 (Metal & CoreML)
-            - Intel (Metal)
-            
-            **Linux (Ubuntu)**
-            - CUDA: 12.4, 13.0
-            - Vulkan
-            - CPU (No CUDA)
             
           files: |
             artifacts/**/*.node
           draft: false
-          prerelease: false
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
-      - name: Update Latest Release
+      - name: Update Latest CUDA Test Release
         uses: softprops/action-gh-release@v1
         if: github.event_name != 'pull_request'
         with:
-          tag_name: latest
-          name: Latest whisper.cpp builds
+          tag_name: cuda-test-latest
+          name: Latest whisper.cpp CUDA test builds
           body: |
-            Latest whisper.cpp addon builds.
+            Latest whisper.cpp CUDA test addon builds.
             Last updated: ${{ steps.date.outputs.date }}
             
             **Windows**
             - CUDA: 12.4, 13.0
-            - Vulkan
-            - CPU (No CUDA)
-            
-            **macOS**
-            - ARM64 (Metal & CoreML)
-            - Intel (Metal)
-            
-            **Linux (Ubuntu)**
-            - CUDA: 12.4, 13.0
-            - Vulkan
-            - CPU (No CUDA)
             
           files: |
             artifacts/**/*.node
           draft: false
-          prerelease: false
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
