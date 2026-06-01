@@ -60,7 +60,7 @@ jobs:
             "--CDBUILD_SHARED_LIBS=OFF",
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
-            "--CDCMAKE_CUDA_ARCHITECTURES=""50-real;61-real;70-real;75-real;80-real;86-real;89-real""",
+            "--CDCMAKE_CUDA_ARCHITECTURES='50-real;61-real;70-real;75-real;80-real;86-real;89-real'",
             "--CDGGML_NATIVE=OFF",
             "--CDGGML_AVX2=ON",
             "--CDGGML_FMA=ON",
