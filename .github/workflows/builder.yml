@@ -20,7 +20,7 @@ jobs:
             cuda_archs: '50-real;61-real;70-real;75-real;80-real;86-real;89-real'
           - cuda_version: '13.0.2'
             optimized: 'windows-cuda-1302'
-            cuda_archs: '75-real;80-real;86-real;89-real;90-real'
+            cuda_archs: '75-real;80-real;86-real;89-real;90-real;120-real;120-virtual'
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
@@ -62,7 +62,7 @@ jobs:
             "--CDBUILD_SHARED_LIBS=OFF",
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
-            "--CDCMAKE_CUDA_ARCHITECTURES='${{ matrix.cuda_archs }}'",
+            "--CDCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}",
             "--CDGGML_NATIVE=OFF",
             "--CDGGML_AVX2=ON",
             "--CDGGML_FMA=ON",
