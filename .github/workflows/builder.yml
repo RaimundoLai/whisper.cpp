@@ -60,8 +60,6 @@ jobs:
             "--CDBUILD_SHARED_LIBS=OFF",
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
-            "--CDGGML_CUDA_GRAPHS=OFF",
-            "--CDGGML_CUDA_FORCE_CUBLAS=ON",
             "--runtime=electron",
             "--runtime-version=35.1.5",
             "--arch=x64"
