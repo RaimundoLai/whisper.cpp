@@ -60,7 +60,7 @@ jobs:
             "--CDBUILD_SHARED_LIBS=OFF",
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
-            "--CDCMAKE_CUDA_ARCHITECTURES=50;61;70;75;80;86;89",
+            "--CDCMAKE_CUDA_ARCHITECTURES=""50-real;61-real;70-real;75-real;80-real;86-real;89-real""",
             "--CDGGML_NATIVE=OFF",
             "--CDGGML_AVX2=ON",
             "--CDGGML_FMA=ON",
@@ -75,7 +75,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release $buildParams
           
           mkdir -p artifacts
-          Copy-Item "build/Release/addon.node.node" -Destination "artifacts/$outputName"
+          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/$outputName"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
