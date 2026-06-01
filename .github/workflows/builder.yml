@@ -60,6 +60,7 @@ jobs:
             "--CDBUILD_SHARED_LIBS=OFF",
             "--CDWHISPER_STATIC=ON",
             "--CDGGML_CUDA=ON",
+            "--CDCMAKE_CUDA_ARCHITECTURES=50;61;70;75;80;86;89",
             "--runtime=electron",
             "--runtime-version=35.1.5",
             "--arch=x64"
