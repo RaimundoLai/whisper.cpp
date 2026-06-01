@@ -71,7 +71,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release $buildParams
           
           mkdir -p artifacts
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/$outputName"
+          Copy-Item "build/Release/addon.node.node" -Destination "artifacts/$outputName"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
