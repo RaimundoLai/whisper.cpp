@@ -8,4 +8,4 @@
 [submodule "third-party/CrispASR"]
 	path = third-party/CrispASR
 	url = https://github.com/RaimundoLai/CrispASR.git
-	branch = dev
+	branch = cuda-test-dev
