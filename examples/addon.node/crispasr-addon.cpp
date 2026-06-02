@@ -316,6 +316,8 @@ public:
                    int n_threads,
                    bool use_gpu,
                    bool debug,
+                   bool flash_attn,
+                   int n_gpu_layers,
                    std::string language,
                    bool translate,
                    std::string target_language,
@@ -336,6 +338,8 @@ public:
           m_n_threads(n_threads),
           m_use_gpu(use_gpu),
           m_debug(debug),
+          m_flash_attn(flash_attn),
+          m_n_gpu_layers(n_gpu_layers),
           m_language(std::move(language)),
           m_translate(translate),
           m_target_language(std::move(target_language)),
@@ -463,8 +467,8 @@ public:
         params.n_threads = m_n_threads;
         params.use_gpu = m_use_gpu ? 1 : 0;
         params.verbosity = m_debug ? 1 : 0;
-        params.flash_attn = 1;
-        params.n_gpu_layers = -1;
+        params.flash_attn = m_flash_attn ? 1 : 0;
+        params.n_gpu_layers = m_n_gpu_layers;
 
         const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
 
@@ -665,6 +669,8 @@ private:
     int m_n_threads;
     bool m_use_gpu;
     bool m_debug;
+    bool m_flash_attn;
+    int m_n_gpu_layers;
     std::string m_language;
     bool m_translate;
     std::string m_target_language;
@@ -729,6 +735,16 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
     bool debug = false;
     if (options.Has("debug") && options.Get("debug").IsBoolean()) {
         debug = options.Get("debug").As<Napi::Boolean>();
+    }
+
+    bool flash_attn = true;
+    if (options.Has("flash_attn") && options.Get("flash_attn").IsBoolean()) {
+        flash_attn = options.Get("flash_attn").As<Napi::Boolean>();
+    }
+
+    int n_gpu_layers = -1;
+    if (options.Has("n_gpu_layers") && options.Get("n_gpu_layers").IsNumber()) {
+        n_gpu_layers = options.Get("n_gpu_layers").As<Napi::Number>().Int32Value();
     }
 
     std::string language = "";
@@ -798,7 +814,8 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
 
     Napi::Function callback = info[1].As<Napi::Function>();
     CrispASRWorker* worker = new CrispASRWorker(
-        callback, model_path, backend_name, std::move(pcmf32), n_threads, use_gpu, debug, language,
+        callback, model_path, backend_name, std::move(pcmf32), n_threads, use_gpu, debug, 
+        flash_attn, n_gpu_layers, language,
         translate, target_language, context, aligner_model_path,
         vad_model_path, vad_threshold, min_speech_ms, min_silence_ms, speech_pad_ms, max_speech_ms,
         progress_callback, env
@@ -839,6 +856,8 @@ public:
         if (options.Has("language")) m_language = options.Get("language").As<Napi::String>();
         if (options.Has("n_threads")) m_n_threads = options.Get("n_threads").As<Napi::Number>().Int32Value();
         if (options.Has("use_gpu")) m_use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
+        if (options.Has("flash_attn")) m_flash_attn = options.Get("flash_attn").As<Napi::Boolean>();
+        if (options.Has("n_gpu_layers")) m_n_gpu_layers = options.Get("n_gpu_layers").As<Napi::Number>().Int32Value();
         if (options.Has("chunk_size_ms")) m_chunk_size_ms = options.Get("chunk_size_ms").As<Napi::Number>().Int32Value();
         
         if (options.Has("translate")) m_translate = options.Get("translate").As<Napi::Boolean>();
@@ -900,9 +919,9 @@ public:
         params.abi_version = 2;
         params.n_threads = m_n_threads;
         params.use_gpu = m_use_gpu ? 1 : 0;
-        params.verbosity = 0;
-        params.flash_attn = 1;
-        params.n_gpu_layers = -1;
+        params.verbosity = m_debug ? 1 : 0;
+        params.flash_attn = m_flash_attn ? 1 : 0;
+        params.n_gpu_layers = m_n_gpu_layers;
 
         const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
         m_session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
@@ -1461,8 +1480,10 @@ private:
     std::string m_context = "";
     std::string m_aligner_model_path = "";
     bool m_debug = false;
-    int m_n_threads = 4;
+    int m_n_threads = std::min(4, (int32_t)std::thread::hardware_concurrency());
     bool m_use_gpu = true;
+    bool m_flash_attn = true;
+    int m_n_gpu_layers = -1;
     int m_chunk_size_ms = 2000;
     bool m_progressive_update = false;
     int m_progressive_interval_ms = 500;
