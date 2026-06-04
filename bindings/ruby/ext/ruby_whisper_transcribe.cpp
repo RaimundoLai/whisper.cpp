@@ -1,4 +1,3 @@
-#include <ruby.h>
 #include "ruby_whisper.h"
 #include "common-whisper.h"
 #include <string>
@@ -13,10 +12,40 @@ extern const rb_data_type_t ruby_whisper_params_type;
 
 extern ID id_to_s;
 extern ID id_call;
+extern ID id_to_path;
 extern ID transcribe_option_names[1];
 
-extern void
-prepare_transcription(ruby_whisper_params * rwp, VALUE * self);
+extern void prepare_transcription(ruby_whisper_params * rwp, VALUE * self, int n_processors);
+
+typedef struct{
+  struct whisper_context *context;
+  struct whisper_full_params *params;
+  float *samples;
+  size_t n_samples;
+  int n_processors;
+  int result;
+} transcribe_without_gvl_args;
+
+static void*
+transcribe_without_gvl(void *rb_args)
+{
+  transcribe_without_gvl_args *args = (transcribe_without_gvl_args *)rb_args;
+  args->result = whisper_full_parallel(args->context, *args->params, args->samples, args->n_samples, args->n_processors);
+
+  return NULL;
+}
+
+typedef struct {
+  ruby_whisper_abort_callback_container *abort_callback_container;
+} transcribe_ubf_args;
+
+static void
+transcribe_ubf(void *rb_args)
+{
+  transcribe_ubf_args *args = (transcribe_ubf_args *)rb_args;
+
+  args->abort_callback_container->is_interrupted = true;
+}
 
 /*
  * transcribe a single file
@@ -43,13 +72,16 @@ ruby_whisper_transcribe(int argc, VALUE *argv, VALUE self) {
 
   int n_processors = opts[0] == Qundef ? 1 : NUM2INT(opts[0]);
 
-  TypedData_Get_Struct(self, ruby_whisper, &ruby_whisper_type, rw);
+  GetContext(self, rw);
   TypedData_Get_Struct(params, ruby_whisper_params, &ruby_whisper_params_type, rwp);
 
   if (!rb_respond_to(wave_file_path, id_to_s)) {
     rb_raise(rb_eRuntimeError, "Expected file path to wave file");
   }
 
+  if (rb_respond_to(wave_file_path, id_to_path)) {
+    wave_file_path = rb_funcall(wave_file_path, id_to_path, 0);
+  }
   std::string fname_inp = StringValueCStr(wave_file_path);
 
   std::vector<float> pcmf32; // mono-channel F32 PCM
@@ -70,9 +102,21 @@ ruby_whisper_transcribe(int argc, VALUE *argv, VALUE self) {
   //   rwp->params.encoder_begin_callback_user_data = &is_aborted;
   // }
 
-  prepare_transcription(rwp, &self);
+  prepare_transcription(rwp, &self, n_processors);
 
-  if (whisper_full_parallel(rw->context, rwp->params, pcmf32.data(), pcmf32.size(), n_processors) != 0) {
+  transcribe_without_gvl_args args = {
+    rw->context,
+    &rwp->params,
+    pcmf32.data(),
+    pcmf32.size(),
+    n_processors,
+    0,
+  };
+  transcribe_ubf_args ubf_args = {
+    rwp->abort_callback_container,
+  };
+  rb_thread_call_without_gvl(transcribe_without_gvl, (void *)&args, transcribe_ubf, (void *)&ubf_args);
+  if (args.result != 0) {
     fprintf(stderr, "failed to process audio\n");
     return self;
   }
