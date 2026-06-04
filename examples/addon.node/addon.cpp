@@ -1469,6 +1469,133 @@ void WhisperStream::StreamWorkerVAD() {
                             callback_user_data.segment_index = m_segment_index + 1;
                             if (whisper_full(m_ctx, m_wparams, m_pcmf32_local.data(), m_pcmf32_local.size()) != 0) {
                                 fprintf(stderr, "whisper_full failed in progressive VAD streaming mode\n");
+                            } else {
+                                // Finalize completed segments early if multiple segments are returned
+                                const int n_segments = whisper_full_n_segments(m_ctx);
+                                if (n_segments > 1) {
+                                    int finalize_count = n_segments - 1;
+                                    int64_t t_final_centiseconds = whisper_full_get_segment_t1(m_ctx, finalize_count - 1);
+                                    int64_t erase_samples = (t_final_centiseconds * WHISPER_SAMPLE_RATE) / 100;
+                                    
+                                    if (erase_samples > 0 && erase_samples < (int64_t)m_pcmf32_local.size()) {
+                                        std::vector<SegmentData> final_segments;
+                                        const int64_t time_offset_ms = (m_current_callback_offset_samples * 1000) / WHISPER_SAMPLE_RATE;
+                                        
+                                        for (int i = 0; i < finalize_count; ++i) {
+                                            const char* text_cstr = whisper_full_get_segment_text(m_ctx, i);
+                                            if (!text_cstr || strlen(text_cstr) == 0) continue;
+                                            
+                                            SegmentData data;
+                                            data.start_ms = time_offset_ms + (whisper_full_get_segment_t0(m_ctx, i) * 10);
+                                            data.end_ms = time_offset_ms + (whisper_full_get_segment_t1(m_ctx, i) * 10);
+                                            data.text = std::string(text_cstr);
+                                            data.speaker_turn = whisper_full_get_segment_speaker_turn_next(m_ctx, i);
+                                            
+                                            if (m_output_tokens) {
+                                                const int n_tokens = whisper_full_n_tokens(m_ctx, i);
+                                                if (n_tokens > 0) {
+                                                    auto token_data_first_overall = whisper_full_get_token_data(m_ctx, i, 0);
+                                                    int64_t segment_t0 = whisper_full_get_segment_t0(m_ctx, i);
+                                                    int64_t missing_offset_10ms = segment_t0 - token_data_first_overall.t0;
+                                                    
+                                                    int j = 0;
+                                                    while (j < n_tokens) {
+                                                        auto token_data_first = whisper_full_get_token_data(m_ctx, i, j);
+                                                        std::string current_text = whisper_token_to_str(m_ctx, token_data_first.id);
+                                                        
+                                                        if (is_valid_utf8(current_text)) {
+                                                            StreamTokenData td;
+                                                            td.text = current_text;
+                                                            td.id = token_data_first.id;
+                                                            td.p = token_data_first.p;
+                                                            
+                                                            int64_t t0 = token_data_first.t0 + missing_offset_10ms;
+                                                            int64_t t1 = token_data_first.t1 + missing_offset_10ms;
+                                                            td.start_ms = time_offset_ms + (t0 * 10);
+                                                            td.end_ms = time_offset_ms + (t1 * 10);
+                                                            
+                                                            td.start_ms = std::max(data.start_ms, std::min(data.end_ms, td.start_ms));
+                                                            td.end_ms = std::max(data.start_ms, std::min(data.end_ms, td.end_ms));
+                                                            
+                                                            data.tokens.push_back(td);
+                                                            j++;
+                                                        } else {
+                                                            std::string merged_text = current_text;
+                                                            int64_t start_time = token_data_first.t0;
+                                                            int64_t end_time = token_data_first.t1;
+                                                            int k = j + 1;
+                                                            
+                                                            while (k < n_tokens) {
+                                                                auto token_data_next = whisper_full_get_token_data(m_ctx, i, k);
+                                                                merged_text += whisper_token_to_str(m_ctx, token_data_next.id);
+                                                                
+                                                                if (is_valid_utf8(merged_text)) {
+                                                                    end_time = token_data_next.t1;
+                                                                    break;
+                                                                }
+                                                                k++;
+                                                            }
+                                                            
+                                                            StreamTokenData td;
+                                                            td.text = merged_text;
+                                                            td.id = token_data_first.id;
+                                                            td.p = token_data_first.p;
+                                                            
+                                                            int64_t t0 = start_time + missing_offset_10ms;
+                                                            int64_t t1 = end_time + missing_offset_10ms;
+                                                            td.start_ms = time_offset_ms + (t0 * 10);
+                                                            td.end_ms = time_offset_ms + (t1 * 10);
+                                                            
+                                                            td.start_ms = std::max(data.start_ms, std::min(data.end_ms, td.start_ms));
+                                                            td.end_ms = std::max(data.start_ms, std::min(data.end_ms, td.end_ms));
+                                                            
+                                                            data.tokens.push_back(td);
+                                                            j = k + 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            final_segments.push_back(data);
+                                        }
+                                        
+                                        if (m_tsfn_callback && !final_segments.empty()) {
+                                            for (const auto& data : final_segments) {
+                                                m_segment_index++;
+                                                auto callback = [data, output_tokens = m_output_tokens, segment_index = m_segment_index] (Napi::Env env, Napi::Function jsCallback) {
+                                                    Napi::Object result = Napi::Object::New(env);
+                                                    result.Set("type", Napi::String::New(env, "segment"));
+                                                    result.Set("index", Napi::Number::New(env, segment_index));
+                                                    result.Set("start", Napi::Number::New(env, data.start_ms));
+                                                    result.Set("end", Napi::Number::New(env, data.end_ms));
+                                                    result.Set("text", Napi::String::New(env, data.text));
+                                                    result.Set("speaker_turn", Napi::Boolean::New(env, data.speaker_turn));
+                                                    
+                                                    if (output_tokens && !data.tokens.empty()) {
+                                                        Napi::Array tokens_array = Napi::Array::New(env, data.tokens.size());
+                                                        for (size_t t = 0; t < data.tokens.size(); ++t) {
+                                                            const auto& tok = data.tokens[t];
+                                                            Napi::Object token_obj = Napi::Object::New(env);
+                                                            token_obj.Set("text", Napi::String::New(env, tok.text));
+                                                            token_obj.Set("id", Napi::Number::New(env, tok.id));
+                                                            token_obj.Set("p", Napi::Number::New(env, tok.p));
+                                                            token_obj.Set("start", Napi::Number::New(env, tok.start_ms));
+                                                            token_obj.Set("end", Napi::Number::New(env, tok.end_ms));
+                                                            tokens_array[t] = token_obj;
+                                                        }
+                                                        result.Set("tokens", tokens_array);
+                                                    }
+                                                    
+                                                    jsCallback.Call({env.Null(), result});
+                                                };
+                                                m_tsfn_callback.BlockingCall(callback);
+                                            }
+                                        }
+                                        
+                                        m_pcmf32_local.erase(m_pcmf32_local.begin(), m_pcmf32_local.begin() + erase_samples);
+                                        m_n_samples_processed += erase_samples;
+                                        current_samples = m_pcmf32_local.size();
+                                    }
+                                }
                             }
                             callback_user_data.is_progressive = false;
                             last_progressive_sample = current_samples;
