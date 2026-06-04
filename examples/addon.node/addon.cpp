@@ -1458,12 +1458,6 @@ void WhisperStream::StreamWorkerVAD() {
                 if (elapsed_since_start_ms >= m_progressive_initial_ms) {
                     int64_t elapsed_since_last_prog_ms = ((current_samples - last_progressive_sample) * 1000) / WHISPER_SAMPLE_RATE;
                     if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
-                        bool has_pending_audio = false;
-                        {
-                            std::lock_guard<std::mutex> lock(m_mutex);
-                            has_pending_audio = !m_audio_buffer.empty();
-                        }
-                        if (!has_pending_audio) {
                             m_current_callback_offset_samples = m_n_samples_processed;
                             callback_user_data.is_progressive = true;
                             callback_user_data.segment_index = m_segment_index + 1;
@@ -1596,10 +1590,22 @@ void WhisperStream::StreamWorkerVAD() {
                                         current_samples = m_pcmf32_local.size();
                                     }
                                 }
+
+                                // Detect trailing silence: if the last segment's end time is
+                                // significantly behind the buffer duration, speech has ended
+                                // but VAD hasn't triggered yet — force finalization.
+                                if (n_segments > 0) {
+                                    int64_t last_seg_end_cs = whisper_full_get_segment_t1(m_ctx, n_segments - 1);
+                                    int64_t last_seg_end_samples = (last_seg_end_cs * WHISPER_SAMPLE_RATE) / 100;
+                                    int64_t trailing_silence_samples = (int64_t)m_pcmf32_local.size() - last_seg_end_samples;
+                                    int64_t trailing_silence_ms = (trailing_silence_samples * 1000) / WHISPER_SAMPLE_RATE;
+                                    if (trailing_silence_ms > vad_window_ms) {
+                                        should_process = true;
+                                    }
+                                }
                             }
                             callback_user_data.is_progressive = false;
                             last_progressive_sample = current_samples;
-                        }
                     }
                 }
             }
