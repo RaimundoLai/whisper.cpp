@@ -68,7 +68,7 @@ jobs:
             "--CDGGML_FMA=ON",
             "--CDGGML_F16C=ON",
             "--runtime=electron",
-            "--runtime-version=35.1.5",
+            "--runtime-version=39.8.10",
             "--arch=x64"
           )
           
@@ -122,7 +122,7 @@ jobs:
             --CDWHISPER_STATIC=ON `
             --CDGGML_VULKAN=ON `
             --runtime=electron `
-            --runtime-version=35.1.5 `
+            --runtime-version=39.8.10 `
             --arch=x64 `
             
           mkdir -p artifacts
@@ -163,7 +163,7 @@ jobs:
             --CDBUILD_SHARED_LIBS=OFF `
             --CDWHISPER_STATIC=ON `
             --runtime=electron `
-            --runtime-version=35.1.5 `
+            --runtime-version=39.8.10 `
             --arch=x64 `
             
           mkdir -p artifacts
@@ -279,7 +279,7 @@ jobs:
             --CDWHISPER_STATIC=ON \
             --CDGGML_METAL=OFF \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=x64 \
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
             
@@ -303,8 +303,10 @@ jobs:
         include:
           - cuda_version: '12.4.0'
             optimized: 'linux-cuda-1240'
+            cuda_archs: '50-real;52-real;61-real;70-real;75-real;80-real;86-real;89-real;89-virtual'
           - cuda_version: '13.0.2'
             optimized: 'linux-cuda-1302'
+            cuda_archs: '75-real;80-real;86-real;89-real;90-real;120-real;120-virtual'
     steps:
       - name: Clone whisper.cpp repository
         uses: actions/checkout@v4
@@ -348,8 +350,9 @@ jobs:
             --CDWHISPER_STATIC=ON \
             --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --CDGGML_CUDA=ON \
+            "--CDCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}" \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=x64
           
           mkdir -p artifacts
@@ -399,7 +402,7 @@ jobs:
             --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --CDGGML_VULKAN=ON \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=x64
             
           mkdir -p artifacts
@@ -443,7 +446,7 @@ jobs:
             --CDWHISPER_STATIC=ON \
             --CDCMAKE_POSITION_INDEPENDENT_CODE=ON \
             --runtime=electron \
-            --runtime-version=35.1.5 \
+            --runtime-version=39.8.10 \
             --arch=x64
             
           mkdir -p artifacts
