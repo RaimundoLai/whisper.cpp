@@ -10,6 +10,7 @@
 .DS_Store
 .vimspector.json
 /CMakeSettings.json
+/CMakeUserPresets.json
 /talk-llama.dSYM/
 
 build/
@@ -65,3 +66,6 @@ local.properties
 .log
 .exe
 examples/whisper.wasm/dist
+
+# AGENTS
+.pi/SYSTEM.md
