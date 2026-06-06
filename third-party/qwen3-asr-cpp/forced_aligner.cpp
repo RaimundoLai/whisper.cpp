@@ -453,8 +453,12 @@ bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_conte
     ggml_backend_dev_t gpu_dev = use_gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
     bool copy_needed = false;
     if (gpu_dev) {
-        if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Device is GPU. Calling buf_from_host_ptr\n");
-        model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(gpu_dev, &props);
+        if (props.caps.buffer_from_host_ptr) {
+            if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Device is GPU. Calling buf_from_host_ptr\n");
+            model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        }
         if (!model_.buffer) {
             if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Allocating VRAM for fallback deep copy\n");
             // Unify memory failed or not supported (e.g. CUDA on PC). Allocate actual VRAM buffer and set flag to deep copy.
