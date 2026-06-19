@@ -1239,7 +1239,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
-        GGML_ASSERT(*cur_backend_id != -1);
+        if (*cur_backend_id == -1) {
+            fprintf(stderr, "GGML_ASSERT failed: node '%s', op '%s' (%d) has no supported backend!\n", node->name, ggml_op_name(node->op), node->op);
+            GGML_ASSERT(*cur_backend_id != -1);
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied

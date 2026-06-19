@@ -503,6 +503,7 @@ extern "C" {
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
+        GGML_OP_NORM_AFFINE,
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
@@ -584,6 +585,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_AA_SNAKE_BETA,
+
         GGML_OP_COUNT,
     };
 
@@ -621,6 +624,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1317,6 +1321,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_siglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_siglu_swapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // A: n columns, r rows,
     // B: n columns, r rows,
     GGML_API struct ggml_tensor * ggml_glu_split(
@@ -1350,6 +1362,11 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_siglu_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor * ggml_swiglu_oai(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1366,6 +1383,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_norm_affine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * b,
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_rms_norm(
@@ -2059,6 +2083,14 @@ extern "C" {
             int                   s0,  // stride
             int                   p0,  // padding
             int                   d0); // dilation
+
+    GGML_API struct ggml_tensor * ggml_aa_snake_beta(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * log_alpha,
+            struct ggml_tensor  * log_beta,
+            struct ggml_tensor  * us_filter,
+            struct ggml_tensor  * ds_filter);
 
     GGML_API struct ggml_tensor * ggml_conv_2d(
             struct ggml_context * ctx,

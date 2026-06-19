@@ -863,6 +863,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_NORM:
+            case GGML_OP_NORM_AFFINE:
             case GGML_OP_RMS_NORM:
             case GGML_OP_RMS_NORM_BACK:
             case GGML_OP_GROUP_NORM:
@@ -999,7 +1000,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
-            case GGML_OP_GLU: {
+            case GGML_OP_GLU:
+            case GGML_OP_AA_SNAKE_BETA: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             default: {

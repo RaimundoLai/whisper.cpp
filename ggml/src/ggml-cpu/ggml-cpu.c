@@ -1808,6 +1808,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_norm(params, tensor);
             } break;
+        case GGML_OP_NORM_AFFINE:
+            {
+                ggml_compute_forward_norm_affine(params, tensor);
+            } break;
         case GGML_OP_RMS_NORM:
             {
                 ggml_compute_forward_rms_norm(params, tensor);
@@ -2022,6 +2026,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
+            } break;
+        case GGML_OP_AA_SNAKE_BETA:
+            {
+                ggml_compute_forward_aa_snake_beta(params, tensor);
             } break;
         case GGML_OP_GET_REL_POS:
             {
@@ -2283,6 +2291,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2294,10 +2303,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
+        case GGML_OP_AA_SNAKE_BETA:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:

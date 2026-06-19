@@ -194,7 +194,7 @@ set_target_properties(parakeet PROPERTIES
 )
 
 target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ${CRISP_AUDIO_DIR}/include ../ggml/src)
-target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
+target_compile_features   (whisper PUBLIC cxx_std_20) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_BIG_ENDIAN)
