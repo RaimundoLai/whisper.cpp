@@ -172,16 +172,15 @@ add_library(whisper
             ${CRISPASR_SOURCES}
             )
 
-# Define project version for standalone build if not set
-if(NOT DEFINED PROJECT_VERSION)
-    set(PROJECT_VERSION "1.8.2")
-endif()
+add_library(parakeet
+            ../include/parakeet.h
+            parakeet-arch.h
+            parakeet.cpp
+            )
 
-if(NOT DEFINED SOVERSION)
-    set(SOVERSION 1)
-endif()
-
-target_compile_definitions(whisper PRIVATE WHISPER_VERSION="${PROJECT_VERSION}" CRISPASR_VERSION="0.6.6" CRISPASR_RNNOISE=1)
+target_include_directories(parakeet PUBLIC . ../include)
+target_compile_features   (parakeet PUBLIC cxx_std_11)
+target_link_libraries(parakeet PUBLIC ggml Threads::Threads)
 
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
@@ -189,15 +188,25 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
+set_target_properties(parakeet PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${SOVERSION}
+)
+
 target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ${CRISP_AUDIO_DIR}/include ../ggml/src)
-target_compile_features   (whisper PUBLIC cxx_std_20)
+target_compile_features   (whisper PUBLIC cxx_std_20) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_BIG_ENDIAN)
+    set(PARAKEET_EXTRA_FLAGS ${PARAKEET_EXTRA_FLAGS} -DPARAKEET_BIG_ENDIAN)
 endif()
 
 if (WHISPER_EXTRA_FLAGS)
     target_compile_options(whisper PRIVATE ${WHISPER_EXTRA_FLAGS})
+endif()
+
+if (PARAKEET_EXTRA_FLAGS)
+    target_compile_options(parakeet PRIVATE ${PARAKEET_EXTRA_FLAGS})
 endif()
 
 find_package(Threads REQUIRED)
@@ -240,4 +249,7 @@ endif()
 if (BUILD_SHARED_LIBS)
     set_target_properties(whisper PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(whisper PRIVATE WHISPER_SHARED WHISPER_BUILD)
+
+    set_target_properties(parakeet PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(parakeet PRIVATE PARAKEET_SHARED PARAKEET_BUILD)
 endif()

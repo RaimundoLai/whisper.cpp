@@ -6,6 +6,37 @@
 
 #include "whisper.h"
 
+// Rename stb_vorbis and miniaudio symbols to avoid duplicate symbol conflicts
+// when linked together with whisper library targets containing CrispASR.
+#define stb_vorbis_close common_stb_vorbis_close
+#define stb_vorbis_decode_filename common_stb_vorbis_decode_filename
+#define stb_vorbis_decode_frame_pushdata common_stb_vorbis_decode_frame_pushdata
+#define stb_vorbis_decode_memory common_stb_vorbis_decode_memory
+#define stb_vorbis_flush_pushdata common_stb_vorbis_flush_pushdata
+#define stb_vorbis_get_comment common_stb_vorbis_get_comment
+#define stb_vorbis_get_error common_stb_vorbis_get_error
+#define stb_vorbis_get_file_offset common_stb_vorbis_get_file_offset
+#define stb_vorbis_get_frame_float common_stb_vorbis_get_frame_float
+#define stb_vorbis_get_frame_short common_stb_vorbis_get_frame_short
+#define stb_vorbis_get_frame_short_interleaved common_stb_vorbis_get_frame_short_interleaved
+#define stb_vorbis_get_info common_stb_vorbis_get_info
+#define stb_vorbis_get_sample_offset common_stb_vorbis_get_sample_offset
+#define stb_vorbis_get_samples_float common_stb_vorbis_get_samples_float
+#define stb_vorbis_get_samples_float_interleaved common_stb_vorbis_get_samples_float_interleaved
+#define stb_vorbis_get_samples_short common_stb_vorbis_get_samples_short
+#define stb_vorbis_get_samples_short_interleaved common_stb_vorbis_get_samples_short_interleaved
+#define stb_vorbis_open_file common_stb_vorbis_open_file
+#define stb_vorbis_open_file_section common_stb_vorbis_open_file_section
+#define stb_vorbis_open_filename common_stb_vorbis_open_filename
+#define stb_vorbis_open_memory common_stb_vorbis_open_memory
+#define stb_vorbis_open_pushdata common_stb_vorbis_open_pushdata
+#define stb_vorbis_seek common_stb_vorbis_seek
+#define stb_vorbis_seek_frame common_stb_vorbis_seek_frame
+#define stb_vorbis_seek_start common_stb_vorbis_seek_start
+#define stb_vorbis_stream_length_in_samples common_stb_vorbis_stream_length_in_samples
+#define stb_vorbis_stream_length_in_seconds common_stb_vorbis_stream_length_in_seconds
+#define ma_atomic_global_lock common_ma_atomic_global_lock
+
 // third-party utilities
 // use your favorite implementations
 #define STB_VORBIS_HEADER_ONLY
@@ -23,6 +54,7 @@
 #define MA_NO_GENERATION
 #define MA_NO_RESOURCE_MANAGER
 #define MA_NO_NODE_GRAPH
+#define MA_API static
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 

@@ -1808,6 +1808,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_norm(params, tensor);
             } break;
+        case GGML_OP_NORM_AFFINE:
+            {
+                ggml_compute_forward_norm_affine(params, tensor);
+            } break;
         case GGML_OP_RMS_NORM:
             {
                 ggml_compute_forward_rms_norm(params, tensor);
@@ -1911,6 +1915,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_IM2COL_3D:
             {
                 ggml_compute_forward_im2col_3d(params, tensor);
+            } break;
+        case GGML_OP_COL2IM_1D:
+            {
+                ggml_compute_forward_col2im_1d(params, tensor);
             } break;
         case GGML_OP_CONV_2D:
             {
@@ -2018,6 +2026,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
+            } break;
+        case GGML_OP_AA_SNAKE_BETA:
+            {
+                ggml_compute_forward_aa_snake_beta(params, tensor);
             } break;
         case GGML_OP_GET_REL_POS:
             {
@@ -2279,6 +2291,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2290,10 +2303,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
+        case GGML_OP_AA_SNAKE_BETA:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -2343,6 +2358,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_3D:
         case GGML_OP_CONV_2D_DW:
+        case GGML_OP_COL2IM_1D:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
@@ -2943,7 +2959,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
-                        const int64_t K   = node->src[5]->ne[1];  // state is (D, K, n_seqs)
+                        const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
