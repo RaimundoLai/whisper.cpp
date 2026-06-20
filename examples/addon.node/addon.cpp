@@ -1672,10 +1672,10 @@ Napi::Value transcribe(const Napi::CallbackInfo& info) {
             options.Set("aligner_model", options.Get("aligner"));
         }
         return qwenASR(info);
-    } else if (backend == "parakeet" || backend == "vibevoice" || backend == "voxtral" || backend == "voxtral4b") {
-        return crispasrASR(info);
-    } else {
+    } else if (backend == "whisper") {
         return whisper(info);
+    } else {
+        return crispasrASR(info);
     }
 }
 
@@ -1717,10 +1717,10 @@ public:
             if (options.Has("aligner") && !options.Has("aligner_model")) {
                 options.Set("aligner_model", options.Get("aligner"));
             }
-        } else if (backend == "parakeet" || backend == "vibevoice" || backend == "voxtral" || backend == "voxtral4b" || backend == "crisp" || backend == "crisp-asr" || backend == "crisprasr") {
-            ctor = g_crisp_stream_ctor.Value();
-        } else {
+        } else if (backend == "whisper") {
             ctor = g_whisper_stream_ctor.Value();
+        } else {
+            ctor = g_crisp_stream_ctor.Value();
         }
 
         Napi::Object instance = ctor.New({ options });
