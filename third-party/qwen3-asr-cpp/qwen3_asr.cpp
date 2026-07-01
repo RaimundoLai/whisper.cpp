@@ -157,6 +157,14 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
         }
     }
     result.t_mel_ms = get_time_ms() - t_mel_start;
+
+    if (mel.n_len <= 0) {
+        result.text = "";
+        result.language = params.language == "auto" ? "auto" : params.language;
+        result.success = true;
+        result.t_total_ms = get_time_ms() - t_total_start;
+        return result;
+    }
     
     if (params.print_progress) {
         fprintf(stderr, "Mel spectrogram: [%d, %d]\n", mel.n_mel, mel.n_len);

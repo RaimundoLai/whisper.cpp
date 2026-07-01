@@ -281,6 +281,16 @@ extern "C" {
     int crispasr_session_set_translate(crispasr_session* s, int enable);
     int crispasr_session_set_target_language(crispasr_session* s, const char* lang);
     int crispasr_session_set_ask(crispasr_session* s, const char* prompt);
+    int crispasr_session_set_hotwords(crispasr_session* s, const char* hotwords, float boost);
+    int crispasr_session_set_beam_size(crispasr_session* s, int n);
+    int crispasr_session_set_temperature(crispasr_session* s, float temperature, uint64_t seed);
+    int crispasr_session_set_top_p(crispasr_session* s, float top_p);
+    int crispasr_session_set_min_p(crispasr_session* s, float min_p);
+    int crispasr_session_set_repetition_penalty(crispasr_session* s, float r);
+    int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty);
+    int crispasr_session_set_best_of(crispasr_session* s, int n);
+    int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);
+    int crispasr_session_set_punctuation(crispasr_session* s, int enable);
 }
 
 struct crispasr_addon_result {
@@ -322,6 +332,18 @@ public:
                    bool translate,
                    std::string target_language,
                    std::string context,
+                   std::string hotwords,
+                   float hotwords_boost,
+                   int beam_size,
+                   float temperature,
+                   int seed,
+                   float top_p,
+                   float min_p,
+                   float repetition_penalty,
+                   float frequency_penalty,
+                   int best_of,
+                   int max_new_tokens,
+                   int punctuation,
                    std::string aligner_model_path,
                    std::string vad_model_path,
                    float vad_threshold,
@@ -344,6 +366,18 @@ public:
           m_translate(translate),
           m_target_language(std::move(target_language)),
           m_context(std::move(context)),
+          m_hotwords(std::move(hotwords)),
+          m_hotwords_boost(hotwords_boost),
+          m_beam_size(beam_size),
+          m_temperature(temperature),
+          m_seed(seed),
+          m_top_p(top_p),
+          m_min_p(min_p),
+          m_repetition_penalty(repetition_penalty),
+          m_frequency_penalty(frequency_penalty),
+          m_best_of(best_of),
+          m_max_new_tokens(max_new_tokens),
+          m_punctuation(punctuation),
           m_aligner_model_path(std::move(aligner_model_path)),
           m_vad_model_path(std::move(vad_model_path)),
           m_vad_threshold(vad_threshold),
@@ -485,6 +519,36 @@ public:
         }
         if (!m_context.empty()) {
             crispasr_session_set_ask(session, m_context.c_str());
+        }
+        if (!m_hotwords.empty()) {
+            crispasr_session_set_hotwords(session, m_hotwords.c_str(), m_hotwords_boost);
+        }
+        if (m_beam_size > 1) {
+            crispasr_session_set_beam_size(session, m_beam_size);
+        }
+        if (m_temperature >= 0.0f) {
+            crispasr_session_set_temperature(session, m_temperature, m_seed >= 0 ? static_cast<uint64_t>(m_seed) : 0ULL);
+        }
+        if (m_top_p >= 0.0f) {
+            crispasr_session_set_top_p(session, m_top_p);
+        }
+        if (m_min_p >= 0.0f) {
+            crispasr_session_set_min_p(session, m_min_p);
+        }
+        if (m_repetition_penalty >= 0.0f) {
+            crispasr_session_set_repetition_penalty(session, m_repetition_penalty);
+        }
+        if (m_frequency_penalty >= 0.0f) {
+            crispasr_session_set_frequency_penalty(session, m_frequency_penalty);
+        }
+        if (m_best_of > 0) {
+            crispasr_session_set_best_of(session, m_best_of);
+        }
+        if (m_max_new_tokens > 0) {
+            crispasr_session_set_max_new_tokens(session, m_max_new_tokens);
+        }
+        if (m_punctuation >= 0) {
+            crispasr_session_set_punctuation(session, m_punctuation);
         }
 
         // Load ForcedAligner if path provided
@@ -675,6 +739,18 @@ private:
     bool m_translate;
     std::string m_target_language;
     std::string m_context;
+    std::string m_hotwords;
+    float m_hotwords_boost;
+    int m_beam_size;
+    float m_temperature;
+    int m_seed;
+    float m_top_p;
+    float m_min_p;
+    float m_repetition_penalty;
+    float m_frequency_penalty;
+    int m_best_of;
+    int m_max_new_tokens;
+    int m_punctuation;
     std::string m_aligner_model_path;
     std::string m_vad_model_path;
     float m_vad_threshold;
@@ -704,6 +780,9 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
     std::string backend_name = "";
     if (options.Has("backend") && options.Get("backend").IsString()) {
         backend_name = options.Get("backend").As<Napi::String>();
+        if (backend_name == "crispasr" || backend_name == "CrispASR") {
+            backend_name = "";
+        }
     }
 
     std::vector<float> pcmf32;
@@ -767,6 +846,82 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         context = options.Get("context").As<Napi::String>();
     }
 
+    std::string hotwords = "";
+    if (options.Has("hotwords") && options.Get("hotwords").IsString()) {
+        hotwords = options.Get("hotwords").As<Napi::String>();
+    }
+
+    float hotwords_boost = 1.5f;
+    if (options.Has("hotwords_boost") && options.Get("hotwords_boost").IsNumber()) {
+        hotwords_boost = options.Get("hotwords_boost").As<Napi::Number>().FloatValue();
+    } else if (options.Has("hotwords-boost") && options.Get("hotwords-boost").IsNumber()) {
+        hotwords_boost = options.Get("hotwords-boost").As<Napi::Number>().FloatValue();
+    }
+
+    int beam_size = 1;
+    if (options.Has("beam_size") && options.Get("beam_size").IsNumber()) {
+        beam_size = options.Get("beam_size").As<Napi::Number>().Int32Value();
+    } else if (options.Has("beam-size") && options.Get("beam-size").IsNumber()) {
+        beam_size = options.Get("beam-size").As<Napi::Number>().Int32Value();
+    }
+
+    float temperature = -1.0f;
+    if (options.Has("temperature") && options.Get("temperature").IsNumber()) {
+        temperature = options.Get("temperature").As<Napi::Number>().FloatValue();
+    }
+
+    int seed = -1;
+    if (options.Has("seed") && options.Get("seed").IsNumber()) {
+        seed = options.Get("seed").As<Napi::Number>().Int32Value();
+    }
+
+    float top_p = -1.0f;
+    if (options.Has("top_p") && options.Get("top_p").IsNumber()) {
+        top_p = options.Get("top_p").As<Napi::Number>().FloatValue();
+    } else if (options.Has("top-p") && options.Get("top-p").IsNumber()) {
+        top_p = options.Get("top-p").As<Napi::Number>().FloatValue();
+    }
+
+    float min_p = -1.0f;
+    if (options.Has("min_p") && options.Get("min_p").IsNumber()) {
+        min_p = options.Get("min_p").As<Napi::Number>().FloatValue();
+    } else if (options.Has("min-p") && options.Get("min-p").IsNumber()) {
+        min_p = options.Get("min-p").As<Napi::Number>().FloatValue();
+    }
+
+    float repetition_penalty = -1.0f;
+    if (options.Has("repetition_penalty") && options.Get("repetition_penalty").IsNumber()) {
+        repetition_penalty = options.Get("repetition_penalty").As<Napi::Number>().FloatValue();
+    } else if (options.Has("repetition-penalty") && options.Get("repetition-penalty").IsNumber()) {
+        repetition_penalty = options.Get("repetition-penalty").As<Napi::Number>().FloatValue();
+    }
+
+    float frequency_penalty = -1.0f;
+    if (options.Has("frequency_penalty") && options.Get("frequency_penalty").IsNumber()) {
+        frequency_penalty = options.Get("frequency_penalty").As<Napi::Number>().FloatValue();
+    } else if (options.Has("frequency-penalty") && options.Get("frequency-penalty").IsNumber()) {
+        frequency_penalty = options.Get("frequency-penalty").As<Napi::Number>().FloatValue();
+    }
+
+    int best_of = -1;
+    if (options.Has("best_of") && options.Get("best_of").IsNumber()) {
+        best_of = options.Get("best_of").As<Napi::Number>().Int32Value();
+    } else if (options.Has("best-of") && options.Get("best-of").IsNumber()) {
+        best_of = options.Get("best-of").As<Napi::Number>().Int32Value();
+    }
+
+    int max_new_tokens = -1;
+    if (options.Has("max_new_tokens") && options.Get("max_new_tokens").IsNumber()) {
+        max_new_tokens = options.Get("max_new_tokens").As<Napi::Number>().Int32Value();
+    } else if (options.Has("max-new-tokens") && options.Get("max-new-tokens").IsNumber()) {
+        max_new_tokens = options.Get("max-new-tokens").As<Napi::Number>().Int32Value();
+    }
+
+    int punctuation = -1;
+    if (options.Has("punctuation")) {
+        punctuation = options.Get("punctuation").As<Napi::Boolean>() ? 1 : 0;
+    }
+
     std::string aligner_model_path = "";
     if (options.Has("aligner_model") && options.Get("aligner_model").IsString()) {
         aligner_model_path = options.Get("aligner_model").As<Napi::String>();
@@ -816,7 +971,9 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
     CrispASRWorker* worker = new CrispASRWorker(
         callback, model_path, backend_name, std::move(pcmf32), n_threads, use_gpu, debug, 
         flash_attn, n_gpu_layers, language,
-        translate, target_language, context, aligner_model_path,
+        translate, target_language, context, hotwords, hotwords_boost, beam_size,
+        temperature, seed, top_p, min_p, repetition_penalty, frequency_penalty, best_of, max_new_tokens, punctuation,
+        aligner_model_path,
         vad_model_path, vad_threshold, min_speech_ms, min_silence_ms, speech_pad_ms, max_speech_ms,
         progress_callback, env
     );
@@ -852,7 +1009,12 @@ public:
         Napi::Env env = info.Env();
         Napi::Object options = info[0].As<Napi::Object>();
         m_model_path = options.Get("model").As<Napi::String>();
-        if (options.Has("backend")) m_backend_name = options.Get("backend").As<Napi::String>();
+        if (options.Has("backend")) {
+            m_backend_name = options.Get("backend").As<Napi::String>();
+            if (m_backend_name == "crispasr" || m_backend_name == "CrispASR") {
+                m_backend_name = "";
+            }
+        }
         if (options.Has("language")) m_language = options.Get("language").As<Napi::String>();
         if (options.Has("n_threads")) m_n_threads = options.Get("n_threads").As<Napi::Number>().Int32Value();
         if (options.Has("use_gpu")) m_use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
@@ -863,6 +1025,61 @@ public:
         if (options.Has("translate")) m_translate = options.Get("translate").As<Napi::Boolean>();
         if (options.Has("target_language")) m_target_language = options.Get("target_language").As<Napi::String>();
         if (options.Has("context")) m_context = options.Get("context").As<Napi::String>();
+        
+        if (options.Has("hotwords") && options.Get("hotwords").IsString()) {
+            m_hotwords = options.Get("hotwords").As<Napi::String>();
+        }
+        if (options.Has("hotwords_boost") && options.Get("hotwords_boost").IsNumber()) {
+            m_hotwords_boost = options.Get("hotwords_boost").As<Napi::Number>().FloatValue();
+        } else if (options.Has("hotwords-boost") && options.Get("hotwords-boost").IsNumber()) {
+            m_hotwords_boost = options.Get("hotwords-boost").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("beam_size") && options.Get("beam_size").IsNumber()) {
+            m_beam_size = options.Get("beam_size").As<Napi::Number>().Int32Value();
+        } else if (options.Has("beam-size") && options.Get("beam-size").IsNumber()) {
+            m_beam_size = options.Get("beam-size").As<Napi::Number>().Int32Value();
+        }
+
+        if (options.Has("temperature") && options.Get("temperature").IsNumber()) {
+            m_temperature = options.Get("temperature").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("seed") && options.Get("seed").IsNumber()) {
+            m_seed = options.Get("seed").As<Napi::Number>().Int32Value();
+        }
+        if (options.Has("top_p") && options.Get("top_p").IsNumber()) {
+            m_top_p = options.Get("top_p").As<Napi::Number>().FloatValue();
+        } else if (options.Has("top-p") && options.Get("top-p").IsNumber()) {
+            m_top_p = options.Get("top-p").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("min_p") && options.Get("min_p").IsNumber()) {
+            m_min_p = options.Get("min_p").As<Napi::Number>().FloatValue();
+        } else if (options.Has("min-p") && options.Get("min-p").IsNumber()) {
+            m_min_p = options.Get("min-p").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("repetition_penalty") && options.Get("repetition_penalty").IsNumber()) {
+            m_repetition_penalty = options.Get("repetition_penalty").As<Napi::Number>().FloatValue();
+        } else if (options.Has("repetition-penalty") && options.Get("repetition-penalty").IsNumber()) {
+            m_repetition_penalty = options.Get("repetition-penalty").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("frequency_penalty") && options.Get("frequency_penalty").IsNumber()) {
+            m_frequency_penalty = options.Get("frequency_penalty").As<Napi::Number>().FloatValue();
+        } else if (options.Has("frequency-penalty") && options.Get("frequency-penalty").IsNumber()) {
+            m_frequency_penalty = options.Get("frequency-penalty").As<Napi::Number>().FloatValue();
+        }
+        if (options.Has("best_of") && options.Get("best_of").IsNumber()) {
+            m_best_of = options.Get("best_of").As<Napi::Number>().Int32Value();
+        } else if (options.Has("best-of") && options.Get("best-of").IsNumber()) {
+            m_best_of = options.Get("best-of").As<Napi::Number>().Int32Value();
+        }
+        if (options.Has("max_new_tokens") && options.Get("max_new_tokens").IsNumber()) {
+            m_max_new_tokens = options.Get("max_new_tokens").As<Napi::Number>().Int32Value();
+        } else if (options.Has("max-new-tokens") && options.Get("max-new-tokens").IsNumber()) {
+            m_max_new_tokens = options.Get("max-new-tokens").As<Napi::Number>().Int32Value();
+        }
+        if (options.Has("punctuation")) {
+            m_punctuation = options.Get("punctuation").As<Napi::Boolean>() ? 1 : 0;
+        }
+
         if (options.Has("aligner") && options.Get("aligner").IsString()) {
             m_aligner_model_path = options.Get("aligner").As<Napi::String>();
         } else if (options.Has("aligner_model") && options.Get("aligner_model").IsString()) {
@@ -936,6 +1153,36 @@ public:
         }
         if (!m_context.empty()) {
             crispasr_session_set_ask(m_session, m_context.c_str());
+        }
+        if (!m_hotwords.empty()) {
+            crispasr_session_set_hotwords(m_session, m_hotwords.c_str(), m_hotwords_boost);
+        }
+        if (m_beam_size > 1) {
+            crispasr_session_set_beam_size(m_session, m_beam_size);
+        }
+        if (m_temperature >= 0.0f) {
+            crispasr_session_set_temperature(m_session, m_temperature, m_seed >= 0 ? static_cast<uint64_t>(m_seed) : 0ULL);
+        }
+        if (m_top_p >= 0.0f) {
+            crispasr_session_set_top_p(m_session, m_top_p);
+        }
+        if (m_min_p >= 0.0f) {
+            crispasr_session_set_min_p(m_session, m_min_p);
+        }
+        if (m_repetition_penalty >= 0.0f) {
+            crispasr_session_set_repetition_penalty(m_session, m_repetition_penalty);
+        }
+        if (m_frequency_penalty >= 0.0f) {
+            crispasr_session_set_frequency_penalty(m_session, m_frequency_penalty);
+        }
+        if (m_best_of > 0) {
+            crispasr_session_set_best_of(m_session, m_best_of);
+        }
+        if (m_max_new_tokens > 0) {
+            crispasr_session_set_max_new_tokens(m_session, m_max_new_tokens);
+        }
+        if (m_punctuation >= 0) {
+            crispasr_session_set_punctuation(m_session, m_punctuation);
         }
 
         if (!m_aligner_model_path.empty()) {
@@ -1478,6 +1725,18 @@ private:
     bool m_translate = false;
     std::string m_target_language = "";
     std::string m_context = "";
+    std::string m_hotwords = "";
+    float m_hotwords_boost = 1.5f;
+    int m_beam_size = 1;
+    float m_temperature = -1.0f;
+    int m_seed = -1;
+    float m_top_p = -1.0f;
+    float m_min_p = -1.0f;
+    float m_repetition_penalty = -1.0f;
+    float m_frequency_penalty = -1.0f;
+    int m_best_of = -1;
+    int m_max_new_tokens = -1;
+    int m_punctuation = -1;
     std::string m_aligner_model_path = "";
     bool m_debug = false;
     int m_n_threads = std::min(4, (int32_t)std::thread::hardware_concurrency());

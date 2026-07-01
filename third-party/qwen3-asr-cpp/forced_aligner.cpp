@@ -1720,6 +1720,12 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
         return result;
     }
     result.t_mel_ms = get_time_ms() - t_mel_start;
+
+    if (mel.n_len <= 0) {
+        result.success = true;
+        result.t_total_ms = get_time_ms() - t_total_start;
+        return result;
+    }
     
     int64_t t_encode_start = get_time_ms();
     std::vector<float> audio_features;
