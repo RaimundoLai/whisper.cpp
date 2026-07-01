@@ -1672,6 +1672,15 @@ Napi::Value transcribe(const Napi::CallbackInfo& info) {
             options.Set("aligner_model", options.Get("aligner"));
         }
         return qwenASR(info);
+    } else if (backend == "qwen-align" || backend == "qwen3-align" || backend == "align") {
+        if (options.Has("aligner") && !options.Has("model")) {
+            options.Set("model", options.Get("aligner"));
+        } else if (options.Has("aligner_model") && !options.Has("model")) {
+            options.Set("model", options.Get("aligner_model"));
+        } else if (options.Has("alignerModel") && !options.Has("model")) {
+            options.Set("model", options.Get("alignerModel"));
+        }
+        return qwenASRAlign(info);
     } else if (backend == "whisper") {
         return whisper(info);
     } else {
