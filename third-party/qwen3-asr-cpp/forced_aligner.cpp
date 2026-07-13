@@ -1677,6 +1677,11 @@ alignment_result ForcedAligner::align(const std::string & audio_path, const std:
                                        const std::string & language) {
     alignment_result result;
     
+    if (text.empty()) {
+        result.success = true;
+        return result;
+    }
+    
     if (!model_loaded_) {
         result.error_msg = "Model not loaded";
         return result;
@@ -1702,6 +1707,12 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
                                        const std::string & language) {
     alignment_result result;
     int64_t t_total_start = get_time_ms();
+    
+    if (text.empty()) {
+        result.success = true;
+        result.t_total_ms = get_time_ms() - t_total_start;
+        return result;
+    }
     
     if (!model_loaded_) {
         result.error_msg = "Model not loaded";

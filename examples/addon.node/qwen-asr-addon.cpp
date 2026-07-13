@@ -1110,7 +1110,7 @@ private:
         qwen3_asr::alignment_result align_res;
         bool has_alignment = false;
         
-        if (m_aligner && !m_aligner_model_path.empty()) {
+        if (m_aligner && !m_aligner_model_path.empty() && !final_text.empty()) {
             std::string detected_lang = m_language.empty() ? stream_lang : m_language;
             align_res = m_aligner->align(audio.data(), audio.size(), final_text, detected_lang);
             has_alignment = align_res.success;
