@@ -2,8 +2,36 @@
 // This file is included by addon.cpp
 
 #include "../../third-party/CrispASR/src/parakeet.h"
+#include "../../third-party/CrispASR/src/qwen3_tts.h"
 #include "whisper.h"
 #include "forced_aligner.h"
+#include <fstream>
+#include <sys/stat.h>
+
+static bool crisp_file_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static std::string crisp_dir_of(const std::string& p) {
+    auto sep = p.find_last_of("/\\");
+    return (sep == std::string::npos) ? std::string(".") : p.substr(0, sep);
+}
+
+static std::string crisp_discover_codec(const std::string& model_path) {
+    const std::string dir = crisp_dir_of(model_path);
+    static const char* candidates[] = {
+        "qwen3-tts-tokenizer-12hz.gguf",
+        "qwen3-tts-tokenizer.gguf",
+        "qwen3-tts-codec.gguf",
+    };
+    for (const char* name : candidates) {
+        std::string p = dir + "/" + name;
+        if (crisp_file_exists(p))
+            return p;
+    }
+    return "";
+}
 
 static std::string extract_clean_text_if_json(const std::string& input) {
     if (input.empty()) return "";
@@ -1766,10 +1794,281 @@ private:
     Napi::ThreadSafeFunction m_tsfn;
 };
 
+// ============================================================================
+// CrispASR / Qwen3-TTS Implementation
+// ============================================================================
+
+class CrispasrTTSWorker : public Napi::AsyncWorker {
+public:
+    CrispasrTTSWorker(Napi::Function& callback,
+                      std::string model_path,
+                      std::string codec_model_path,
+                      std::string text,
+                      std::string voice,
+                      std::string ref_text,
+                      std::string instruct,
+                      std::string language,
+                      std::string output_path,
+                      int n_threads,
+                      bool use_gpu,
+                      float temperature,
+                      uint64_t seed,
+                      Napi::Env env)
+        : Napi::AsyncWorker(callback),
+          m_model_path(std::move(model_path)),
+          m_codec_model_path(std::move(codec_model_path)),
+          m_text(std::move(text)),
+          m_voice(std::move(voice)),
+          m_ref_text(std::move(ref_text)),
+          m_instruct(std::move(instruct)),
+          m_language(std::move(language)),
+          m_output_path(std::move(output_path)),
+          m_n_threads(n_threads),
+          m_use_gpu(use_gpu),
+          m_temperature(temperature),
+          m_seed(seed) {}
+
+    void Execute() override {
+        if (m_model_path.empty()) {
+            SetError("Model path is required for crispasrTTS");
+            return;
+        }
+        if (m_text.empty()) {
+            SetError("Text is required for crispasrTTS");
+            return;
+        }
+
+        struct qwen3_tts_context_params cp = qwen3_tts_context_default_params();
+        cp.n_threads = m_n_threads;
+        cp.verbosity = 0;
+        cp.use_gpu = m_use_gpu;
+        cp.temperature = m_temperature;
+        cp.seed = m_seed;
+
+        struct qwen3_tts_context* ctx = qwen3_tts_init_from_file(m_model_path.c_str(), cp);
+        if (!ctx) {
+            SetError("Failed to initialize Qwen3-TTS context from " + m_model_path);
+            return;
+        }
+
+        std::string codec_path = m_codec_model_path;
+        if (codec_path.empty()) {
+            qwen3_tts_free(ctx);
+            SetError("No codec model found for Qwen3-TTS. Please specify codec_model or place qwen3-tts-tokenizer-12hz.gguf next to talker model.");
+            return;
+        }
+
+        if (qwen3_tts_set_codec_path(ctx, codec_path.c_str()) != 0) {
+            qwen3_tts_free(ctx);
+            SetError("Failed to load codec model from " + codec_path);
+            return;
+        }
+
+        qwen3_tts_set_temperature(ctx, m_temperature);
+        qwen3_tts_set_seed(ctx, m_seed);
+
+        if (!m_language.empty()) {
+            std::string lang = m_language;
+            std::transform(lang.begin(), lang.end(), lang.begin(), [](unsigned char c){ return std::tolower(c); });
+            if (lang == "zh") lang = "chinese";
+            else if (lang == "en") lang = "english";
+            else if (lang == "ja") lang = "japanese";
+            else if (lang == "ko") lang = "korean";
+            else if (lang == "de") lang = "german";
+            else if (lang == "fr") lang = "french";
+            else if (lang == "ru") lang = "russian";
+            else if (lang == "pt") lang = "portuguese";
+            else if (lang == "es") lang = "spanish";
+            else if (lang == "it") lang = "italian";
+            qwen3_tts_set_language_by_name(ctx, lang.c_str());
+        }
+
+        if (qwen3_tts_is_voice_design(ctx)) {
+            if (!m_instruct.empty()) {
+                qwen3_tts_set_instruct(ctx, m_instruct.c_str());
+            }
+        } else if (qwen3_tts_is_custom_voice(ctx)) {
+            if (!m_voice.empty()) {
+                qwen3_tts_set_speaker_by_name(ctx, m_voice.c_str());
+            } else {
+                const char* first_spk = qwen3_tts_get_speaker_name(ctx, 0);
+                if (first_spk) {
+                    qwen3_tts_set_speaker_by_name(ctx, first_spk);
+                }
+            }
+            if (!m_instruct.empty()) {
+                qwen3_tts_set_cv_style_instruct(ctx, m_instruct.c_str());
+            }
+        } else if (!m_voice.empty()) {
+            if (m_voice.size() > 4 && (m_voice.substr(m_voice.size() - 4) == ".wav" || m_voice.substr(m_voice.size() - 4) == ".WAV")) {
+                if (!m_ref_text.empty()) {
+                    qwen3_tts_set_voice_prompt_with_text(ctx, m_voice.c_str(), m_ref_text.c_str());
+                } else {
+                    qwen3_tts_set_voice_prompt(ctx, m_voice.c_str());
+                }
+            } else {
+                qwen3_tts_load_voice_pack(ctx, m_voice.c_str());
+            }
+        }
+
+        int n_samples = 0;
+        float* pcm = qwen3_tts_synthesize(ctx, m_text.c_str(), &n_samples);
+        if (!pcm || n_samples <= 0) {
+            qwen3_tts_free(ctx);
+            SetError("Qwen3-TTS synthesis failed or returned empty audio");
+            return;
+        }
+
+        m_pcm_samples.assign(pcm, pcm + n_samples);
+        qwen3_tts_pcm_free(pcm);
+        qwen3_tts_free(ctx);
+
+        if (!m_output_path.empty()) {
+            std::ofstream fout(m_output_path, std::ios::binary);
+            if (fout.is_open()) {
+                int sample_rate = 24000;
+                int num_channels = 1;
+                int bits_per_sample = 16;
+                int data_size = n_samples * (bits_per_sample / 8);
+                int chunk_size = 36 + data_size;
+                int byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
+                int block_align = num_channels * (bits_per_sample / 8);
+
+                fout.write("RIFF", 4);
+                fout.write(reinterpret_cast<const char*>(&chunk_size), 4);
+                fout.write("WAVEfmt ", 8);
+                int fmt_chunk_size = 16;
+                int audio_format = 1;
+                fout.write(reinterpret_cast<const char*>(&fmt_chunk_size), 4);
+                fout.write(reinterpret_cast<const char*>(&audio_format), 2);
+                fout.write(reinterpret_cast<const char*>(&num_channels), 2);
+                fout.write(reinterpret_cast<const char*>(&sample_rate), 4);
+                fout.write(reinterpret_cast<const char*>(&byte_rate), 4);
+                fout.write(reinterpret_cast<const char*>(&block_align), 2);
+                fout.write(reinterpret_cast<const char*>(&bits_per_sample), 2);
+                fout.write("data", 4);
+                fout.write(reinterpret_cast<const char*>(&data_size), 4);
+
+                for (int i = 0; i < n_samples; ++i) {
+                    float s = std::max(-1.0f, std::min(1.0f, m_pcm_samples[i]));
+                    int16_t val = (s < 0) ? static_cast<int16_t>(s * 32768.0f) : static_cast<int16_t>(s * 32767.0f);
+                    fout.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                }
+                fout.close();
+            }
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object result = Napi::Object::New(Env());
+
+        result.Set("sampleRate", Napi::Number::New(Env(), 24000));
+        result.Set("n_samples", Napi::Number::New(Env(), m_pcm_samples.size()));
+        result.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm_samples.size()) / 24000.0));
+
+        if (!m_output_path.empty()) {
+            result.Set("path", Napi::String::New(Env(), m_output_path));
+        }
+
+        Napi::Float32Array buffer = Napi::Float32Array::New(Env(), m_pcm_samples.size());
+        for (size_t i = 0; i < m_pcm_samples.size(); ++i) {
+            buffer[i] = m_pcm_samples[i];
+        }
+        result.Set("buffer", buffer);
+
+        Callback().Call({Env().Null(), result});
+    }
+
+private:
+    std::string m_model_path;
+    std::string m_codec_model_path;
+    std::string m_text;
+    std::string m_voice;
+    std::string m_ref_text;
+    std::string m_instruct;
+    std::string m_language;
+    std::string m_output_path;
+    int m_n_threads;
+    bool m_use_gpu;
+    float m_temperature;
+    uint64_t m_seed;
+    std::vector<float> m_pcm_samples;
+};
+
+Napi::Value crispasrTTS(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "Usage: crispasrTTS(options, callback)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    Napi::Function callback = info[1].As<Napi::Function>();
+
+    std::string model_path = (options.Has("model") && options.Get("model").IsString())
+                                 ? options.Get("model").As<Napi::String>().Utf8Value()
+                                 : std::string("");
+    std::string codec_model_path;
+    if (options.Has("codec_model") && options.Get("codec_model").IsString()) {
+        codec_model_path = options.Get("codec_model").As<Napi::String>().Utf8Value();
+    } else if (options.Has("codecModel") && options.Get("codecModel").IsString()) {
+        codec_model_path = options.Get("codecModel").As<Napi::String>().Utf8Value();
+    }
+
+    std::string text = (options.Has("text") && options.Get("text").IsString())
+                           ? options.Get("text").As<Napi::String>().Utf8Value()
+                           : std::string("");
+    std::string voice = (options.Has("voice") && options.Get("voice").IsString())
+                            ? options.Get("voice").As<Napi::String>().Utf8Value()
+                            : std::string("");
+    std::string ref_text;
+    if (options.Has("ref_text") && options.Get("ref_text").IsString()) {
+        ref_text = options.Get("ref_text").As<Napi::String>().Utf8Value();
+    } else if (options.Has("refText") && options.Get("refText").IsString()) {
+        ref_text = options.Get("refText").As<Napi::String>().Utf8Value();
+    }
+
+    std::string instruct = (options.Has("instruct") && options.Get("instruct").IsString())
+                               ? options.Get("instruct").As<Napi::String>().Utf8Value()
+                               : std::string("");
+    std::string language = (options.Has("language") && options.Get("language").IsString())
+                               ? options.Get("language").As<Napi::String>().Utf8Value()
+                               : std::string("zh");
+
+    std::string output_path;
+    if (options.Has("output_path") && options.Get("output_path").IsString()) {
+        output_path = options.Get("output_path").As<Napi::String>().Utf8Value();
+    } else if (options.Has("outputPath") && options.Get("outputPath").IsString()) {
+        output_path = options.Get("outputPath").As<Napi::String>().Utf8Value();
+    }
+
+    int n_threads = (options.Has("n_threads") && options.Get("n_threads").IsNumber())
+                        ? options.Get("n_threads").As<Napi::Number>().Int32Value()
+                        : std::min(4, static_cast<int32_t>(std::thread::hardware_concurrency()));
+    bool use_gpu = (options.Has("use_gpu") && options.Get("use_gpu").IsBoolean())
+                       ? options.Get("use_gpu").As<Napi::Boolean>().Value()
+                       : true;
+    float temperature = (options.Has("temperature") && options.Get("temperature").IsNumber())
+                            ? options.Get("temperature").As<Napi::Number>().FloatValue()
+                            : 0.9f;
+    uint64_t seed = (options.Has("seed") && options.Get("seed").IsNumber())
+                        ? options.Get("seed").As<Napi::Number>().Int64Value()
+                        : 42;
+
+    CrispasrTTSWorker* worker = new CrispasrTTSWorker(
+        callback, model_path, codec_model_path, text, voice, ref_text, instruct, language,
+        output_path, n_threads, use_gpu, temperature, seed, env);
+    worker->Queue();
+    return env.Undefined();
+}
+
 void InitCrispASR(Napi::Env env, Napi::Object exports) {
     printf("InitCrispASR: Initializing CrispASR exports...\n");
     exports.Set("parakeetASR", Napi::Function::New(env, parakeetASR));
     exports.Set("crispasrASR", Napi::Function::New(env, crispasrASR));
     exports.Set("distilWhisper", Napi::Function::New(env, distilWhisper));
+    exports.Set("crispasrTTS", Napi::Function::New(env, crispasrTTS));
+    exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
     CrispASRStream::Init(env, exports);
 }

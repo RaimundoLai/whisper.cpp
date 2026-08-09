@@ -16,7 +16,7 @@ npx cmake-js compile -T addon.node -B Release \
   --runtime=electron \
   --runtime-version=39.8.10 \
   --arch=arm64
-cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
+cp build/Release/addon.node artifacts/addon-macos-arm64.node
 
 echo "Clearing build cache..."
 rm -rf build/CMakeCache.txt build/CMakeFiles/
@@ -33,6 +33,6 @@ npx cmake-js compile -T addon.node -B Release \
   --runtime-version=39.8.10 \
   --arch=arm64
 
-cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
+cp build/Release/addon.node artifacts/addon-macos-arm64-coreml.node
 
 echo "Build complete."
