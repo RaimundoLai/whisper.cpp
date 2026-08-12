@@ -1,6 +1,7 @@
 #include "napi.h"
 #include "common.h"
 #include "common-whisper.h"
+#include "model-cache.h"
 #include "whisper.h"
 #include "sense-voice.h"
 
@@ -118,6 +119,8 @@ struct whisper_params {
     bool comma_in_time   = true;
     bool output_tokens   = false; // [New] Option to control whether to output token data
     bool debug_mode      = false;
+    bool reuse_instance  = false;
+    int64_t auto_release_ms = 0;
 
     std::string language = "en";
     std::string prompt;
@@ -347,14 +350,33 @@ private:
             exit(0);
         }
 
-        struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = params.use_gpu;
-        cparams.flash_attn = params.flash_attn;
-        struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::WHISPER));
 
-        if (ctx == nullptr) {
-            fprintf(stderr, "error: failed to initialize whisper context\n");
-            return 3;
+        struct whisper_context * ctx = nullptr;
+        bool owned = false;
+
+        if (params.reuse_instance) {
+            ctx = static_cast<struct whisper_context*>(
+                cache.acquire(ModelType::WHISPER, params.model, params.use_gpu));
+        }
+
+        if (!ctx) {
+            struct whisper_context_params cparams = whisper_context_default_params();
+            cparams.use_gpu = params.use_gpu;
+            cparams.flash_attn = params.flash_attn;
+            ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+
+            if (ctx == nullptr) {
+                fprintf(stderr, "error: failed to initialize whisper context\n");
+                return 3;
+            }
+
+            if (params.reuse_instance) {
+                cache.store(ModelType::WHISPER, ctx, params.model, params.use_gpu, "", params.auto_release_ms);
+            } else {
+                owned = true;
+            }
         }
 
         if (!params.pcmf32.empty()) {
@@ -639,7 +661,11 @@ private:
         }
 
         whisper_print_timings(ctx);
-        whisper_free(ctx);
+        if (owned) {
+            whisper_free(ctx);
+        } else {
+            cache.markIdle(ModelType::WHISPER);
+        }
         return 0;
     }
 };
@@ -707,6 +733,12 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     if (whisper_params.Has("debug") && whisper_params.Get("debug").IsBoolean()) {
         params.debug_mode = whisper_params.Get("debug").As<Napi::Boolean>();
         g_addon_debug_mode.store(params.debug_mode);
+    }
+    if (whisper_params.Has("reuse_instance") && whisper_params.Get("reuse_instance").IsBoolean()) {
+        params.reuse_instance = whisper_params.Get("reuse_instance").As<Napi::Boolean>();
+    }
+    if (whisper_params.Has("auto_release_ms") && whisper_params.Get("auto_release_ms").IsNumber()) {
+        params.auto_release_ms = whisper_params.Get("auto_release_ms").As<Napi::Number>().Int64Value();
     }
 
     Napi::Function progress_callback;
@@ -1792,6 +1824,35 @@ private:
     Napi::ObjectReference m_underlying;
 };
 
+Napi::Value freeModelCache(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    auto& cache = ModelCache::instance();
+    if (info.Length() > 0 && info[0].IsString()) {
+        std::string typeStr = info[0].As<Napi::String>();
+        ModelType type;
+        if (stringToModelType(typeStr, type)) {
+            cache.release(type);
+        } else {
+            cache.releaseAll();
+        }
+    } else {
+        cache.releaseAll();
+    }
+    return env.Undefined();
+}
+
+Napi::Value getModelCacheInfo(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string jsonInfo = ModelCache::instance().getInfo();
+    return Napi::String::New(env, jsonInfo);
+}
+
+Napi::Value checkModelCacheAutoRelease(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ModelCache::instance().checkAutoRelease();
+    return env.Undefined();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     whisper_log_set(addon_whisper_log_callback, nullptr);
 
@@ -1822,6 +1883,18 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
         Napi::String::New(env, "transcribe"),
         Napi::Function::New(env, transcribe)
+    );
+    exports.Set(
+        Napi::String::New(env, "freeModelCache"),
+        Napi::Function::New(env, freeModelCache)
+    );
+    exports.Set(
+        Napi::String::New(env, "getModelCacheInfo"),
+        Napi::Function::New(env, getModelCacheInfo)
+    );
+    exports.Set(
+        Napi::String::New(env, "checkModelCacheAutoRelease"),
+        Napi::Function::New(env, checkModelCacheAutoRelease)
     );
 
     InitNEC(env, exports);

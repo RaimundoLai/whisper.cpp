@@ -1,6 +1,7 @@
 // qwen-asr-addon.cpp - Qwen3 ASR N-API bindings
 // This file is included by addon.cpp
 
+#include "model-cache.h"
 #include "qwen3_asr.h"
 #include "forced_aligner.h"
 
@@ -52,6 +53,8 @@ public:
                   int max_speech_ms,
                   int min_silence_ms,
                   int speech_pad_ms,
+                  bool reuse_instance,
+                  int64_t auto_release_ms,
                   Napi::Function progress_callback,
                   Napi::Env env)
         : Napi::AsyncWorker(callback),
@@ -69,6 +72,8 @@ public:
           m_max_speech_ms(max_speech_ms),
           m_min_silence_ms(min_silence_ms),
           m_speech_pad_ms(speech_pad_ms),
+          m_reuse_instance(reuse_instance),
+          m_auto_release_ms(auto_release_ms),
           env(env),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
@@ -90,20 +95,61 @@ public:
     }
 
     void Execute() override {
-        qwen3_asr::Qwen3ASR asr;
-        if (!asr.load_model(m_model_path, m_use_gpu, m_debug)) {
-            SetError("Failed to load model: " + asr.get_error());
-            return;
+        auto& cache = ModelCache::instance();
+
+        std::lock_guard<std::mutex> asr_lock(cache.mutex(ModelType::QWEN3_ASR));
+        qwen3_asr::Qwen3ASR* asr_ptr = nullptr;
+        bool asr_owned = false;
+
+        if (m_reuse_instance) {
+            asr_ptr = static_cast<qwen3_asr::Qwen3ASR*>(
+                cache.acquire(ModelType::QWEN3_ASR, m_model_path, m_use_gpu));
         }
 
-        qwen3_asr::ForcedAligner aligner;
-        bool use_aligner = !m_aligner_model_path.empty();
-        if (use_aligner) {
-            if (!aligner.load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
-                SetError("Failed to load aligner model: " + aligner.get_error());
+        if (!asr_ptr) {
+            asr_ptr = new qwen3_asr::Qwen3ASR();
+            if (!asr_ptr->load_model(m_model_path, m_use_gpu, m_debug)) {
+                SetError("Failed to load model: " + asr_ptr->get_error());
+                delete asr_ptr;
                 return;
             }
+            if (m_reuse_instance) {
+                cache.store(ModelType::QWEN3_ASR, asr_ptr, m_model_path, m_use_gpu, "", m_auto_release_ms);
+            } else {
+                asr_owned = true;
+            }
         }
+
+        qwen3_asr::Qwen3ASR& asr = *asr_ptr;
+
+        std::lock_guard<std::mutex> aligner_lock(cache.mutex(ModelType::QWEN3_ALIGNER));
+        qwen3_asr::ForcedAligner* aligner_ptr = nullptr;
+        bool aligner_owned = false;
+        bool use_aligner = !m_aligner_model_path.empty();
+
+        if (use_aligner) {
+            if (m_reuse_instance) {
+                aligner_ptr = static_cast<qwen3_asr::ForcedAligner*>(
+                    cache.acquire(ModelType::QWEN3_ALIGNER, m_aligner_model_path, m_use_gpu));
+            }
+            if (!aligner_ptr) {
+                aligner_ptr = new qwen3_asr::ForcedAligner();
+                if (!aligner_ptr->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                    if (asr_owned) { delete asr_ptr; }
+                    else { cache.markIdle(ModelType::QWEN3_ASR); }
+                    SetError("Failed to load aligner model: " + aligner_ptr->get_error());
+                    delete aligner_ptr;
+                    return;
+                }
+                if (m_reuse_instance) {
+                    cache.store(ModelType::QWEN3_ALIGNER, aligner_ptr, m_aligner_model_path, m_use_gpu, "", m_auto_release_ms);
+                } else {
+                    aligner_owned = true;
+                }
+            }
+        }
+
+        qwen3_asr::ForcedAligner& aligner = *aligner_ptr;
 
         auto abort_flag = m_should_abort;
         auto was_aborted = m_was_aborted;
@@ -116,7 +162,6 @@ public:
             int global_progress = static_cast<int>((m_progress_base + chunk_progress * m_progress_scale) * 100);
             if (global_progress > 100) global_progress = 100;
             
-            // Limit progress updates to avoid spamming the JS thread
             static int last_reported = -1;
             if (global_progress != last_reported) {
                 last_reported = global_progress;
@@ -136,6 +181,8 @@ public:
             m_progress_scale = 1.0f;
             auto res = asr.transcribe(m_pcmf32.data(), m_pcmf32.size(), tp);
             if (!res.success) {
+                if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
+                if (use_aligner) { if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); } }
                 SetError("Transcription failed: " + res.error_msg);
                 return;
             }
@@ -167,6 +214,8 @@ public:
             
             whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
             if (!vctx) {
+                if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
+                if (use_aligner) { if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); } }
                 SetError("Failed to initialize whisper VAD context");
                 return;
             }
@@ -175,13 +224,12 @@ public:
             vad_params.threshold = m_vad_threshold;
             vad_params.min_speech_duration_ms = m_min_speech_ms;
             vad_params.min_silence_duration_ms = m_min_silence_ms;
-            vad_params.max_speech_duration_s = FLT_MAX;  // Don't use whisper's splitting (gets undone by post-merge)
+            vad_params.max_speech_duration_s = FLT_MAX;
             vad_params.speech_pad_ms = m_speech_pad_ms;
 
             whisper_vad_segments* segments = whisper_vad_segments_from_samples(vctx, vad_params, m_pcmf32.data(), m_pcmf32.size());
             if (segments) {
                 int n_segments = whisper_vad_segments_n_segments(segments);
-                // Calculate max samples per chunk for manual splitting (SenseVoice pattern)
                 const int64_t max_samples_per_chunk = (static_cast<int64_t>(m_max_speech_ms) * 16000) / 1000;
 
                 for (int i = 0; i < n_segments; i++) {
@@ -199,7 +247,6 @@ public:
                     if (seg_end_sample > (int64_t)m_pcmf32.size()) seg_end_sample = m_pcmf32.size();
                     if (seg_end_sample <= seg_start_sample) continue;
 
-                    // Split segment into smaller chunks if too long (SenseVoice pattern)
                     int64_t chunk_start = seg_start_sample;
                     while (chunk_start < seg_end_sample) {
                         if (ShouldAbort()) {
@@ -250,11 +297,14 @@ public:
                     }
                 }
                 whisper_vad_free_segments(segments);
-                
-                // Ensure 100% is reached at the end of VAD loop
                 OnProgress(100);
             }
             whisper_vad_free(vctx);
+        }
+
+        if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
+        if (use_aligner) {
+            if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); }
         }
     }
 
@@ -349,6 +399,8 @@ private:
     
     float m_progress_base = 0.0f;
     float m_progress_scale = 1.0f;
+    bool m_reuse_instance = false;
+    int64_t m_auto_release_ms = 0;
 
     Napi::Env env;
     Napi::ThreadSafeFunction tsfn;
@@ -462,6 +514,16 @@ Napi::Value qwenASR(const Napi::CallbackInfo& info) {
         speech_pad_ms = options.Get("speech_pad_ms").As<Napi::Number>().Int32Value();
     }
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     // Progress callback (optional)
     Napi::Function progress_callback;
     if (options.Has("progress_callback") && options.Get("progress_callback").IsFunction()) {
@@ -473,6 +535,7 @@ Napi::Value qwenASR(const Napi::CallbackInfo& info) {
         callback, model_path, aligner_model_path, vad_model_path, std::move(pcmf32),
         language, n_threads, max_tokens, debug, use_gpu,
         vad_threshold, min_speech_ms, max_speech_ms, min_silence_ms, speech_pad_ms,
+        reuse_instance, auto_release_ms,
         progress_callback, env);
     worker->Queue();
 
@@ -491,7 +554,9 @@ public:
                        std::string text,
                        std::string language,
                        bool debug,
-                       bool use_gpu)
+                       bool use_gpu,
+                       bool reuse_instance,
+                       int64_t auto_release_ms)
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
           m_pcmf32(std::move(pcmf32)),
@@ -499,18 +564,44 @@ public:
           m_language(std::move(language)),
           m_debug(debug),
           m_use_gpu(use_gpu),
+          m_reuse_instance(reuse_instance),
+          m_auto_release_ms(auto_release_ms),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {}
 
     void Execute() override {
-        qwen3_asr::ForcedAligner aligner;
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> lock(cache.mutex(ModelType::QWEN3_ALIGNER));
 
-        if (!aligner.load_model(m_model_path, m_use_gpu, m_debug)) {
-            SetError("Failed to load aligner model: " + aligner.get_error());
-            return;
+        qwen3_asr::ForcedAligner* aligner_ptr = nullptr;
+        bool owned = false;
+
+        if (m_reuse_instance) {
+            aligner_ptr = static_cast<qwen3_asr::ForcedAligner*>(
+                cache.acquire(ModelType::QWEN3_ALIGNER, m_model_path, m_use_gpu));
         }
 
-        m_result = aligner.align(m_pcmf32.data(), m_pcmf32.size(), m_text, m_language);
+        if (!aligner_ptr) {
+            aligner_ptr = new qwen3_asr::ForcedAligner();
+            if (!aligner_ptr->load_model(m_model_path, m_use_gpu, m_debug)) {
+                SetError("Failed to load aligner model: " + aligner_ptr->get_error());
+                delete aligner_ptr;
+                return;
+            }
+            if (m_reuse_instance) {
+                cache.store(ModelType::QWEN3_ALIGNER, aligner_ptr, m_model_path, m_use_gpu, "", m_auto_release_ms);
+            } else {
+                owned = true;
+            }
+        }
+
+        m_result = aligner_ptr->align(m_pcmf32.data(), m_pcmf32.size(), m_text, m_language);
+
+        if (owned) {
+            delete aligner_ptr;
+        } else {
+            cache.markIdle(ModelType::QWEN3_ALIGNER);
+        }
 
         if (!m_result.success) {
             SetError("Alignment failed: " + m_result.error_msg);
@@ -553,6 +644,8 @@ private:
     std::string m_language;
     bool m_debug;
     bool m_use_gpu;
+    bool m_reuse_instance;
+    int64_t m_auto_release_ms;
     qwen3_asr::alignment_result m_result;
 };
 
@@ -625,10 +718,20 @@ Napi::Value qwenASRAlign(const Napi::CallbackInfo& info) {
         use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
     }
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     Napi::Function callback = info[1].As<Napi::Function>();
     QwenASRAlignWorker* worker = new QwenASRAlignWorker(
         callback, model_path, std::move(pcmf32),
-        text, language, debug, use_gpu);
+        text, language, debug, use_gpu, reuse_instance, auto_release_ms);
     worker->Queue();
 
     return env.Undefined();

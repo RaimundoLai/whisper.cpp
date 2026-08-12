@@ -1,6 +1,7 @@
 // crispasr-addon.cpp - CrispASR (Parakeet, Distil-Whisper) N-API bindings
 // This file is included by addon.cpp
 
+#include "model-cache.h"
 #include "../../third-party/CrispASR/src/parakeet.h"
 #include "../../third-party/CrispASR/src/qwen3_tts.h"
 #include "whisper.h"
@@ -129,24 +130,46 @@ public:
                    int n_threads,
                    bool use_gpu,
                    bool debug,
+                   bool reuse_instance,
+                   int64_t auto_release_ms,
                    Napi::Env env)
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
           m_pcmf32(std::move(pcmf32)),
           m_n_threads(n_threads),
           m_use_gpu(use_gpu),
-          m_debug(debug) {}
+          m_debug(debug),
+          m_reuse_instance(reuse_instance),
+          m_auto_release_ms(auto_release_ms) {}
 
     void Execute() override {
-        struct parakeet_context_params params = parakeet_context_default_params();
-        params.n_threads = m_n_threads;
-        params.use_gpu = m_use_gpu;
-        params.verbosity = m_debug ? 1 : 0;
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::PARAKEET));
 
-        struct parakeet_context* ctx = parakeet_init_from_file(m_model_path.c_str(), params);
+        struct parakeet_context* ctx = nullptr;
+        bool owned = false;
+
+        if (m_reuse_instance) {
+            ctx = static_cast<struct parakeet_context*>(
+                cache.acquire(ModelType::PARAKEET, m_model_path, m_use_gpu));
+        }
+
         if (!ctx) {
-            SetError("Failed to initialize Parakeet context from " + m_model_path);
-            return;
+            struct parakeet_context_params params = parakeet_context_default_params();
+            params.n_threads = m_n_threads;
+            params.use_gpu = m_use_gpu;
+            params.verbosity = m_debug ? 1 : 0;
+
+            ctx = parakeet_init_from_file(m_model_path.c_str(), params);
+            if (!ctx) {
+                SetError("Failed to initialize Parakeet context from " + m_model_path);
+                return;
+            }
+            if (m_reuse_instance) {
+                cache.store(ModelType::PARAKEET, ctx, m_model_path, m_use_gpu, "", m_auto_release_ms);
+            } else {
+                owned = true;
+            }
         }
 
         struct parakeet_result* res = parakeet_transcribe_ex(ctx, m_pcmf32.data(), m_pcmf32.size(), 0);
@@ -176,7 +199,11 @@ public:
             SetError("Parakeet transcription failed");
         }
 
-        parakeet_free(ctx);
+        if (owned) {
+            parakeet_free(ctx);
+        } else {
+            cache.markIdle(ModelType::PARAKEET);
+        }
     }
 
     void OnOK() override {
@@ -216,6 +243,8 @@ private:
     int m_n_threads;
     bool m_use_gpu;
     bool m_debug;
+    bool m_reuse_instance;
+    int64_t m_auto_release_ms;
     parakeet_addon_result m_result;
 };
 
@@ -258,8 +287,18 @@ Napi::Value parakeetASR(const Napi::CallbackInfo& info) {
         debug = options.Get("debug").As<Napi::Boolean>();
     }
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     Napi::Function callback = info[1].As<Napi::Function>();
-    ParakeetWorker* worker = new ParakeetWorker(callback, model_path, std::move(pcmf32), n_threads, use_gpu, debug, env);
+    ParakeetWorker* worker = new ParakeetWorker(callback, model_path, std::move(pcmf32), n_threads, use_gpu, debug, reuse_instance, auto_release_ms, env);
     worker->Queue();
 
     return env.Undefined();
@@ -379,6 +418,8 @@ public:
                    int min_silence_ms,
                    int speech_pad_ms,
                    int max_speech_ms,
+                   bool reuse_instance,
+                   int64_t auto_release_ms,
                    Napi::Function progress_callback,
                    Napi::Env env)
         : Napi::AsyncWorker(callback),
@@ -413,6 +454,8 @@ public:
           m_min_silence_ms(min_silence_ms),
           m_speech_pad_ms(speech_pad_ms),
           m_max_speech_ms(max_speech_ms),
+          m_reuse_instance(reuse_instance),
+          m_auto_release_ms(auto_release_ms),
           env(env),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
@@ -523,21 +566,39 @@ public:
     }
 
     void Execute() override {
-        crispasr_open_params_v1 params;
-        memset(&params, 0, sizeof(params));
-        params.abi_version = 2;
-        params.n_threads = m_n_threads;
-        params.use_gpu = m_use_gpu ? 1 : 0;
-        params.verbosity = m_debug ? 1 : 0;
-        params.flash_attn = m_flash_attn ? 1 : 0;
-        params.n_gpu_layers = m_n_gpu_layers;
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::CRISPASR_SESSION));
 
-        const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
+        crispasr_session* session = nullptr;
+        bool owned = false;
 
-        crispasr_session* session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
+        if (m_reuse_instance) {
+            session = static_cast<crispasr_session*>(
+                cache.acquire(ModelType::CRISPASR_SESSION, m_model_path, m_use_gpu, m_backend_name));
+        }
+
         if (!session) {
-            SetError("Failed to open CrispASR session for model " + m_model_path);
-            return;
+            crispasr_open_params_v1 params;
+            memset(&params, 0, sizeof(params));
+            params.abi_version = 2;
+            params.n_threads = m_n_threads;
+            params.use_gpu = m_use_gpu ? 1 : 0;
+            params.verbosity = m_debug ? 1 : 0;
+            params.flash_attn = m_flash_attn ? 1 : 0;
+            params.n_gpu_layers = m_n_gpu_layers;
+
+            const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
+
+            session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
+            if (!session) {
+                SetError("Failed to open CrispASR session for model " + m_model_path);
+                return;
+            }
+            if (m_reuse_instance) {
+                cache.store(ModelType::CRISPASR_SESSION, session, m_model_path, m_use_gpu, m_backend_name, m_auto_release_ms);
+            } else {
+                owned = true;
+            }
         }
 
         // Apply translate, target language, and context parameters
@@ -584,7 +645,11 @@ public:
         bool use_aligner = !m_aligner_model_path.empty();
         if (use_aligner) {
             if (!aligner.load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
-                crispasr_session_close(session);
+                if (owned) {
+                    crispasr_session_close(session);
+                } else {
+                    cache.markIdle(ModelType::CRISPASR_SESSION);
+                }
                 SetError("Failed to load aligner model: " + aligner.get_error());
                 return;
             }
@@ -634,7 +699,11 @@ public:
             
             whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
             if (!vctx) {
-                crispasr_session_close(session);
+                if (owned) {
+                    crispasr_session_close(session);
+                } else {
+                    cache.markIdle(ModelType::CRISPASR_SESSION);
+                }
                 SetError("Failed to initialize whisper VAD context");
                 return;
             }
@@ -718,7 +787,11 @@ public:
             whisper_vad_free(vctx);
         }
 
-        crispasr_session_close(session);
+        if (owned) {
+            crispasr_session_close(session);
+        } else {
+            cache.markIdle(ModelType::CRISPASR_SESSION);
+        }
     }
 
     void OnOK() override {
@@ -788,6 +861,8 @@ private:
     int m_max_speech_ms;
     Napi::Env env;
     Napi::ThreadSafeFunction tsfn;
+    bool m_reuse_instance = false;
+    int64_t m_auto_release_ms = 0;
     crispasr_addon_result m_result;
 };
 
@@ -990,6 +1065,16 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         max_speech_ms = options.Get("max_speech_duration_ms").As<Napi::Number>().Int32Value();
     }
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     Napi::Function progress_callback;
     if (options.Has("progress_callback") && options.Get("progress_callback").IsFunction()) {
         progress_callback = options.Get("progress_callback").As<Napi::Function>();
@@ -1003,6 +1088,7 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         temperature, seed, top_p, min_p, repetition_penalty, frequency_penalty, best_of, max_new_tokens, punctuation,
         aligner_model_path,
         vad_model_path, vad_threshold, min_speech_ms, min_silence_ms, speech_pad_ms, max_speech_ms,
+        reuse_instance, auto_release_ms,
         progress_callback, env
     );
     worker->Queue();
@@ -1813,6 +1899,8 @@ public:
                       bool use_gpu,
                       float temperature,
                       uint64_t seed,
+                      bool reuse_instance,
+                      int64_t auto_release_ms,
                       Napi::Env env)
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
@@ -1826,7 +1914,9 @@ public:
           m_n_threads(n_threads),
           m_use_gpu(use_gpu),
           m_temperature(temperature),
-          m_seed(seed) {}
+          m_seed(seed),
+          m_reuse_instance(reuse_instance),
+          m_auto_release_ms(auto_release_ms) {}
 
     void Execute() override {
         if (m_model_path.empty()) {
@@ -1838,30 +1928,49 @@ public:
             return;
         }
 
-        struct qwen3_tts_context_params cp = qwen3_tts_context_default_params();
-        cp.n_threads = m_n_threads;
-        cp.verbosity = 0;
-        cp.use_gpu = m_use_gpu;
-        cp.temperature = m_temperature;
-        cp.seed = m_seed;
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::QWEN3_TTS));
 
-        struct qwen3_tts_context* ctx = qwen3_tts_init_from_file(m_model_path.c_str(), cp);
+        struct qwen3_tts_context* ctx = nullptr;
+        bool owned = false;
+
+        if (m_reuse_instance) {
+            ctx = static_cast<struct qwen3_tts_context*>(
+                cache.acquire(ModelType::QWEN3_TTS, m_model_path, m_use_gpu, m_codec_model_path));
+        }
+
         if (!ctx) {
-            SetError("Failed to initialize Qwen3-TTS context from " + m_model_path);
-            return;
-        }
+            struct qwen3_tts_context_params cp = qwen3_tts_context_default_params();
+            cp.n_threads = m_n_threads;
+            cp.verbosity = 0;
+            cp.use_gpu = m_use_gpu;
+            cp.temperature = m_temperature;
+            cp.seed = m_seed;
 
-        std::string codec_path = m_codec_model_path;
-        if (codec_path.empty()) {
-            qwen3_tts_free(ctx);
-            SetError("No codec model found for Qwen3-TTS. Please specify codec_model or place qwen3-tts-tokenizer-12hz.gguf next to talker model.");
-            return;
-        }
+            ctx = qwen3_tts_init_from_file(m_model_path.c_str(), cp);
+            if (!ctx) {
+                SetError("Failed to initialize Qwen3-TTS context from " + m_model_path);
+                return;
+            }
 
-        if (qwen3_tts_set_codec_path(ctx, codec_path.c_str()) != 0) {
-            qwen3_tts_free(ctx);
-            SetError("Failed to load codec model from " + codec_path);
-            return;
+            std::string codec_path = m_codec_model_path;
+            if (codec_path.empty()) {
+                qwen3_tts_free(ctx);
+                SetError("No codec model found for Qwen3-TTS. Please specify codec_model or place qwen3-tts-tokenizer-12hz.gguf next to talker model.");
+                return;
+            }
+
+            if (qwen3_tts_set_codec_path(ctx, codec_path.c_str()) != 0) {
+                qwen3_tts_free(ctx);
+                SetError("Failed to load codec model from " + codec_path);
+                return;
+            }
+
+            if (m_reuse_instance) {
+                cache.store(ModelType::QWEN3_TTS, ctx, m_model_path, m_use_gpu, m_codec_model_path, m_auto_release_ms);
+            } else {
+                owned = true;
+            }
         }
 
         qwen3_tts_set_temperature(ctx, m_temperature);
@@ -1881,12 +1990,12 @@ public:
             else if (lang == "es") lang = "spanish";
             else if (lang == "it") lang = "italian";
             qwen3_tts_set_language_by_name(ctx, lang.c_str());
+        } else {
+            qwen3_tts_set_language_by_name(ctx, "auto");
         }
 
         if (qwen3_tts_is_voice_design(ctx)) {
-            if (!m_instruct.empty()) {
-                qwen3_tts_set_instruct(ctx, m_instruct.c_str());
-            }
+            qwen3_tts_set_instruct(ctx, m_instruct.c_str());
         } else if (qwen3_tts_is_custom_voice(ctx)) {
             if (!m_voice.empty()) {
                 qwen3_tts_set_speaker_by_name(ctx, m_voice.c_str());
@@ -1896,17 +2005,17 @@ public:
                     qwen3_tts_set_speaker_by_name(ctx, first_spk);
                 }
             }
-            if (!m_instruct.empty()) {
-                qwen3_tts_set_cv_style_instruct(ctx, m_instruct.c_str());
-            }
+            qwen3_tts_set_cv_style_instruct(ctx, m_instruct.c_str());
         } else if (!m_voice.empty()) {
             if (m_voice.size() > 4 && (m_voice.substr(m_voice.size() - 4) == ".wav" || m_voice.substr(m_voice.size() - 4) == ".WAV")) {
                 if (!m_ref_text.empty()) {
                     qwen3_tts_set_voice_prompt_with_text(ctx, m_voice.c_str(), m_ref_text.c_str());
                 } else {
-                    qwen3_tts_set_voice_prompt(ctx, m_voice.c_str());
+                    qwen3_tts_set_voice_prompt_with_text(ctx, "", "");
+                    qwen3_tts_set_voice_prompt_xvec_only(ctx, m_voice.c_str());
                 }
             } else {
+                qwen3_tts_set_voice_prompt_with_text(ctx, "", "");
                 qwen3_tts_load_voice_pack(ctx, m_voice.c_str());
             }
         }
@@ -1914,14 +2023,23 @@ public:
         int n_samples = 0;
         float* pcm = qwen3_tts_synthesize(ctx, m_text.c_str(), &n_samples);
         if (!pcm || n_samples <= 0) {
-            qwen3_tts_free(ctx);
+            if (owned) {
+                qwen3_tts_free(ctx);
+            } else {
+                cache.markIdle(ModelType::QWEN3_TTS);
+            }
             SetError("Qwen3-TTS synthesis failed or returned empty audio");
             return;
         }
 
         m_pcm_samples.assign(pcm, pcm + n_samples);
         qwen3_tts_pcm_free(pcm);
-        qwen3_tts_free(ctx);
+
+        if (owned) {
+            qwen3_tts_free(ctx);
+        } else {
+            cache.markIdle(ModelType::QWEN3_TTS);
+        }
 
         if (!m_output_path.empty()) {
             std::ofstream fout(m_output_path, std::ios::binary);
@@ -1993,6 +2111,8 @@ private:
     bool m_use_gpu;
     float m_temperature;
     uint64_t m_seed;
+    bool m_reuse_instance;
+    int64_t m_auto_release_ms;
     std::vector<float> m_pcm_samples;
 };
 
@@ -2056,9 +2176,19 @@ Napi::Value crispasrTTS(const Napi::CallbackInfo& info) {
                         ? options.Get("seed").As<Napi::Number>().Int64Value()
                         : 42;
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     CrispasrTTSWorker* worker = new CrispasrTTSWorker(
         callback, model_path, codec_model_path, text, voice, ref_text, instruct, language,
-        output_path, n_threads, use_gpu, temperature, seed, env);
+        output_path, n_threads, use_gpu, temperature, seed, reuse_instance, auto_release_ms, env);
     worker->Queue();
     return env.Undefined();
 }
