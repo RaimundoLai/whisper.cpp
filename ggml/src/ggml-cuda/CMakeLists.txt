@@ -179,7 +179,22 @@ if (CUDAToolkit_FOUND)
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
     else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+        find_library(GGML_CUDA_DRIVER_LIB NAMES cuda
+                     HINTS ${CUDAToolkit_LIBRARY_DIR}
+                           ${CUDAToolkit_LIBRARY_ROOT}/lib64
+                           /usr/local/cuda/lib64
+                           /usr/local/cuda/targets/x86_64-linux/lib
+                     PATH_SUFFIXES stubs)
+        if (GGML_CUDA_DRIVER_LIB)
+            message(STATUS "ggml-cuda: linking CUDA driver ${GGML_CUDA_DRIVER_LIB}")
+            target_link_libraries(ggml-cuda PRIVATE ${GGML_CUDA_DRIVER_LIB})
+        elseif (TARGET CUDA::cuda_driver)
+            message(STATUS "ggml-cuda: linking CUDA::cuda_driver")
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+        else()
+            message(WARNING "ggml-cuda: libcuda not found — building with GGML_CUDA_NO_VMM")
+            target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NO_VMM)
+        endif()
     endif()
 
     if (GGML_CUDA_NCCL)

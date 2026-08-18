@@ -11601,3 +11601,354 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN AA SnakeBeta kernel.
+constant constexpr int AA_BUFFER_SIZE      = 32;
+constant constexpr int AA_FILTER_SIZE      = 12;
+constant constexpr int AA_HALF_FILTER_SIZE = AA_FILTER_SIZE / 2;
+constant constexpr int AA_UP_REP_PAD       = 15;
+constant constexpr int AA_DS_REP_PAD_LEFT  = 5;
+constant constexpr int AA_DS_REP_PAD_RIGHT = 6;
+constant constexpr int AA_THREADS_PER_TGRP = 128;
+constant constexpr int AA_TILE_PAD_LEFT    = AA_HALF_FILTER_SIZE;
+constant constexpr int AA_TILE_PAD_RIGHT   = AA_HALF_FILTER_SIZE;
+constant constexpr int AA_TILE_ACTIVE      = AA_THREADS_PER_TGRP * AA_BUFFER_SIZE;
+constant constexpr int AA_TILE_TOTAL       = AA_TILE_ACTIVE + AA_TILE_PAD_LEFT + AA_TILE_PAD_RIGHT;
+constant constexpr int AA_TILE_LOAD_ITERS  = (AA_TILE_TOTAL + AA_THREADS_PER_TGRP - 1) / AA_THREADS_PER_TGRP;
+
+template <typename T>
+kernel void kernel_aa_snake_beta_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;   // chunk index
+    const int chan    = (int) tgpig.y;   // channel
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    const int seq_offset = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE
+                         + tid * AA_BUFFER_SIZE;
+    const int intermediate_seq_offset = seq_offset * 2;
+
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    const float seq_left  = (float) src_ch[0];
+    const float seq_right = (float) src_ch[seq_len - 1];
+
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    float elements[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE + 2 * AA_UP_REP_PAD] = {0};
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT]              = {0};
+    float output[AA_BUFFER_SIZE] = {0};
+
+    #pragma unroll
+    for (int it = -AA_HALF_FILTER_SIZE; it < AA_BUFFER_SIZE + AA_HALF_FILTER_SIZE; it++) {
+        const int element_index = seq_offset + it;
+        const int slot = 2 * (AA_HALF_FILTER_SIZE + it);
+        if ((element_index < 0) && (element_index >= -AA_UP_REP_PAD)) {
+            elements[slot] = 2.0f * seq_left;
+        } else if ((element_index >= seq_len) && (element_index < seq_len + AA_UP_REP_PAD)) {
+            elements[slot] = 2.0f * seq_right;
+        } else if ((element_index >= 0) && (element_index < seq_len)) {
+            elements[slot] = 2.0f * (float) src_ch[element_index];
+        }
+    }
+
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        float acc = 0.0f;
+        const int element_index = intermediate_seq_offset + it;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            if ((element_index + f) >= 0) {
+                acc += up_filter[f] * elements[it + f];
+            }
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    const float inv_beta = 1.0f / (beta_val + 1e-9f);
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first + it] = intermediates[tail_first - 1];
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output[it] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int element_index = seq_offset + it;
+        if (element_index < seq_len) {
+            dst_ch[element_index] = (T) output[it];
+        }
+    }
+}
+
+typedef decltype(kernel_aa_snake_beta_impl<float>) aa_snake_beta_t;
+template [[host_name("kernel_aa_snake_beta_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_impl<float>;
+
+template <typename T>
+kernel void kernel_aa_snake_beta_polyphase_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;
+    const int chan    = (int) tgpig.y;
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    const int seq_offset = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE
+                         + tid * AA_BUFFER_SIZE;
+
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    const float seq_left  = (float) src_ch[0];
+    const float seq_right = (float) src_ch[seq_len - 1];
+
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+    const float inv_beta  = 1.0f / (beta_val + 1e-9f);
+
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = 2.0f * (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    constexpr int AA_INPUT_WIN = AA_BUFFER_SIZE + 2 * AA_HALF_FILTER_SIZE;
+    float input_window[AA_INPUT_WIN] = {0};
+    #pragma unroll
+    for (int j = 0; j < AA_INPUT_WIN; j++) {
+        const int idx = seq_offset - AA_HALF_FILTER_SIZE + j;
+        if (idx >= 0 && idx < seq_len) {
+            input_window[j] = (float) src_ch[idx];
+        } else if (idx < 0 && idx >= -AA_UP_REP_PAD) {
+            input_window[j] = seq_left;
+        } else if (idx >= seq_len && idx < seq_len + AA_UP_REP_PAD) {
+            input_window[j] = seq_right;
+        }
+    }
+
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT] = {0};
+
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        const int p = it & 1;
+        const int base = (it + p) / 2;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < AA_FILTER_SIZE / 2; kk++) {
+            acc += up_filter[p + 2 * kk] * input_window[base + kk];
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first_p = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first_p + it] = intermediates[tail_first_p - 1];
+    }
+
+    float output_p[AA_BUFFER_SIZE];
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output_p[it] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int abs_idx = seq_offset + it;
+        if (abs_idx < seq_len) {
+            dst_ch[abs_idx] = (T) output_p[it];
+        }
+    }
+}
+
+template [[host_name("kernel_aa_snake_beta_polyphase_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_polyphase_impl<float>;
+
+template <typename T>
+kernel void kernel_aa_snake_beta_tgmem_impl(
+        constant ggml_metal_kargs_aa_snake_beta & args      [[buffer(0)]],
+        device const T                          * src       [[buffer(1)]],
+        device const T                          * log_alpha [[buffer(2)]],
+        device const T                          * log_beta  [[buffer(3)]],
+        device const T                          * up_ftr    [[buffer(4)]],
+        device const T                          * down_ftr  [[buffer(5)]],
+        device T                                * dst       [[buffer(6)]],
+        uint3                                     tgpig     [[threadgroup_position_in_grid]],
+        uint3                                     tpitg     [[thread_position_in_threadgroup]]) {
+
+    const int seq_blk = (int) tgpig.x;
+    const int chan    = (int) tgpig.y;
+    const int tid     = (int) tpitg.x;
+    const int seq_len = args.T;
+
+    const int chunk_start = seq_blk * AA_THREADS_PER_TGRP * AA_BUFFER_SIZE;
+    const int local_start = tid * AA_BUFFER_SIZE;
+    const int seq_offset  = chunk_start + local_start;
+
+    const int channel_offset = chan * seq_len;
+    device const T * src_ch  = src + channel_offset;
+    device       T * dst_ch  = dst + channel_offset;
+
+    threadgroup float input_tile[AA_TILE_TOTAL];
+
+    {
+        const float seq_left  = (float) src_ch[0];
+        const float seq_right = (float) src_ch[seq_len - 1];
+        #pragma unroll
+        for (int it = 0; it < AA_TILE_LOAD_ITERS; it++) {
+            const int local_idx = it * AA_THREADS_PER_TGRP + tid;
+            if (local_idx < AA_TILE_TOTAL) {
+                const int abs_idx = chunk_start + local_idx - AA_TILE_PAD_LEFT;
+                float val;
+                if (abs_idx >= 0 && abs_idx < seq_len) {
+                    val = (float) src_ch[abs_idx];
+                } else if (abs_idx < 0 && abs_idx >= -AA_UP_REP_PAD) {
+                    val = seq_left;
+                } else if (abs_idx >= seq_len && abs_idx < seq_len + AA_UP_REP_PAD) {
+                    val = seq_right;
+                } else {
+                    val = 0.0f;
+                }
+                input_tile[local_idx] = val;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float alpha_val = exp((float) log_alpha[chan]);
+    const float beta_val  = exp((float) log_beta[chan]);
+    const float inv_beta  = 1.0f / (beta_val + 1e-9f);
+
+    float up_filter[AA_FILTER_SIZE];
+    float down_filter[AA_FILTER_SIZE];
+    #pragma unroll
+    for (int k = 0; k < AA_FILTER_SIZE; k++) {
+        up_filter[k]   = 2.0f * (float) up_ftr[k];
+        down_filter[k] = (float) down_ftr[k];
+    }
+
+    float intermediates[2 * AA_FILTER_SIZE + 2 * AA_BUFFER_SIZE
+                        + AA_DS_REP_PAD_LEFT + AA_DS_REP_PAD_RIGHT] = {0};
+
+    #pragma unroll
+    for (int it = 0; it < (2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE); it++) {
+        const int p = it & 1;
+        const int base = local_start + (it + p) / 2;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < AA_FILTER_SIZE / 2; kk++) {
+            acc += up_filter[p + 2 * kk] * input_tile[base + kk];
+        }
+        intermediates[it + AA_DS_REP_PAD_LEFT] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE; it++) {
+        const float v = intermediates[it + AA_DS_REP_PAD_LEFT];
+        const float s = sin(alpha_val * v);
+        intermediates[it + AA_DS_REP_PAD_LEFT] = v + inv_beta * s * s;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_LEFT; it++) {
+        intermediates[it] = intermediates[AA_DS_REP_PAD_LEFT];
+    }
+    const int tail_first_t = AA_DS_REP_PAD_LEFT + 2 * AA_BUFFER_SIZE + 2 * AA_FILTER_SIZE;
+    #pragma unroll
+    for (int it = 0; it < AA_DS_REP_PAD_RIGHT; it++) {
+        intermediates[tail_first_t + it] = intermediates[tail_first_t - 1];
+    }
+
+    float output_t[AA_BUFFER_SIZE];
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int f = 0; f < AA_FILTER_SIZE; f++) {
+            acc += down_filter[f] * intermediates[it * 2 + f + AA_DS_REP_PAD_RIGHT];
+        }
+        output_t[it] = acc;
+    }
+
+    #pragma unroll
+    for (int it = 0; it < AA_BUFFER_SIZE; it++) {
+        const int abs_idx = seq_offset + it;
+        if (abs_idx < seq_len) {
+            dst_ch[abs_idx] = (T) output_t[it];
+        }
+    }
+}
+
+template [[host_name("kernel_aa_snake_beta_tgmem_f32")]]
+kernel aa_snake_beta_t kernel_aa_snake_beta_tgmem_impl<float>;

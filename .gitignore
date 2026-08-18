@@ -69,3 +69,6 @@ examples/whisper.wasm/dist
 
 # AGENTS
 .pi/SYSTEM.md
+
+*.node
+

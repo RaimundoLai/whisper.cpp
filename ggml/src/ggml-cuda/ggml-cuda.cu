@@ -1627,6 +1627,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
+    // CrispASR patch (issue #38 + #125; MUST RE-APPLY on ggml sync).
+    if (src1->type == GGML_TYPE_F32) {
+        compute_type = GGML_TYPE_F32;
+    }
+
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
     if (env_c != nullptr) {
         std::string env_cpp = env_c;
@@ -2174,6 +2179,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_NORM:
             ggml_cuda_op_norm(ctx, dst);
+            break;
+        case GGML_OP_NORM_AFFINE:
+            ggml_cuda_op_norm_affine(ctx, dst);
             break;
         case GGML_OP_GROUP_NORM:
             ggml_cuda_op_group_norm(ctx, dst);
@@ -5043,6 +5051,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
         case GGML_OP_NORM:
+        case GGML_OP_NORM_AFFINE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);

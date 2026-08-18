@@ -672,6 +672,17 @@ typedef struct {
 } ggml_metal_kargs_conv_2d;
 
 typedef struct {
+    int32_t T;             // sequence length per channel
+    int32_t C;             // channels (input == output)
+    int32_t K;             // filter taps (always 12 in current kernel)
+    int32_t up_pad;        // 5  — replicate-pad before upsample
+    int32_t up_pad_left;   // 15 — left crop of upsample output
+    int32_t up_pad_right;  // 15 — right crop of upsample output
+    int32_t ds_pad_left;   // 5  — replicate-pad before downsample
+    int32_t ds_pad_right;  // 6
+} ggml_metal_kargs_aa_snake_beta;
+
+typedef struct {
     uint64_t nb00;  // kernel strides
     uint64_t nb01;
     uint64_t nb02;

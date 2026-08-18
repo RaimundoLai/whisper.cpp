@@ -1901,6 +1901,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_snake(ggml_metal
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_aa_snake_beta(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_AA_SNAKE_BETA);
+
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    static const char * variant_name = []() -> const char * {
+        const char * v = getenv("INDEXTTS_AA_METAL_VARIANT");
+        if (!v || !*v)                                                                return "kernel_aa_snake_beta_f32";
+        if (v[0] == 'p' || v[0] == 'P')                                               return "kernel_aa_snake_beta_polyphase_f32";
+        if (v[0] == 't' || v[0] == 'T' || v[0] == 's' || v[0] == 'S')                 return "kernel_aa_snake_beta_tgmem_f32";
+        return "kernel_aa_snake_beta_f32";
+    }();
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "%s", variant_name);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_CONV_TRANSPOSE_2D);
 
