@@ -1,4 +1,5 @@
 // sense-voice-addon.cpp - SenseVoice N-API bindings
+#include "model-cache.h"
 // This file is included by addon.cpp
 
 #include "sense-voice.h"
@@ -282,6 +283,7 @@ public:
         int min_silence_duration_ms, int speech_pad_ms,
         bool use_beam_search, int beam_size, bool debug,
         std::vector<std::string> hotwords, float hotwords_score,
+        bool reuse_instance, int64_t auto_release_ms,
         Napi::Function progress_callback, Napi::Env env)
         : Napi::AsyncWorker(callback), 
           m_model_path(model_path), m_vad_model_path(vad_model_path),
@@ -294,6 +296,7 @@ public:
           m_use_beam_search(use_beam_search), m_beam_size(beam_size),
           m_debug(debug),
           m_hotwords(std::move(hotwords)), m_hotwords_score(hotwords_score),
+          m_reuse_instance(reuse_instance), m_auto_release_ms(auto_release_ms),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
         if (!progress_callback.IsEmpty()) {
@@ -319,12 +322,10 @@ public:
             auto callback = [abort_flag, progress](Napi::Env env, Napi::Function jsCallback) {
                 try {
                     Napi::Value result = jsCallback.Call({Napi::Number::New(env, progress)});
-                    // If callback returns false, signal abort
                     if (result.IsBoolean() && !result.As<Napi::Boolean>().Value()) {
                         abort_flag->store(true);
                     }
                 } catch (...) {
-                    // Continue on error
                 }
             };
             m_tsfn.BlockingCall(callback);
@@ -336,18 +337,35 @@ public:
     }
 
     void Execute() override {
-        // Initialize SenseVoice context
-        struct sense_voice_context_params cparams = sense_voice_context_default_params();
-        cparams.use_gpu = m_use_gpu;
-        cparams.use_itn = m_use_itn;
-        cparams.flash_attn = m_flash_attn;
+        auto& cache = ModelCache::instance();
+        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::SENSE_VOICE));
 
-        struct sense_voice_context* ctx = sense_voice_small_init_from_file_with_params(
-            m_model_path.c_str(), cparams);
+        struct sense_voice_context* ctx = nullptr;
+        bool owned = false;
 
-        if (ctx == nullptr) {
-            SetError("Failed to initialize SenseVoice context");
-            return;
+        if (m_reuse_instance) {
+            ctx = static_cast<struct sense_voice_context*>(
+                cache.acquire(ModelType::SENSE_VOICE, m_model_path, m_use_gpu));
+        }
+
+        if (!ctx) {
+            struct sense_voice_context_params cparams = sense_voice_context_default_params();
+            cparams.use_gpu = m_use_gpu;
+            cparams.use_itn = m_use_itn;
+            cparams.flash_attn = m_flash_attn;
+
+            ctx = sense_voice_small_init_from_file_with_params(m_model_path.c_str(), cparams);
+
+            if (ctx == nullptr) {
+                SetError("Failed to initialize SenseVoice context");
+                return;
+            }
+
+            if (m_reuse_instance) {
+                cache.store(ModelType::SENSE_VOICE, ctx, m_model_path, m_use_gpu, "", m_auto_release_ms);
+            } else {
+                owned = true;
+            }
         }
 
         // Set language
@@ -400,7 +418,7 @@ public:
             
             if (vctx == nullptr) {
                 SetError("Failed to initialize whisper VAD context");
-                sense_voice_free(ctx);
+                if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                 return;
             }
 
@@ -429,7 +447,7 @@ public:
                         m_was_aborted->store(true);
                         whisper_vad_free_segments(segments);
                         whisper_vad_free(vctx);
-                        sense_voice_free(ctx);
+                        if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                         return;
                     }
                     // Note: whisper_vad_segments_get_segment_t0/t1 returns centiseconds (values * 100)
@@ -609,7 +627,7 @@ public:
                             m_was_aborted->store(true);
                             whisper_vad_free_segments(segments);
                             whisper_vad_free(vctx);
-                            sense_voice_free(ctx);
+                            if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                             return;
                         }
                     }
@@ -768,7 +786,11 @@ public:
             m_result.event = m_result.segments[0].event;
         }
 
-        sense_voice_free(ctx);
+        if (owned) {
+            sense_voice_free(ctx);
+        } else {
+            cache.markIdle(ModelType::SENSE_VOICE);
+        }
     }
 
 
@@ -837,6 +859,8 @@ private:
     bool m_debug = false;  // Debug logging flag
     std::vector<std::string> m_hotwords;  // Hot words for biasing
     float m_hotwords_score = 1.0f;  // Hot words log probability bonus
+    bool m_reuse_instance = false;
+    int64_t m_auto_release_ms = 0;
     sense_voice_addon_result m_result;
     Napi::ThreadSafeFunction m_tsfn;  // Thread-safe function for progress callback
 };
@@ -986,6 +1010,16 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         hotwords_score = options.Get("hotwords_score").As<Napi::Number>().FloatValue();
     }
 
+    bool reuse_instance = false;
+    if (options.Has("reuse_instance") && options.Get("reuse_instance").IsBoolean()) {
+        reuse_instance = options.Get("reuse_instance").As<Napi::Boolean>();
+    }
+
+    int64_t auto_release_ms = 0;
+    if (options.Has("auto_release_ms") && options.Get("auto_release_ms").IsNumber()) {
+        auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
+    }
+
     // Progress callback (optional)
     Napi::Function progress_callback;
     if (options.Has("progress_callback") && options.Get("progress_callback").IsFunction()) {
@@ -1000,6 +1034,7 @@ Napi::Value senseVoice(const Napi::CallbackInfo& info) {
         min_speech_duration_ms, max_speech_duration_ms, min_silence_duration_ms, speech_pad_ms,
         use_beam_search, beam_size, debug,
         std::move(hotwords), hotwords_score,
+        reuse_instance, auto_release_ms,
         progress_callback, env);
     worker->Queue();
 

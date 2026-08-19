@@ -1,3 +1,6 @@
+cmake_minimum_required(VERSION 3.15)
+project(addon_node C CXX)
+
 set(TARGET addon.node)
 
 # Base settings
@@ -7,10 +10,13 @@ add_definitions(-DNAPI_VERSION=4)
 include_directories(${CMAKE_JS_INC})
 #==================================================================
 
-add_library(${TARGET} SHARED ${CMAKE_JS_SRC} addon.cpp)
-set_target_properties(${TARGET} PROPERTIES PREFIX "" SUFFIX ".node")
-
-include(DefaultTargetOptions)
+add_library(${TARGET} SHARED ${CMAKE_JS_SRC} addon.cpp model-cache.cpp)
+set_target_properties(${TARGET} PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "addon"
+    SUFFIX ".node"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+)
 
 # Include N-API wrappers
 #==================================================================

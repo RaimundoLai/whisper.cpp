@@ -77,7 +77,7 @@ jobs:
           npx cmake-js compile -T addon.node -B Release $buildParams
           
           mkdir -p artifacts
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/$outputName"
+          Copy-Item "build/bin/Release/addon.node" -Destination "artifacts/$outputName"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -126,7 +126,7 @@ jobs:
             --arch=x64 `
             
           mkdir -p artifacts
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-vulkan.node"
+          Copy-Item "build/bin/Release/addon.node" -Destination "artifacts/addon-windows-vulkan.node"
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -168,7 +168,7 @@ jobs:
             
           mkdir -p artifacts
           
-          Copy-Item "build/bin/Release/addon.node.node" -Destination "artifacts/addon-windows-no-cuda.node"
+          Copy-Item "build/bin/Release/addon.node" -Destination "artifacts/addon-windows-no-cuda.node"
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -219,7 +219,7 @@ jobs:
             --runtime-version=39.8.10 \
             --arch=arm64 \
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
-          cp build/Release/addon.node.node artifacts/addon-macos-arm64.node
+          cp build/Release/addon.node artifacts/addon-macos-arm64.node
           
           # Clear build cache
           rm -rf build/CMakeCache.txt build/CMakeFiles/
@@ -236,7 +236,7 @@ jobs:
             --runtime-version=39.8.10 \
             --arch=arm64 \
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
-          cp build/Release/addon.node.node artifacts/addon-macos-arm64-coreml.node
+          cp build/Release/addon.node artifacts/addon-macos-arm64-coreml.node
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -284,7 +284,7 @@ jobs:
             --CDCMAKE_OSX_DEPLOYMENT_TARGET=12.0
             
           mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-macos-x64.node
+          cp build/Release/addon.node artifacts/addon-macos-x64.node
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -356,7 +356,7 @@ jobs:
             --arch=x64
           
           mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/$outputName
+          cp build/Release/addon.node artifacts/$outputName
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -406,7 +406,7 @@ jobs:
             --arch=x64
             
           mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-linux-vulkan.node
+          cp build/Release/addon.node artifacts/addon-linux-vulkan.node
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -450,7 +450,7 @@ jobs:
             --arch=x64
             
           mkdir -p artifacts
-          cp build/Release/addon.node.node artifacts/addon-linux-no-cuda.node
+          cp build/Release/addon.node artifacts/addon-linux-no-cuda.node
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
