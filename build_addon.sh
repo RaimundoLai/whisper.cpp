@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+git submodule update --init --recursive
+
 cd examples/addon.node
 npm install
 cd ../../

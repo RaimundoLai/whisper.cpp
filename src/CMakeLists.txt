@@ -251,6 +251,10 @@ if(APPLE)
     target_link_libraries(whisper PRIVATE "-framework Accelerate")
 endif()
 
+if(NOT WIN32)
+    target_compile_definitions(whisper PRIVATE WEBRTC_POSIX)
+endif()
+
 # Add tokenizers-cpp for SenseVoice support
 set(TOKENIZERS_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third-party/tokenizers-cpp")
 if(EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
