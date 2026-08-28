@@ -1,10 +1,15 @@
 # TODO: should not use this
 if (WIN32)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES NOMINMAX)
 
     if (BUILD_SHARED_LIBS)
         set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
     endif()
+endif()
+
+if (MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/bigobj>)
 endif()
 
 
@@ -147,10 +152,25 @@ set(CRISPASR_RNNOISE_SOURCES
 set(CRISP_AUDIO_SOURCES
     "${CRISP_AUDIO_DIR}/src/audio_tower.cpp"
 )
+file(GLOB_RECURSE GLINT_SOURCES
+    "${CRISPASR_DIR}/glint/src/*.cpp"
+    "${CRISPASR_DIR}/glint/src/*.c"
+)
+set(CRISPASR_C2PA_SOURCES
+    "${CRISPASR_DIR}/third_party/c2pa-audio/src/c2pa_native.cpp"
+    "${CRISPASR_DIR}/third_party/c2pa-audio/third_party/uecc/uECC.c"
+)
+file(GLOB_RECURSE WEBRTC_VAD_SOURCES
+    "${CRISPASR_DIR}/third_party/webrtc/*.c"
+    "${CRISPASR_DIR}/third_party/webrtc/*.cpp"
+)
 list(APPEND CRISPASR_SOURCES ${CRISPASR_CORE_SOURCES})
 list(APPEND CRISPASR_SOURCES ${CRISPASR_RNNOISE_SOURCES})
 list(APPEND CRISPASR_SOURCES ${CRISP_AUDIO_SOURCES})
-list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp")
+list(APPEND CRISPASR_SOURCES ${GLINT_SOURCES})
+list(APPEND CRISPASR_SOURCES ${CRISPASR_C2PA_SOURCES})
+list(APPEND CRISPASR_SOURCES ${WEBRTC_VAD_SOURCES})
+list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp" "${CRISPASR_DIR}/src/miniaudio_libopus.c")
 
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
 if (WHISPER_COREML)
@@ -193,7 +213,21 @@ set_target_properties(parakeet PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include ${SENSE_VOICE_DIR} ${QWEN3_ASR_DIR} ${CRISPASR_DIR}/include ${CRISPASR_DIR}/src ${CRISP_AUDIO_DIR}/include ../ggml/src)
+target_include_directories(whisper PUBLIC
+    .
+    ../include
+    ${SENSE_VOICE_DIR}
+    ${QWEN3_ASR_DIR}
+    ${CRISPASR_DIR}/include
+    ${CRISPASR_DIR}/src
+    ${CRISPASR_DIR}/glint/include
+    ${CRISPASR_DIR}/glint/src
+    ${CRISPASR_DIR}/third_party
+    ${CRISPASR_DIR}/third_party/c2pa-audio/src
+    ${CRISPASR_DIR}/third_party/c2pa-audio/third_party/uecc
+    ${CRISP_AUDIO_DIR}/include
+    ../ggml/src
+)
 target_compile_features   (whisper PUBLIC cxx_std_20) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
@@ -215,6 +249,10 @@ target_link_libraries(whisper PUBLIC ggml Threads::Threads)
 # Link Accelerate framework on Apple for qwen3-asr mel spectrogram
 if(APPLE)
     target_link_libraries(whisper PRIVATE "-framework Accelerate")
+endif()
+
+if(NOT WIN32)
+    target_compile_definitions(whisper PRIVATE WEBRTC_POSIX)
 endif()
 
 # Add tokenizers-cpp for SenseVoice support

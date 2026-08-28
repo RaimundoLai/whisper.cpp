@@ -421,6 +421,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_conv_3d(ctx, idx);
             } break;
+        case GGML_OP_AA_SNAKE_BETA:
+            {
+                n_fuse = ggml_metal_op_aa_snake_beta(ctx, idx);
+            } break;
         case GGML_OP_UPSCALE:
             {
                 n_fuse = ggml_metal_op_upscale(ctx, idx);
@@ -4747,6 +4751,53 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_aa_snake_beta(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t T = op->src[0]->ne[0];
+    const int32_t C = op->src[0]->ne[1];
+    const int32_t K = op->src[3]->ne[0];
+
+    GGML_ASSERT(K == 12 && "aa_snake_beta Metal kernel hardcodes K=12");
+
+    // Pad layout mirrors the CPU forward in ggml-cpu/ops.cpp.
+    ggml_metal_kargs_aa_snake_beta args = {
+        /*.T            =*/ T,
+        /*.C            =*/ C,
+        /*.K            =*/ K,
+        /*.up_pad       =*/ K / 2 - 1,                  // 5
+        /*.up_pad_left  =*/ K / 2 - 1 + (K - 2) / 2 + (K - 2) / 2,  // unused on GPU
+        /*.up_pad_right =*/ 0,                          // unused on GPU
+        /*.ds_pad_left  =*/ K / 2 - 1,                  // 5
+        /*.ds_pad_right =*/ K / 2,                      // 6
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_aa_snake_beta(lib, op);
+
+    constexpr int AA_THREADS_PER_TGRP = 128;
+    constexpr int AA_BUFFER_SIZE      = 32;
+    constexpr int AA_SAMPLES_PER_TGRP = AA_THREADS_PER_TGRP * AA_BUFFER_SIZE;  // 4096
+
+    const int seq_blocks = (T + AA_SAMPLES_PER_TGRP - 1) / AA_SAMPLES_PER_TGRP;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                     0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]),    1);  // x
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]),    2);  // log_alpha
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]),    3);  // log_beta
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]),    4);  // us_filter
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]),    5);  // ds_filter
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),            6);  // dst
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, seq_blocks, C, 1,
+                                                  AA_THREADS_PER_TGRP, 1, 1);
 
     return 1;
 }
