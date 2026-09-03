@@ -1884,6 +1884,20 @@ private:
 // CrispASR / Qwen3-TTS Implementation
 // ============================================================================
 
+#if defined(__APPLE__)
+extern "C" {
+    void* objc_autoreleasePoolPush(void);
+    void  objc_autoreleasePoolPop(void* pool);
+}
+struct AddonAutoReleaseScope {
+    void* pool;
+    AddonAutoReleaseScope() : pool(objc_autoreleasePoolPush()) {}
+    ~AddonAutoReleaseScope() { objc_autoreleasePoolPop(pool); }
+};
+#else
+struct AddonAutoReleaseScope {};
+#endif
+
 class CrispasrTTSWorker : public Napi::AsyncWorker {
 public:
     CrispasrTTSWorker(Napi::Function& callback,
@@ -1919,6 +1933,7 @@ public:
           m_auto_release_ms(auto_release_ms) {}
 
     void Execute() override {
+        AddonAutoReleaseScope ar_scope;
         if (m_model_path.empty()) {
             SetError("Model path is required for crispasrTTS");
             return;
@@ -2044,20 +2059,21 @@ public:
         if (!m_output_path.empty()) {
             std::ofstream fout(m_output_path, std::ios::binary);
             if (fout.is_open()) {
-                int sample_rate = 24000;
-                int num_channels = 1;
-                int bits_per_sample = 16;
-                int data_size = n_samples * (bits_per_sample / 8);
-                int chunk_size = 36 + data_size;
-                int byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
-                int block_align = num_channels * (bits_per_sample / 8);
+                uint32_t sample_rate = 24000;
+                uint16_t num_channels = 1;
+                uint16_t bits_per_sample = 16;
+                uint32_t byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
+                uint16_t block_align = num_channels * (bits_per_sample / 8);
+                uint32_t data_size = n_samples * sizeof(int16_t);
+                uint32_t chunk_size = 36 + data_size;
 
                 fout.write("RIFF", 4);
                 fout.write(reinterpret_cast<const char*>(&chunk_size), 4);
-                fout.write("WAVEfmt ", 8);
-                int fmt_chunk_size = 16;
-                int audio_format = 1;
-                fout.write(reinterpret_cast<const char*>(&fmt_chunk_size), 4);
+                fout.write("WAVE", 4);
+                fout.write("fmt ", 4);
+                uint32_t subchunk1_size = 16;
+                uint16_t audio_format = 1;
+                fout.write(reinterpret_cast<const char*>(&subchunk1_size), 4);
                 fout.write(reinterpret_cast<const char*>(&audio_format), 2);
                 fout.write(reinterpret_cast<const char*>(&num_channels), 2);
                 fout.write(reinterpret_cast<const char*>(&sample_rate), 4);
@@ -2078,24 +2094,41 @@ public:
     }
 
     void OnOK() override {
-        Napi::HandleScope scope(Env());
-        Napi::Object result = Napi::Object::New(Env());
+        try {
+            Napi::HandleScope scope(Env());
+            Napi::Object result = Napi::Object::New(Env());
 
-        result.Set("sampleRate", Napi::Number::New(Env(), 24000));
-        result.Set("n_samples", Napi::Number::New(Env(), m_pcm_samples.size()));
-        result.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm_samples.size()) / 24000.0));
+            result.Set("sampleRate", Napi::Number::New(Env(), 24000));
+            result.Set("n_samples", Napi::Number::New(Env(), m_pcm_samples.size()));
+            result.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm_samples.size()) / 24000.0));
 
-        if (!m_output_path.empty()) {
-            result.Set("path", Napi::String::New(Env(), m_output_path));
+            if (!m_output_path.empty()) {
+                result.Set("path", Napi::String::New(Env(), m_output_path));
+            } else {
+                Napi::Float32Array buffer = Napi::Float32Array::New(Env(), m_pcm_samples.size());
+                for (size_t i = 0; i < m_pcm_samples.size(); ++i) {
+                    buffer[i] = m_pcm_samples[i];
+                }
+                result.Set("buffer", buffer);
+            }
+
+            Callback().Call({Env().Null(), result});
+        } catch (const Napi::Error& e) {
+            fprintf(stderr, "[CrispasrTTSWorker] Caught Napi::Error in OnOK during teardown: %s\n", e.what());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[CrispasrTTSWorker] Caught std::exception in OnOK: %s\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[CrispasrTTSWorker] Suppressed unknown exception in OnOK\n");
         }
+    }
 
-        Napi::Float32Array buffer = Napi::Float32Array::New(Env(), m_pcm_samples.size());
-        for (size_t i = 0; i < m_pcm_samples.size(); ++i) {
-            buffer[i] = m_pcm_samples[i];
+    void OnError(const Napi::Error& e) override {
+        try {
+            Napi::HandleScope scope(Env());
+            Callback().Call({e.Value(), Env().Undefined()});
+        } catch (...) {
+            fprintf(stderr, "[CrispasrTTSWorker] Suppressed error callback in OnError during teardown\n");
         }
-        result.Set("buffer", buffer);
-
-        Callback().Call({Env().Null(), result});
     }
 
 private:

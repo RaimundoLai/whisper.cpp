@@ -70,12 +70,12 @@ void ModelCache::markIdle(ModelType t) {
 
         if (slots_[idx].pending_release) {
             fprintf(stderr, "[ModelCache] Executing deferred release for %s\n", modelTypeToString(t));
-            freeSlotNoLock(t);
+            freeSlotNoLock(t, false);
         }
     }
 }
 
-void ModelCache::freeSlotNoLock(ModelType t) {
+void ModelCache::freeSlotNoLock(ModelType t, bool async) {
     int idx = static_cast<int>(t);
     CacheSlot& slot = slots_[idx];
     if (!slot.ctx) {
@@ -96,9 +96,7 @@ void ModelCache::freeSlotNoLock(ModelType t) {
     slot.secondary_path.clear();
     slot.auto_release_ms = 0;
 
-    // Run heavy GPU/CPU VRAM deallocation asynchronously on a background thread
-    // so freeing 2.0 GB of Metal buffers never blocks Node.js Event Loop or UI!
-    std::thread([ctx, t, this, idx]() {
+    auto do_free = [ctx, t, this, idx]() {
         std::lock_guard<std::mutex> type_lock(mutexes_[idx]);
         try {
             switch (t) {
@@ -126,22 +124,28 @@ void ModelCache::freeSlotNoLock(ModelType t) {
                 default:
                     break;
             }
-            fprintf(stderr, "[ModelCache] Successfully freed %s context in background thread\n", modelTypeToString(t));
+            fprintf(stderr, "[ModelCache] Successfully freed %s context\n", modelTypeToString(t));
         } catch (...) {
             fprintf(stderr, "[ModelCache] Warning: Exception caught while freeing %s context\n", modelTypeToString(t));
         }
-    }).detach();
+    };
+
+    if (async) {
+        std::thread(do_free).detach();
+    } else {
+        do_free();
+    }
 }
 
 void ModelCache::release(ModelType t) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    freeSlotNoLock(t);
+    freeSlotNoLock(t, false);
 }
 
 void ModelCache::releaseAll() {
     std::lock_guard<std::mutex> lock(global_mutex_);
     for (int i = 0; i < static_cast<int>(ModelType::MODEL_TYPE_COUNT); i++) {
-        freeSlotNoLock(static_cast<ModelType>(i));
+        freeSlotNoLock(static_cast<ModelType>(i), false);
     }
 }
 

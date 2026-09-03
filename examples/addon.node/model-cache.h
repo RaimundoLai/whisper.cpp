@@ -92,7 +92,7 @@ private:
     ModelCache() = default;
     ~ModelCache();
 
-    void freeSlotNoLock(ModelType t);
+    void freeSlotNoLock(ModelType t, bool async = false);
 
     CacheSlot slots_[static_cast<int>(ModelType::MODEL_TYPE_COUNT)];
     std::mutex mutexes_[static_cast<int>(ModelType::MODEL_TYPE_COUNT)];

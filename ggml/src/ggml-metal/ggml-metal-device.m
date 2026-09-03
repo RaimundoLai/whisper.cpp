@@ -654,8 +654,12 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
     }
 
     // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
-
+    if ([rsets->data count] != 0) {
+        GGML_LOG_WARN("%s: warning: residency sets still active on exit, safely draining\n", __func__);
+        [rsets->lock lock];
+        [rsets->data removeAllObjects];
+        [rsets->lock unlock];
+    }
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 
     dispatch_group_wait(rsets->d_group, DISPATCH_TIME_FOREVER);

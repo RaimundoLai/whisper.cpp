@@ -1051,6 +1051,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
     vk_pipeline pipeline_timestep_embedding_f32;
     vk_pipeline pipeline_conv_transpose_1d_f32;
+    vk_pipeline pipeline_conv_transpose_1d_f16;
     vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
@@ -5784,6 +5785,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f16, "conv_transpose_1d_f16", conv_transpose_1d_f16_len, conv_transpose_1d_f16_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32,  "col2im_1d_f32",  col2im_1d_f32_len,  col2im_1d_f32_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
@@ -11518,6 +11520,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_CONV_TRANSPOSE_1D:
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_conv_transpose_1d_f16;
+        }
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_conv_transpose_1d_f32;
         }
@@ -13939,17 +13944,18 @@ static void ggml_vk_timestep_embedding(ggml_backend_vk_context * ctx, vk_context
 }
 
 static void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // src0: (K, Cout, Cin, 1) -- kernel
-    // src1: (L, Cin, 1, 1) -- input
+    // src0: (K, Cout, Cin, 1) -- kernel (F32 or F16)
+    // src1: (L, Cin, 1, 1) -- input (F32)
     // dst: (*, Cout, 1, 1)
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(nb00 == sizeof(float));
+    const size_t src0_elem_size = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == src0_elem_size);
     GGML_ASSERT(nb10 == sizeof(float));
 
     const int32_t s0 = dst->op_params[0];
@@ -13960,8 +13966,8 @@ static void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context&
     p.K = static_cast<uint32_t>(ne00);
     p.L = static_cast<uint32_t>(ne10);
     p.KL = static_cast<uint32_t>(ne0);
-    p.nb01 = static_cast<uint32_t>(nb01 / nb00);
-    p.nb02 = static_cast<uint32_t>(nb02 / nb00);
+    p.nb01 = static_cast<uint32_t>(nb01 / src0_elem_size);
+    p.nb02 = static_cast<uint32_t>(nb02 / src0_elem_size);
     p.nb11 = static_cast<uint32_t>(nb11 / nb10);
     p.nb1 = static_cast<uint32_t>(nb1 / nb0);
     p.s0 = static_cast<uint32_t>(s0);
@@ -18439,7 +18445,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
             return (op->src[0]->type == GGML_TYPE_F32 ||
                     op->src[0]->type == GGML_TYPE_F16 ||
