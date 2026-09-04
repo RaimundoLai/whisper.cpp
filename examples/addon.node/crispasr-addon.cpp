@@ -99,6 +99,21 @@ static std::string extract_clean_text_if_json(const std::string& input) {
     return clean_text.empty() ? input : clean_text;
 }
 
+static void trim_leading_replacement_and_spaces(std::string& str) {
+    while (!str.empty()) {
+        if (str.front() == ' ' || str.front() == '\t' || str.front() == '\r' || str.front() == '\n') {
+            str.erase(str.begin());
+        } else if (str.size() >= 3 &&
+                   (unsigned char)str[0] == 0xEF &&
+                   (unsigned char)str[1] == 0xBF &&
+                   (unsigned char)str[2] == 0xBD) {
+            str.erase(str.begin(), str.begin() + 3);
+        } else {
+            break;
+        }
+    }
+}
+
 // ============================================================================
 // Parakeet ASR Implementation
 // ============================================================================
@@ -510,6 +525,8 @@ public:
             sd.end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
 
             std::string clean_seg_text = extract_clean_text_if_json(sd.text);
+            trim_leading_replacement_and_spaces(clean_seg_text);
+            sd.text = clean_seg_text;
             if (!full_text.empty() && !clean_seg_text.empty()) {
                 full_text += " ";
             }
@@ -682,6 +699,7 @@ public:
                     if (!total_txt.empty()) {
                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
                         std::string clean_txt = extract_clean_text_if_json(total_txt);
+                        trim_leading_replacement_and_spaces(clean_txt);
                         align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                     }
                 }
@@ -771,6 +789,7 @@ public:
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                     std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    trim_leading_replacement_and_spaces(clean_txt);
                                     align_res = aligner.align(chunk.data(), chunk.size(), clean_txt, detected_lang);
                                 }
                             }
@@ -1384,6 +1403,7 @@ private:
                 text += seg_text;
             }
         }
+        trim_leading_replacement_and_spaces(text);
 
         bool should_extract_words = true;
         if (m_backend_name.find("voxtral") != std::string::npos ||
@@ -1405,6 +1425,17 @@ private:
                 }
             }
         }
+
+        // Clean out empty, whitespace-only, or replacement character artifact words
+        std::vector<stream_word_item> filtered_words;
+        filtered_words.reserve(words_list.size());
+        for (auto& wi : words_list) {
+            trim_leading_replacement_and_spaces(wi.word);
+            if (!wi.word.empty() && wi.word != "\xEF\xBF\xBD") {
+                filtered_words.push_back(std::move(wi));
+            }
+        }
+        words_list = std::move(filtered_words);
         
         if ((!text.empty() || type == "segment") && m_tsfn) {
             auto cb_data = std::make_tuple(start_time, end_time, text, words_list, type);
@@ -1607,6 +1638,7 @@ private:
                                             if (!total_txt.empty()) {
                                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                                 std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                                trim_leading_replacement_and_spaces(clean_txt);
                                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                                 if (align_res.success) {
                                                     for (const auto& w : align_res.words) {
@@ -1653,6 +1685,7 @@ private:
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                     std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    trim_leading_replacement_and_spaces(clean_txt);
                                     auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                     if (align_res.success) {
                                         for (const auto& w : align_res.words) {
@@ -1722,6 +1755,7 @@ private:
                                     if (!total_txt.empty()) {
                                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                         std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                        trim_leading_replacement_and_spaces(clean_txt);
                                         auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                         if (align_res.success) {
                                             for (const auto& w : align_res.words) {
@@ -1794,6 +1828,7 @@ private:
                             if (!total_txt.empty()) {
                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                 std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                trim_leading_replacement_and_spaces(clean_txt);
                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                 if (align_res.success) {
                                     for (const auto& w : align_res.words) {
