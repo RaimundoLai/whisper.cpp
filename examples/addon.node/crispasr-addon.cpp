@@ -25,6 +25,15 @@ static std::string crisp_discover_codec(const std::string& model_path) {
         "qwen3-tts-tokenizer-12hz.gguf",
         "qwen3-tts-tokenizer.gguf",
         "qwen3-tts-codec.gguf",
+        "snac-24khz.gguf",
+        "snac-24khz-q8_0.gguf",
+        "snac.gguf",
+        "dots-tts-soar-vocoder-q8_0.gguf",
+        "dots-tts-soar-vocoder.gguf",
+        "dac-44khz.gguf",
+        "bigvgan-24khz.gguf",
+        "bigvgan-22khz.gguf",
+        "vocos-24khz.gguf"
     };
     for (const char* name : candidates) {
         std::string p = dir + "/" + name;
@@ -97,6 +106,21 @@ static std::string extract_clean_text_if_json(const std::string& input) {
         pos = val_end + 1;
     }
     return clean_text.empty() ? input : clean_text;
+}
+
+static void trim_leading_replacement_and_spaces(std::string& str) {
+    while (!str.empty()) {
+        if (str.front() == ' ' || str.front() == '\t' || str.front() == '\r' || str.front() == '\n') {
+            str.erase(str.begin());
+        } else if (str.size() >= 3 &&
+                   (unsigned char)str[0] == 0xEF &&
+                   (unsigned char)str[1] == 0xBF &&
+                   (unsigned char)str[2] == 0xBD) {
+            str.erase(str.begin(), str.begin() + 3);
+        } else {
+            break;
+        }
+    }
 }
 
 // ============================================================================
@@ -331,8 +355,11 @@ struct crispasr_open_params_v1 {
 };
 
 extern "C" {
+    int crispasr_detect_backend_from_gguf(const char* path, char* out_name, int out_cap);
     crispasr_session* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const crispasr_open_params_v1* params);
     const char* crispasr_session_backend(crispasr_session* s);
+    void crispasr_session_close(crispasr_session* s);
+
     crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm, int n_samples, const char* language);
     int crispasr_session_result_n_segments(crispasr_session_result* r);
     const char* crispasr_session_result_segment_text(crispasr_session_result* r, int i);
@@ -344,20 +371,64 @@ extern "C" {
     int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
     float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
     void crispasr_session_result_free(crispasr_session_result* r);
-    void crispasr_session_close(crispasr_session* s);
+
+    // ASR setters
     int crispasr_session_set_translate(crispasr_session* s, int enable);
+    int crispasr_session_set_source_language(crispasr_session* s, const char* lang);
     int crispasr_session_set_target_language(crispasr_session* s, const char* lang);
     int crispasr_session_set_ask(crispasr_session* s, const char* prompt);
     int crispasr_session_set_hotwords(crispasr_session* s, const char* hotwords, float boost);
     int crispasr_session_set_beam_size(crispasr_session* s, int n);
     int crispasr_session_set_temperature(crispasr_session* s, float temperature, uint64_t seed);
     int crispasr_session_set_top_p(crispasr_session* s, float top_p);
+    int crispasr_session_set_top_k(crispasr_session* s, int top_k);
     int crispasr_session_set_min_p(crispasr_session* s, float min_p);
     int crispasr_session_set_repetition_penalty(crispasr_session* s, float r);
     int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty);
     int crispasr_session_set_best_of(crispasr_session* s, int n);
     int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);
     int crispasr_session_set_punctuation(crispasr_session* s, int enable);
+    int crispasr_session_set_punc_model(crispasr_session* s, const char* punc_model);
+    int crispasr_session_set_sensitivity(crispasr_session* s, const char* preset_name);
+    int crispasr_session_set_return_logits(crispasr_session* s, int enable);
+    int crispasr_session_set_alt_n(crispasr_session* s, int n);
+    int crispasr_session_set_whisper_decode_extras(crispasr_session* s, int suppress_nst, const char* suppress_regex, int carry_initial_prompt);
+    int crispasr_session_set_parakeet_att_context(crispasr_session* s, int left, int right);
+
+    // TTS & Synthesis
+    float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples);
+    float* crispasr_session_synthesize_raw(crispasr_session* s, const char* text, int* out_n_samples);
+    int crispasr_session_accept_marking_responsibility(crispasr_session* s, const char* attestation);
+    void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
+    float crispasr_watermark_detect(const float* pcm, int n_samples);
+    int crispasr_watermark_load_model(const char* gguf_path);
+    int crispasr_audio_load(const char* path, float** out_pcm, int* out_samples, int* out_sample_rate);
+    void crispasr_audio_free(float* pcm);
+    int crispasr_session_output_sample_rate(crispasr_session* s);
+    int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
+    int crispasr_session_set_voice(crispasr_session* s, const char* path, const char* ref_text_or_null);
+    int crispasr_session_set_speaker_name(crispasr_session* s, const char* name);
+    int crispasr_session_set_speaker_id(crispasr_session* s, int id);
+    int crispasr_session_set_instruct(crispasr_session* s, const char* instruct);
+    int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes);
+    void crispasr_session_set_tts_pad_silence_ms(crispasr_session* s, int ms);
+    int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed);
+    int crispasr_session_set_tts_steps(crispasr_session* s, int steps);
+    int crispasr_session_set_tts_num_candidates(crispasr_session* s, int n);
+    int crispasr_session_set_cfg_weight(crispasr_session* s, float cfg_weight);
+    int crispasr_session_set_length_scale(crispasr_session* s, float scale);
+    int crispasr_session_set_tts_noise_temp(crispasr_session* s, float noise_temp);
+    int crispasr_session_set_exaggeration(crispasr_session* s, float exaggeration);
+    int crispasr_session_set_max_speech_tokens(crispasr_session* s, int n);
+    int crispasr_session_set_min_speech_tokens(crispasr_session* s, int n);
+    int crispasr_session_set_speaker_identity(crispasr_session* s, const char* identity);
+    int crispasr_session_set_g2p_dict(crispasr_session* s, const char* source);
+    int crispasr_session_set_tts_reference_language(crispasr_session* s, const char* lang);
+    int crispasr_session_is_voice_design(crispasr_session* s);
+    int crispasr_session_is_custom_voice(crispasr_session* s);
+    int crispasr_session_n_speakers(crispasr_session* s);
+    const char* crispasr_session_get_speaker_name(crispasr_session* s, int i);
+    void crispasr_pcm_free(float* pcm);
 }
 
 struct crispasr_addon_result {
@@ -390,6 +461,7 @@ public:
                    std::string model_path,
                    std::string backend_name,
                    std::vector<float> pcmf32,
+                   std::string audio_file,
                    int n_threads,
                    bool use_gpu,
                    bool debug,
@@ -421,11 +493,23 @@ public:
                    bool reuse_instance,
                    int64_t auto_release_ms,
                    Napi::Function progress_callback,
-                   Napi::Env env)
+                   Napi::Env env,
+                   std::string source_language = "",
+                   std::string punc_model = "",
+                   std::string sensitivity = "",
+                   int top_k = -1,
+                   int return_logits = -1,
+                   int alt_n = -1,
+                   bool suppress_nst = false,
+                   std::string suppress_regex = "",
+                   bool carry_initial_prompt = false,
+                   int att_context_left = -1,
+                   int att_context_right = -1)
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
           m_backend_name(std::move(backend_name)),
           m_pcmf32(std::move(pcmf32)),
+          m_audio_file(std::move(audio_file)),
           m_n_threads(n_threads),
           m_use_gpu(use_gpu),
           m_debug(debug),
@@ -457,6 +541,17 @@ public:
           m_reuse_instance(reuse_instance),
           m_auto_release_ms(auto_release_ms),
           env(env),
+          m_source_language(std::move(source_language)),
+          m_punc_model(std::move(punc_model)),
+          m_sensitivity(std::move(sensitivity)),
+          m_top_k(top_k),
+          m_return_logits(return_logits),
+          m_alt_n(alt_n),
+          m_suppress_nst(suppress_nst),
+          m_suppress_regex(std::move(suppress_regex)),
+          m_carry_initial_prompt(carry_initial_prompt),
+          m_att_context_left(att_context_left),
+          m_att_context_right(att_context_right),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
         if (!progress_callback.IsEmpty()) {
@@ -510,6 +605,8 @@ public:
             sd.end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
 
             std::string clean_seg_text = extract_clean_text_if_json(sd.text);
+            trim_leading_replacement_and_spaces(clean_seg_text);
+            sd.text = clean_seg_text;
             if (!full_text.empty() && !clean_seg_text.empty()) {
                 full_text += " ";
             }
@@ -566,6 +663,14 @@ public:
     }
 
     void Execute() override {
+        if (m_pcmf32.empty() && !m_audio_file.empty()) {
+            std::vector<std::vector<float>> pcmf32s;
+            if (!read_audio_data(m_audio_file, m_pcmf32, pcmf32s, false)) {
+                SetError("failed to read audio file: " + m_audio_file);
+                return;
+            }
+        }
+
         auto& cache = ModelCache::instance();
         std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::CRISPASR_SESSION));
 
@@ -639,6 +744,32 @@ public:
         if (m_punctuation >= 0) {
             crispasr_session_set_punctuation(session, m_punctuation);
         }
+        if (!m_source_language.empty()) {
+            crispasr_session_set_source_language(session, m_source_language.c_str());
+        }
+        if (!m_punc_model.empty()) {
+            crispasr_session_set_punc_model(session, m_punc_model.c_str());
+        }
+        if (!m_sensitivity.empty()) {
+            crispasr_session_set_sensitivity(session, m_sensitivity.c_str());
+        }
+        if (m_top_k > 0) {
+            crispasr_session_set_top_k(session, m_top_k);
+        }
+        if (m_return_logits >= 0) {
+            crispasr_session_set_return_logits(session, m_return_logits);
+        }
+        if (m_alt_n > 0) {
+            crispasr_session_set_alt_n(session, m_alt_n);
+        }
+        if (m_suppress_nst || !m_suppress_regex.empty() || m_carry_initial_prompt) {
+            crispasr_session_set_whisper_decode_extras(session, m_suppress_nst ? 1 : 0,
+                                                       m_suppress_regex.empty() ? nullptr : m_suppress_regex.c_str(),
+                                                       m_carry_initial_prompt ? 1 : 0);
+        }
+        if (m_att_context_left >= 0 || m_att_context_right >= 0) {
+            crispasr_session_set_parakeet_att_context(session, m_att_context_left, m_att_context_right);
+        }
 
         // Load ForcedAligner if path provided
         qwen3_asr::ForcedAligner aligner;
@@ -682,6 +813,7 @@ public:
                     if (!total_txt.empty()) {
                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
                         std::string clean_txt = extract_clean_text_if_json(total_txt);
+                        trim_leading_replacement_and_spaces(clean_txt);
                         align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                     }
                 }
@@ -771,6 +903,7 @@ public:
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                     std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    trim_leading_replacement_and_spaces(clean_txt);
                                     align_res = aligner.align(chunk.data(), chunk.size(), clean_txt, detected_lang);
                                 }
                             }
@@ -831,6 +964,7 @@ private:
     std::string m_model_path;
     std::string m_backend_name;
     std::vector<float> m_pcmf32;
+    std::string m_audio_file;
     int m_n_threads;
     bool m_use_gpu;
     bool m_debug;
@@ -853,6 +987,17 @@ private:
     int m_max_new_tokens;
     int m_punctuation;
     std::string m_aligner_model_path;
+    std::string m_source_language;
+    std::string m_punc_model;
+    std::string m_sensitivity;
+    int m_top_k = -1;
+    int m_return_logits = -1;
+    int m_alt_n = -1;
+    bool m_suppress_nst = false;
+    std::string m_suppress_regex;
+    bool m_carry_initial_prompt = false;
+    int m_att_context_left = -1;
+    int m_att_context_right = -1;
     std::string m_vad_model_path;
     float m_vad_threshold;
     int m_min_speech_ms;
@@ -885,20 +1030,18 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         backend_name = options.Get("backend").As<Napi::String>();
         if (backend_name == "crispasr" || backend_name == "CrispASR") {
             backend_name = "";
+        } else if (backend_name == "moss" || backend_name == "moss-transcribe" || backend_name == "moss_transcribe") {
+            backend_name = "moss-diarize";
         }
     }
 
     std::vector<float> pcmf32;
+    std::string audio_file = "";
     if (options.Has("pcmf32") && options.Get("pcmf32").IsTypedArray()) {
         Napi::Float32Array pcmf32_arr = options.Get("pcmf32").As<Napi::Float32Array>();
         pcmf32.assign(pcmf32_arr.Data(), pcmf32_arr.Data() + pcmf32_arr.ElementLength());
     } else if (options.Has("file") && options.Get("file").IsString()) {
-        std::string audio_file = options.Get("file").As<Napi::String>();
-        std::vector<std::vector<float>> pcmf32s;
-        if (!read_audio_data(audio_file, pcmf32, pcmf32s, false)) {
-            Napi::Error::New(env, "failed to read audio file: " + audio_file).ThrowAsJavaScriptException();
-            return env.Undefined();
-        }
+        audio_file = options.Get("file").As<Napi::String>();
     } else {
         Napi::TypeError::New(env, "options.pcmf32 (Float32Array) or options.file (string) is required").ThrowAsJavaScriptException();
         return env.Undefined();
@@ -947,6 +1090,101 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
     std::string context = "";
     if (options.Has("context") && options.Get("context").IsString()) {
         context = options.Get("context").As<Napi::String>();
+    } else if (options.Has("prompt") && options.Get("prompt").IsString()) {
+        context = options.Get("prompt").As<Napi::String>();
+    } else if (options.Has("ask") && options.Get("ask").IsString()) {
+        context = options.Get("ask").As<Napi::String>();
+    }
+
+    std::string source_language = "";
+    if (options.Has("source_language") && options.Get("source_language").IsString()) {
+        source_language = options.Get("source_language").As<Napi::String>();
+    } else if (options.Has("sourceLanguage") && options.Get("sourceLanguage").IsString()) {
+        source_language = options.Get("sourceLanguage").As<Napi::String>();
+    } else if (options.Has("source-language") && options.Get("source-language").IsString()) {
+        source_language = options.Get("source-language").As<Napi::String>();
+    }
+
+    std::string punc_model = "";
+    if (options.Has("punc_model") && options.Get("punc_model").IsString()) {
+        punc_model = options.Get("punc_model").As<Napi::String>();
+    } else if (options.Has("puncModel") && options.Get("puncModel").IsString()) {
+        punc_model = options.Get("puncModel").As<Napi::String>();
+    } else if (options.Has("punc-model") && options.Get("punc-model").IsString()) {
+        punc_model = options.Get("punc-model").As<Napi::String>();
+    }
+
+    std::string sensitivity = "";
+    if (options.Has("sensitivity") && options.Get("sensitivity").IsString()) {
+        sensitivity = options.Get("sensitivity").As<Napi::String>();
+    }
+
+    int top_k = -1;
+    if (options.Has("top_k") && options.Get("top_k").IsNumber()) {
+        top_k = options.Get("top_k").As<Napi::Number>().Int32Value();
+    } else if (options.Has("topK") && options.Get("topK").IsNumber()) {
+        top_k = options.Get("topK").As<Napi::Number>().Int32Value();
+    } else if (options.Has("top-k") && options.Get("top-k").IsNumber()) {
+        top_k = options.Get("top-k").As<Napi::Number>().Int32Value();
+    }
+
+    int return_logits = -1;
+    if (options.Has("return_logits")) {
+        return_logits = options.Get("return_logits").As<Napi::Boolean>() ? 1 : 0;
+    } else if (options.Has("returnLogits")) {
+        return_logits = options.Get("returnLogits").As<Napi::Boolean>() ? 1 : 0;
+    } else if (options.Has("return-logits")) {
+        return_logits = options.Get("return-logits").As<Napi::Boolean>() ? 1 : 0;
+    }
+
+    int alt_n = -1;
+    if (options.Has("alt_n") && options.Get("alt_n").IsNumber()) {
+        alt_n = options.Get("alt_n").As<Napi::Number>().Int32Value();
+    } else if (options.Has("altN") && options.Get("altN").IsNumber()) {
+        alt_n = options.Get("altN").As<Napi::Number>().Int32Value();
+    } else if (options.Has("alt-n") && options.Get("alt-n").IsNumber()) {
+        alt_n = options.Get("alt-n").As<Napi::Number>().Int32Value();
+    }
+
+    bool suppress_nst = false;
+    if (options.Has("suppress_nst") && options.Get("suppress_nst").IsBoolean()) {
+        suppress_nst = options.Get("suppress_nst").As<Napi::Boolean>();
+    } else if (options.Has("suppressNst") && options.Get("suppressNst").IsBoolean()) {
+        suppress_nst = options.Get("suppressNst").As<Napi::Boolean>();
+    } else if (options.Has("suppress-nst") && options.Get("suppress-nst").IsBoolean()) {
+        suppress_nst = options.Get("suppress-nst").As<Napi::Boolean>();
+    }
+
+    std::string suppress_regex = "";
+    if (options.Has("suppress_regex") && options.Get("suppress_regex").IsString()) {
+        suppress_regex = options.Get("suppress_regex").As<Napi::String>();
+    } else if (options.Has("suppressRegex") && options.Get("suppressRegex").IsString()) {
+        suppress_regex = options.Get("suppressRegex").As<Napi::String>();
+    } else if (options.Has("suppress-regex") && options.Get("suppress-regex").IsString()) {
+        suppress_regex = options.Get("suppress-regex").As<Napi::String>();
+    }
+
+    bool carry_initial_prompt = false;
+    if (options.Has("carry_initial_prompt") && options.Get("carry_initial_prompt").IsBoolean()) {
+        carry_initial_prompt = options.Get("carry_initial_prompt").As<Napi::Boolean>();
+    } else if (options.Has("carryInitialPrompt") && options.Get("carryInitialPrompt").IsBoolean()) {
+        carry_initial_prompt = options.Get("carryInitialPrompt").As<Napi::Boolean>();
+    } else if (options.Has("carry-initial-prompt") && options.Get("carry-initial-prompt").IsBoolean()) {
+        carry_initial_prompt = options.Get("carry-initial-prompt").As<Napi::Boolean>();
+    }
+
+    int att_context_left = -1;
+    if (options.Has("att_context_left") && options.Get("att_context_left").IsNumber()) {
+        att_context_left = options.Get("att_context_left").As<Napi::Number>().Int32Value();
+    } else if (options.Has("attContextLeft") && options.Get("attContextLeft").IsNumber()) {
+        att_context_left = options.Get("attContextLeft").As<Napi::Number>().Int32Value();
+    }
+
+    int att_context_right = -1;
+    if (options.Has("att_context_right") && options.Get("att_context_right").IsNumber()) {
+        att_context_right = options.Get("att_context_right").As<Napi::Number>().Int32Value();
+    } else if (options.Has("attContextRight") && options.Get("attContextRight").IsNumber()) {
+        att_context_right = options.Get("attContextRight").As<Napi::Number>().Int32Value();
     }
 
     std::string hotwords = "";
@@ -1082,14 +1320,16 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
 
     Napi::Function callback = info[1].As<Napi::Function>();
     CrispASRWorker* worker = new CrispASRWorker(
-        callback, model_path, backend_name, std::move(pcmf32), n_threads, use_gpu, debug, 
+        callback, model_path, backend_name, std::move(pcmf32), std::move(audio_file), n_threads, use_gpu, debug, 
         flash_attn, n_gpu_layers, language,
         translate, target_language, context, hotwords, hotwords_boost, beam_size,
         temperature, seed, top_p, min_p, repetition_penalty, frequency_penalty, best_of, max_new_tokens, punctuation,
         aligner_model_path,
         vad_model_path, vad_threshold, min_speech_ms, min_silence_ms, speech_pad_ms, max_speech_ms,
         reuse_instance, auto_release_ms,
-        progress_callback, env
+        progress_callback, env,
+        source_language, punc_model, sensitivity, top_k, return_logits, alt_n, suppress_nst, suppress_regex,
+        carry_initial_prompt, att_context_left, att_context_right
     );
     worker->Queue();
 
@@ -1127,6 +1367,8 @@ public:
             m_backend_name = options.Get("backend").As<Napi::String>();
             if (m_backend_name == "crispasr" || m_backend_name == "CrispASR") {
                 m_backend_name = "";
+            } else if (m_backend_name == "moss" || m_backend_name == "moss-transcribe" || m_backend_name == "moss_transcribe") {
+                m_backend_name = "moss-diarize";
             }
         }
         if (options.Has("language")) m_language = options.Get("language").As<Napi::String>();
@@ -1139,6 +1381,88 @@ public:
         if (options.Has("translate")) m_translate = options.Get("translate").As<Napi::Boolean>();
         if (options.Has("target_language")) m_target_language = options.Get("target_language").As<Napi::String>();
         if (options.Has("context")) m_context = options.Get("context").As<Napi::String>();
+        else if (options.Has("prompt")) m_context = options.Get("prompt").As<Napi::String>();
+        else if (options.Has("ask")) m_context = options.Get("ask").As<Napi::String>();
+
+        if (options.Has("source_language") && options.Get("source_language").IsString()) {
+            m_source_language = options.Get("source_language").As<Napi::String>();
+        } else if (options.Has("sourceLanguage") && options.Get("sourceLanguage").IsString()) {
+            m_source_language = options.Get("sourceLanguage").As<Napi::String>();
+        } else if (options.Has("source-language") && options.Get("source-language").IsString()) {
+            m_source_language = options.Get("source-language").As<Napi::String>();
+        }
+
+        if (options.Has("punc_model") && options.Get("punc_model").IsString()) {
+            m_punc_model = options.Get("punc_model").As<Napi::String>();
+        } else if (options.Has("puncModel") && options.Get("puncModel").IsString()) {
+            m_punc_model = options.Get("puncModel").As<Napi::String>();
+        } else if (options.Has("punc-model") && options.Get("punc-model").IsString()) {
+            m_punc_model = options.Get("punc-model").As<Napi::String>();
+        }
+
+        if (options.Has("sensitivity") && options.Get("sensitivity").IsString()) {
+            m_sensitivity = options.Get("sensitivity").As<Napi::String>();
+        }
+
+        if (options.Has("top_k") && options.Get("top_k").IsNumber()) {
+            m_top_k = options.Get("top_k").As<Napi::Number>().Int32Value();
+        } else if (options.Has("topK") && options.Get("topK").IsNumber()) {
+            m_top_k = options.Get("topK").As<Napi::Number>().Int32Value();
+        } else if (options.Has("top-k") && options.Get("top-k").IsNumber()) {
+            m_top_k = options.Get("top-k").As<Napi::Number>().Int32Value();
+        }
+
+        if (options.Has("return_logits")) {
+            m_return_logits = options.Get("return_logits").As<Napi::Boolean>() ? 1 : 0;
+        } else if (options.Has("returnLogits")) {
+            m_return_logits = options.Get("returnLogits").As<Napi::Boolean>() ? 1 : 0;
+        } else if (options.Has("return-logits")) {
+            m_return_logits = options.Get("return-logits").As<Napi::Boolean>() ? 1 : 0;
+        }
+
+        if (options.Has("alt_n") && options.Get("alt_n").IsNumber()) {
+            m_alt_n = options.Get("alt_n").As<Napi::Number>().Int32Value();
+        } else if (options.Has("altN") && options.Get("altN").IsNumber()) {
+            m_alt_n = options.Get("altN").As<Napi::Number>().Int32Value();
+        } else if (options.Has("alt-n") && options.Get("alt-n").IsNumber()) {
+            m_alt_n = options.Get("alt-n").As<Napi::Number>().Int32Value();
+        }
+
+        if (options.Has("suppress_nst") && options.Get("suppress_nst").IsBoolean()) {
+            m_suppress_nst = options.Get("suppress_nst").As<Napi::Boolean>();
+        } else if (options.Has("suppressNst") && options.Get("suppressNst").IsBoolean()) {
+            m_suppress_nst = options.Get("suppressNst").As<Napi::Boolean>();
+        } else if (options.Has("suppress-nst") && options.Get("suppress-nst").IsBoolean()) {
+            m_suppress_nst = options.Get("suppress-nst").As<Napi::Boolean>();
+        }
+
+        if (options.Has("suppress_regex") && options.Get("suppress_regex").IsString()) {
+            m_suppress_regex = options.Get("suppress_regex").As<Napi::String>();
+        } else if (options.Has("suppressRegex") && options.Get("suppressRegex").IsString()) {
+            m_suppress_regex = options.Get("suppressRegex").As<Napi::String>();
+        } else if (options.Has("suppress-regex") && options.Get("suppress-regex").IsString()) {
+            m_suppress_regex = options.Get("suppress-regex").As<Napi::String>();
+        }
+
+        if (options.Has("carry_initial_prompt") && options.Get("carry_initial_prompt").IsBoolean()) {
+            m_carry_initial_prompt = options.Get("carry_initial_prompt").As<Napi::Boolean>();
+        } else if (options.Has("carryInitialPrompt") && options.Get("carryInitialPrompt").IsBoolean()) {
+            m_carry_initial_prompt = options.Get("carryInitialPrompt").As<Napi::Boolean>();
+        } else if (options.Has("carry-initial-prompt") && options.Get("carry-initial-prompt").IsBoolean()) {
+            m_carry_initial_prompt = options.Get("carry-initial-prompt").As<Napi::Boolean>();
+        }
+
+        if (options.Has("att_context_left") && options.Get("att_context_left").IsNumber()) {
+            m_att_context_left = options.Get("att_context_left").As<Napi::Number>().Int32Value();
+        } else if (options.Has("attContextLeft") && options.Get("attContextLeft").IsNumber()) {
+            m_att_context_left = options.Get("attContextLeft").As<Napi::Number>().Int32Value();
+        }
+
+        if (options.Has("att_context_right") && options.Get("att_context_right").IsNumber()) {
+            m_att_context_right = options.Get("att_context_right").As<Napi::Number>().Int32Value();
+        } else if (options.Has("attContextRight") && options.Get("attContextRight").IsNumber()) {
+            m_att_context_right = options.Get("attContextRight").As<Napi::Number>().Int32Value();
+        }
         
         if (options.Has("hotwords") && options.Get("hotwords").IsString()) {
             m_hotwords = options.Get("hotwords").As<Napi::String>();
@@ -1242,78 +1566,17 @@ public:
 
     Napi::Value Start(const Napi::CallbackInfo& info) {
         Napi::Env env = info.Env();
-        Napi::Function callback = info[0].As<Napi::Function>();
-        m_tsfn = Napi::ThreadSafeFunction::New(env, callback, "CrispASRStream", 0, 1);
-        
-        crispasr_open_params_v1 params;
-        memset(&params, 0, sizeof(params));
-        params.abi_version = 2;
-        params.n_threads = m_n_threads;
-        params.use_gpu = m_use_gpu ? 1 : 0;
-        params.verbosity = m_debug ? 1 : 0;
-        params.flash_attn = m_flash_attn ? 1 : 0;
-        params.n_gpu_layers = m_n_gpu_layers;
-
-        const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
-        m_session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
-        if (!m_session) {
-            Napi::Error::New(env, "Failed to open CrispASR session").ThrowAsJavaScriptException();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            Napi::TypeError::New(env, "start() requires a callback function").ThrowAsJavaScriptException();
             return env.Undefined();
         }
-
-        crispasr_session_set_translate(m_session, m_translate ? 1 : 0);
-        if (!m_target_language.empty()) {
-            crispasr_session_set_target_language(m_session, m_target_language.c_str());
+        if (m_running) {
+            Napi::Error::New(env, "Stream is already running").ThrowAsJavaScriptException();
+            return env.Undefined();
         }
-        if (!m_context.empty()) {
-            crispasr_session_set_ask(m_session, m_context.c_str());
-        }
-        if (!m_hotwords.empty()) {
-            crispasr_session_set_hotwords(m_session, m_hotwords.c_str(), m_hotwords_boost);
-        }
-        if (m_beam_size > 1) {
-            crispasr_session_set_beam_size(m_session, m_beam_size);
-        }
-        if (m_temperature >= 0.0f) {
-            crispasr_session_set_temperature(m_session, m_temperature, m_seed >= 0 ? static_cast<uint64_t>(m_seed) : 0ULL);
-        }
-        if (m_top_p >= 0.0f) {
-            crispasr_session_set_top_p(m_session, m_top_p);
-        }
-        if (m_min_p >= 0.0f) {
-            crispasr_session_set_min_p(m_session, m_min_p);
-        }
-        if (m_repetition_penalty >= 0.0f) {
-            crispasr_session_set_repetition_penalty(m_session, m_repetition_penalty);
-        }
-        if (m_frequency_penalty >= 0.0f) {
-            crispasr_session_set_frequency_penalty(m_session, m_frequency_penalty);
-        }
-        if (m_best_of > 0) {
-            crispasr_session_set_best_of(m_session, m_best_of);
-        }
-        if (m_max_new_tokens > 0) {
-            crispasr_session_set_max_new_tokens(m_session, m_max_new_tokens);
-        }
-        if (m_punctuation >= 0) {
-            crispasr_session_set_punctuation(m_session, m_punctuation);
-        }
-
-        if (!m_aligner_model_path.empty()) {
-            m_aligner = std::make_unique<qwen3_asr::ForcedAligner>();
-            if (!m_aligner->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
-                fprintf(stderr, "[STREAM] Warning: Failed to load Forced Align model\n");
-            }
-        }
-        
+        Napi::Function callback = info[0].As<Napi::Function>();
+        m_tsfn = Napi::ThreadSafeFunction::New(env, callback, "CrispASRStream", 0, 1);
         m_segment_index = 0;
-        if (!m_vad_model_path.empty()) {
-            whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
-            vad_ctx_params.n_threads = m_n_threads;
-            vad_ctx_params.use_gpu = false;
-            m_vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
-        }
-        
         m_running = true;
         m_worker_thread = std::thread(&CrispASRStream::Worker, this);
         return env.Undefined();
@@ -1384,14 +1647,9 @@ private:
                 text += seg_text;
             }
         }
+        trim_leading_replacement_and_spaces(text);
 
-        bool should_extract_words = true;
-        if (m_backend_name.find("voxtral") != std::string::npos ||
-            m_backend_name.find("vibevoice") != std::string::npos) {
-            should_extract_words = false;
-        }
-
-        if (should_extract_words && words_list.empty()) {
+        if (words_list.empty()) {
             for (int i = 0; i < n_segs; i++) {
                 int n_words = crispasr_session_result_n_words(res, i);
                 for (int j = 0; j < n_words; j++) {
@@ -1405,6 +1663,17 @@ private:
                 }
             }
         }
+
+        // Clean out empty, whitespace-only, or replacement character artifact words
+        std::vector<stream_word_item> filtered_words;
+        filtered_words.reserve(words_list.size());
+        for (auto& wi : words_list) {
+            trim_leading_replacement_and_spaces(wi.word);
+            if (!wi.word.empty() && wi.word != "\xEF\xBF\xBD") {
+                filtered_words.push_back(std::move(wi));
+            }
+        }
+        words_list = std::move(filtered_words);
         
         if ((!text.empty() || type == "segment") && m_tsfn) {
             auto cb_data = std::make_tuple(start_time, end_time, text, words_list, type);
@@ -1450,6 +1719,109 @@ private:
     }
 
     void Worker() {
+        crispasr_open_params_v1 params;
+        memset(&params, 0, sizeof(params));
+        params.abi_version = 2;
+        params.n_threads = m_n_threads;
+        params.use_gpu = m_use_gpu ? 1 : 0;
+        params.verbosity = m_debug ? 1 : 0;
+        params.flash_attn = m_flash_attn ? 1 : 0;
+        params.n_gpu_layers = m_n_gpu_layers;
+
+        const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
+        m_session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
+        if (!m_session) {
+            if (m_tsfn) {
+                m_tsfn.BlockingCall([](Napi::Env env, Napi::Function cb) {
+                    cb.Call({Napi::Error::New(env, "Failed to open CrispASR session").Value(), env.Null()});
+                });
+            }
+            m_running = false;
+            return;
+        }
+
+        if (!m_running) {
+            return;
+        }
+
+        crispasr_session_set_translate(m_session, m_translate ? 1 : 0);
+        if (!m_target_language.empty()) {
+            crispasr_session_set_target_language(m_session, m_target_language.c_str());
+        }
+        if (!m_context.empty()) {
+            crispasr_session_set_ask(m_session, m_context.c_str());
+        }
+        if (!m_hotwords.empty()) {
+            crispasr_session_set_hotwords(m_session, m_hotwords.c_str(), m_hotwords_boost);
+        }
+        if (m_beam_size > 1) {
+            crispasr_session_set_beam_size(m_session, m_beam_size);
+        }
+        if (m_temperature >= 0.0f) {
+            crispasr_session_set_temperature(m_session, m_temperature, m_seed >= 0 ? static_cast<uint64_t>(m_seed) : 0ULL);
+        }
+        if (m_top_p >= 0.0f) {
+            crispasr_session_set_top_p(m_session, m_top_p);
+        }
+        if (m_min_p >= 0.0f) {
+            crispasr_session_set_min_p(m_session, m_min_p);
+        }
+        if (m_repetition_penalty >= 0.0f) {
+            crispasr_session_set_repetition_penalty(m_session, m_repetition_penalty);
+        }
+        if (m_frequency_penalty >= 0.0f) {
+            crispasr_session_set_frequency_penalty(m_session, m_frequency_penalty);
+        }
+        if (m_best_of > 0) {
+            crispasr_session_set_best_of(m_session, m_best_of);
+        }
+        if (m_max_new_tokens > 0) {
+            crispasr_session_set_max_new_tokens(m_session, m_max_new_tokens);
+        }
+        if (m_punctuation >= 0) {
+            crispasr_session_set_punctuation(m_session, m_punctuation);
+        }
+        if (!m_source_language.empty()) {
+            crispasr_session_set_source_language(m_session, m_source_language.c_str());
+        }
+        if (!m_punc_model.empty()) {
+            crispasr_session_set_punc_model(m_session, m_punc_model.c_str());
+        }
+        if (!m_sensitivity.empty()) {
+            crispasr_session_set_sensitivity(m_session, m_sensitivity.c_str());
+        }
+        if (m_top_k > 0) {
+            crispasr_session_set_top_k(m_session, m_top_k);
+        }
+        if (m_return_logits >= 0) {
+            crispasr_session_set_return_logits(m_session, m_return_logits);
+        }
+        if (m_alt_n > 0) {
+            crispasr_session_set_alt_n(m_session, m_alt_n);
+        }
+        if (m_suppress_nst || !m_suppress_regex.empty() || m_carry_initial_prompt) {
+            crispasr_session_set_whisper_decode_extras(m_session, m_suppress_nst ? 1 : 0,
+                                                       m_suppress_regex.empty() ? nullptr : m_suppress_regex.c_str(),
+                                                       m_carry_initial_prompt ? 1 : 0);
+        }
+        if (m_att_context_left >= 0 || m_att_context_right >= 0) {
+            crispasr_session_set_parakeet_att_context(m_session, m_att_context_left, m_att_context_right);
+        }
+
+        if (!m_aligner_model_path.empty()) {
+            m_aligner = std::make_unique<qwen3_asr::ForcedAligner>();
+            if (!m_aligner->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                fprintf(stderr, "[STREAM] Warning: Failed to load Forced Align model\n");
+            }
+        }
+
+        if (!m_vad_model_path.empty()) {
+            whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
+            vad_ctx_params.n_threads = m_n_threads;
+            vad_ctx_params.use_gpu = false;
+            m_vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
+        }
+
         const int sample_rate = 16000;
         const int chunk_samples = (m_chunk_size_ms * sample_rate) / 1000;
         const char* lang_ptr = m_language.empty() ? nullptr : m_language.c_str();
@@ -1607,6 +1979,7 @@ private:
                                             if (!total_txt.empty()) {
                                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                                 std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                                trim_leading_replacement_and_spaces(clean_txt);
                                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                                 if (align_res.success) {
                                                     for (const auto& w : align_res.words) {
@@ -1653,6 +2026,7 @@ private:
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                     std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    trim_leading_replacement_and_spaces(clean_txt);
                                     auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                     if (align_res.success) {
                                         for (const auto& w : align_res.words) {
@@ -1722,6 +2096,7 @@ private:
                                     if (!total_txt.empty()) {
                                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                         std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                        trim_leading_replacement_and_spaces(clean_txt);
                                         auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                         if (align_res.success) {
                                             for (const auto& w : align_res.words) {
@@ -1794,6 +2169,7 @@ private:
                             if (!total_txt.empty()) {
                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
                                 std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                trim_leading_replacement_and_spaces(clean_txt);
                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                 if (align_res.success) {
                                     for (const auto& w : align_res.words) {
@@ -1852,6 +2228,17 @@ private:
     int m_max_new_tokens = -1;
     int m_punctuation = -1;
     std::string m_aligner_model_path = "";
+    std::string m_source_language = "";
+    std::string m_punc_model = "";
+    std::string m_sensitivity = "";
+    int m_top_k = -1;
+    int m_return_logits = -1;
+    int m_alt_n = -1;
+    bool m_suppress_nst = false;
+    std::string m_suppress_regex = "";
+    bool m_carry_initial_prompt = false;
+    int m_att_context_left = -1;
+    int m_att_context_right = -1;
     bool m_debug = false;
     int m_n_threads = std::min(4, (int32_t)std::thread::hardware_concurrency());
     bool m_use_gpu = true;
@@ -1915,7 +2302,22 @@ public:
                       uint64_t seed,
                       bool reuse_instance,
                       int64_t auto_release_ms,
-                      Napi::Env env)
+                      Napi::Env env,
+                      std::string backend_name = "",
+                      bool watermark = false,
+                      float speed = 1.0f,
+                      int steps = -1,
+                      float cfg_scale = -1.0f,
+                      float noise_temp = -1.0f,
+                      int num_candidates = -1,
+                      int min_speech_tokens = -1,
+                      int max_speech_tokens = -1,
+                      float exaggeration = -1.0f,
+                      std::string phonemes = "",
+                      int pad_silence_ms = 0,
+                      std::string speaker_identity = "",
+                      std::string g2p_dict = "",
+                      std::string ref_lang = "")
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
           m_codec_model_path(std::move(codec_model_path)),
@@ -1930,7 +2332,22 @@ public:
           m_temperature(temperature),
           m_seed(seed),
           m_reuse_instance(reuse_instance),
-          m_auto_release_ms(auto_release_ms) {}
+          m_auto_release_ms(auto_release_ms),
+          m_backend_name(std::move(backend_name)),
+          m_watermark(watermark),
+          m_speed(speed),
+          m_steps(steps),
+          m_cfg_scale(cfg_scale),
+          m_noise_temp(noise_temp),
+          m_num_candidates(num_candidates),
+          m_min_speech_tokens(min_speech_tokens),
+          m_max_speech_tokens(max_speech_tokens),
+          m_exaggeration(exaggeration),
+          m_phonemes(std::move(phonemes)),
+          m_pad_silence_ms(pad_silence_ms),
+          m_speaker_identity(std::move(speaker_identity)),
+          m_g2p_dict(std::move(g2p_dict)),
+          m_ref_lang(std::move(ref_lang)) {}
 
     void Execute() override {
         AddonAutoReleaseScope ar_scope;
@@ -1946,112 +2363,154 @@ public:
         auto& cache = ModelCache::instance();
         std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::QWEN3_TTS));
 
-        struct qwen3_tts_context* ctx = nullptr;
+        crispasr_session* session = nullptr;
         bool owned = false;
 
+        std::string cache_tag = m_backend_name.empty() ? m_codec_model_path : (m_backend_name + "|" + m_codec_model_path);
         if (m_reuse_instance) {
-            ctx = static_cast<struct qwen3_tts_context*>(
-                cache.acquire(ModelType::QWEN3_TTS, m_model_path, m_use_gpu, m_codec_model_path));
+            session = static_cast<crispasr_session*>(
+                cache.acquire(ModelType::QWEN3_TTS, m_model_path, m_use_gpu, cache_tag));
         }
 
-        if (!ctx) {
-            struct qwen3_tts_context_params cp = qwen3_tts_context_default_params();
-            cp.n_threads = m_n_threads;
-            cp.verbosity = 0;
-            cp.use_gpu = m_use_gpu;
-            cp.temperature = m_temperature;
-            cp.seed = m_seed;
+        if (!session) {
+            crispasr_open_params_v1 params;
+            memset(&params, 0, sizeof(params));
+            params.abi_version = 2;
+            params.n_threads = m_n_threads;
+            params.use_gpu = m_use_gpu ? 1 : 0;
+            params.verbosity = 0;
+            params.flash_attn = 1;
+            params.n_gpu_layers = -1;
 
-            ctx = qwen3_tts_init_from_file(m_model_path.c_str(), cp);
-            if (!ctx) {
-                SetError("Failed to initialize Qwen3-TTS context from " + m_model_path);
+            const char* backend_ptr = m_backend_name.empty() ? nullptr : m_backend_name.c_str();
+            session = crispasr_session_open_with_params(m_model_path.c_str(), backend_ptr, &params);
+            if (!session) {
+                SetError("Failed to initialize CrispASR TTS session from " + m_model_path);
                 return;
             }
 
             std::string codec_path = m_codec_model_path;
             if (codec_path.empty()) {
-                qwen3_tts_free(ctx);
-                SetError("No codec model found for Qwen3-TTS. Please specify codec_model or place qwen3-tts-tokenizer-12hz.gguf next to talker model.");
-                return;
+                codec_path = crisp_discover_codec(m_model_path);
             }
-
-            if (qwen3_tts_set_codec_path(ctx, codec_path.c_str()) != 0) {
-                qwen3_tts_free(ctx);
-                SetError("Failed to load codec model from " + codec_path);
-                return;
+            if (!codec_path.empty()) {
+                crispasr_session_set_codec_path(session, codec_path.c_str());
             }
 
             if (m_reuse_instance) {
-                cache.store(ModelType::QWEN3_TTS, ctx, m_model_path, m_use_gpu, m_codec_model_path, m_auto_release_ms);
+                cache.store(ModelType::QWEN3_TTS, session, m_model_path, m_use_gpu, cache_tag, m_auto_release_ms);
             } else {
                 owned = true;
             }
         }
 
-        qwen3_tts_set_temperature(ctx, m_temperature);
-        qwen3_tts_set_seed(ctx, m_seed);
-
-        if (!m_language.empty()) {
-            std::string lang = m_language;
-            std::transform(lang.begin(), lang.end(), lang.begin(), [](unsigned char c){ return std::tolower(c); });
-            if (lang == "zh") lang = "chinese";
-            else if (lang == "en") lang = "english";
-            else if (lang == "ja") lang = "japanese";
-            else if (lang == "ko") lang = "korean";
-            else if (lang == "de") lang = "german";
-            else if (lang == "fr") lang = "french";
-            else if (lang == "ru") lang = "russian";
-            else if (lang == "pt") lang = "portuguese";
-            else if (lang == "es") lang = "spanish";
-            else if (lang == "it") lang = "italian";
-            qwen3_tts_set_language_by_name(ctx, lang.c_str());
-        } else {
-            qwen3_tts_set_language_by_name(ctx, "auto");
+        if (!m_codec_model_path.empty()) {
+            crispasr_session_set_codec_path(session, m_codec_model_path.c_str());
         }
 
-        if (qwen3_tts_is_voice_design(ctx)) {
-            qwen3_tts_set_instruct(ctx, m_instruct.c_str());
-        } else if (qwen3_tts_is_custom_voice(ctx)) {
-            if (!m_voice.empty()) {
-                qwen3_tts_set_speaker_by_name(ctx, m_voice.c_str());
-            } else {
-                const char* first_spk = qwen3_tts_get_speaker_name(ctx, 0);
-                if (first_spk) {
-                    qwen3_tts_set_speaker_by_name(ctx, first_spk);
-                }
-            }
-            qwen3_tts_set_cv_style_instruct(ctx, m_instruct.c_str());
-        } else if (!m_voice.empty()) {
-            if (m_voice.size() > 4 && (m_voice.substr(m_voice.size() - 4) == ".wav" || m_voice.substr(m_voice.size() - 4) == ".WAV")) {
-                if (!m_ref_text.empty()) {
-                    qwen3_tts_set_voice_prompt_with_text(ctx, m_voice.c_str(), m_ref_text.c_str());
-                } else {
-                    qwen3_tts_set_voice_prompt_with_text(ctx, "", "");
-                    qwen3_tts_set_voice_prompt_xvec_only(ctx, m_voice.c_str());
-                }
-            } else {
-                qwen3_tts_set_voice_prompt_with_text(ctx, "", "");
-                qwen3_tts_load_voice_pack(ctx, m_voice.c_str());
-            }
+        if (m_temperature >= 0.0f) {
+            crispasr_session_set_temperature(session, m_temperature, m_seed);
+        }
+        crispasr_session_set_tts_seed(session, m_seed);
+
+        if (!m_language.empty()) {
+            crispasr_session_set_target_language(session, m_language.c_str());
+        }
+        if (!m_ref_lang.empty()) {
+            crispasr_session_set_tts_reference_language(session, m_ref_lang.c_str());
+        }
+
+        if (!m_voice.empty() || !m_ref_text.empty()) {
+            crispasr_session_set_voice(session, m_voice.c_str(), m_ref_text.empty() ? nullptr : m_ref_text.c_str());
+        }
+
+        if (!m_instruct.empty()) {
+            crispasr_session_set_instruct(session, m_instruct.c_str());
+        }
+
+        if (!m_phonemes.empty()) {
+            crispasr_session_set_tts_phonemes(session, m_phonemes.c_str());
+        }
+
+        if (m_pad_silence_ms > 0) {
+            crispasr_session_set_tts_pad_silence_ms(session, m_pad_silence_ms);
+        }
+
+        if (m_steps > 0) {
+            crispasr_session_set_tts_steps(session, m_steps);
+        }
+
+        if (m_cfg_scale >= 0.0f) {
+            crispasr_session_set_cfg_weight(session, m_cfg_scale);
+        }
+
+        if (m_noise_temp >= 0.0f) {
+            crispasr_session_set_tts_noise_temp(session, m_noise_temp);
+        }
+
+        if (m_num_candidates > 0) {
+            crispasr_session_set_tts_num_candidates(session, m_num_candidates);
+        }
+
+        if (m_speed > 0.0f && m_speed != 1.0f) {
+            crispasr_session_set_length_scale(session, 1.0f / m_speed);
+        }
+
+        if (m_min_speech_tokens >= 0) {
+            crispasr_session_set_min_speech_tokens(session, m_min_speech_tokens);
+        }
+        if (m_max_speech_tokens > 0) {
+            crispasr_session_set_max_speech_tokens(session, m_max_speech_tokens);
+        }
+
+        if (m_exaggeration >= 0.0f) {
+            crispasr_session_set_exaggeration(session, m_exaggeration);
+        }
+
+        if (!m_speaker_identity.empty()) {
+            crispasr_session_set_speaker_identity(session, m_speaker_identity.c_str());
+        }
+
+        if (!m_g2p_dict.empty()) {
+            crispasr_session_set_g2p_dict(session, m_g2p_dict.c_str());
         }
 
         int n_samples = 0;
-        float* pcm = qwen3_tts_synthesize(ctx, m_text.c_str(), &n_samples);
+        float* pcm = nullptr;
+
+        if (m_watermark) {
+            pcm = crispasr_session_synthesize(session, m_text.c_str(), &n_samples);
+        } else {
+            crispasr_session_accept_marking_responsibility(session, "Caller accepted marking responsibility via addon options");
+            pcm = crispasr_session_synthesize_raw(session, m_text.c_str(), &n_samples);
+            if (!pcm) {
+                pcm = crispasr_session_synthesize(session, m_text.c_str(), &n_samples);
+            }
+        }
+
         if (!pcm || n_samples <= 0) {
             if (owned) {
-                qwen3_tts_free(ctx);
+                crispasr_session_close(session);
             } else {
                 cache.markIdle(ModelType::QWEN3_TTS);
             }
-            SetError("Qwen3-TTS synthesis failed or returned empty audio");
+            SetError("CrispASR TTS synthesis failed or returned empty audio");
             return;
         }
 
         m_pcm_samples.assign(pcm, pcm + n_samples);
-        qwen3_tts_pcm_free(pcm);
+        crispasr_pcm_free(pcm);
+
+        int native_sr = crispasr_session_output_sample_rate(session);
+        if (native_sr <= 0) {
+            native_sr = 24000;
+        }
+        m_sample_rate = native_sr;
+        const char* b = crispasr_session_backend(session);
+        m_backend = b ? b : "";
 
         if (owned) {
-            qwen3_tts_free(ctx);
+            crispasr_session_close(session);
         } else {
             cache.markIdle(ModelType::QWEN3_TTS);
         }
@@ -2059,7 +2518,7 @@ public:
         if (!m_output_path.empty()) {
             std::ofstream fout(m_output_path, std::ios::binary);
             if (fout.is_open()) {
-                uint32_t sample_rate = 24000;
+                uint32_t sample_rate = static_cast<uint32_t>(m_sample_rate);
                 uint16_t num_channels = 1;
                 uint16_t bits_per_sample = 16;
                 uint32_t byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
@@ -2098,9 +2557,11 @@ public:
             Napi::HandleScope scope(Env());
             Napi::Object result = Napi::Object::New(Env());
 
-            result.Set("sampleRate", Napi::Number::New(Env(), 24000));
+            result.Set("sampleRate", Napi::Number::New(Env(), m_sample_rate));
             result.Set("n_samples", Napi::Number::New(Env(), m_pcm_samples.size()));
-            result.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm_samples.size()) / 24000.0));
+            result.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm_samples.size()) / static_cast<double>(m_sample_rate)));
+            result.Set("watermarked", Napi::Boolean::New(Env(), m_watermark));
+            result.Set("backend", Napi::String::New(Env(), m_backend));
 
             if (!m_output_path.empty()) {
                 result.Set("path", Napi::String::New(Env(), m_output_path));
@@ -2146,6 +2607,23 @@ private:
     uint64_t m_seed;
     bool m_reuse_instance;
     int64_t m_auto_release_ms;
+    std::string m_backend_name;
+    bool m_watermark = false;
+    float m_speed = 1.0f;
+    int m_steps = -1;
+    float m_cfg_scale = -1.0f;
+    float m_noise_temp = -1.0f;
+    int m_num_candidates = -1;
+    int m_min_speech_tokens = -1;
+    int m_max_speech_tokens = -1;
+    float m_exaggeration = -1.0f;
+    std::string m_phonemes;
+    int m_pad_silence_ms = 0;
+    std::string m_speaker_identity;
+    std::string m_g2p_dict;
+    std::string m_ref_lang;
+    int m_sample_rate = 24000;
+    std::string m_backend;
     std::vector<float> m_pcm_samples;
 };
 
@@ -2219,11 +2697,758 @@ Napi::Value crispasrTTS(const Napi::CallbackInfo& info) {
         auto_release_ms = options.Get("auto_release_ms").As<Napi::Number>().Int64Value();
     }
 
+    std::string backend_name = "";
+    if (options.Has("backend") && options.Get("backend").IsString()) {
+        backend_name = options.Get("backend").As<Napi::String>().Utf8Value();
+        if (backend_name == "crispasr" || backend_name == "CrispASR") {
+            backend_name = "";
+        }
+    }
+
+    bool watermark = false;
+    if (options.Has("watermark") && options.Get("watermark").IsBoolean()) {
+        watermark = options.Get("watermark").As<Napi::Boolean>().Value();
+    } else if (options.Has("enable_watermark") && options.Get("enable_watermark").IsBoolean()) {
+        watermark = options.Get("enable_watermark").As<Napi::Boolean>().Value();
+    } else if (options.Has("enableWatermark") && options.Get("enableWatermark").IsBoolean()) {
+        watermark = options.Get("enableWatermark").As<Napi::Boolean>().Value();
+    }
+
+    float speed = 1.0f;
+    if (options.Has("speed") && options.Get("speed").IsNumber()) {
+        speed = options.Get("speed").As<Napi::Number>().FloatValue();
+    } else if (options.Has("rate") && options.Get("rate").IsNumber()) {
+        speed = options.Get("rate").As<Napi::Number>().FloatValue();
+    }
+
+    int steps = -1;
+    if (options.Has("steps") && options.Get("steps").IsNumber()) {
+        steps = options.Get("steps").As<Napi::Number>().Int32Value();
+    } else if (options.Has("num_steps") && options.Get("num_steps").IsNumber()) {
+        steps = options.Get("num_steps").As<Napi::Number>().Int32Value();
+    } else if (options.Has("numSteps") && options.Get("numSteps").IsNumber()) {
+        steps = options.Get("numSteps").As<Napi::Number>().Int32Value();
+    } else if (options.Has("tts_steps") && options.Get("tts_steps").IsNumber()) {
+        steps = options.Get("tts_steps").As<Napi::Number>().Int32Value();
+    } else if (options.Has("ttsSteps") && options.Get("ttsSteps").IsNumber()) {
+        steps = options.Get("ttsSteps").As<Napi::Number>().Int32Value();
+    }
+
+    float cfg_scale = -1.0f;
+    if (options.Has("cfg_scale") && options.Get("cfg_scale").IsNumber()) {
+        cfg_scale = options.Get("cfg_scale").As<Napi::Number>().FloatValue();
+    } else if (options.Has("cfgScale") && options.Get("cfgScale").IsNumber()) {
+        cfg_scale = options.Get("cfgScale").As<Napi::Number>().FloatValue();
+    } else if (options.Has("cfg_weight") && options.Get("cfg_weight").IsNumber()) {
+        cfg_scale = options.Get("cfg_weight").As<Napi::Number>().FloatValue();
+    } else if (options.Has("cfgWeight") && options.Get("cfgWeight").IsNumber()) {
+        cfg_scale = options.Get("cfgWeight").As<Napi::Number>().FloatValue();
+    } else if (options.Has("tts_cfg_scale") && options.Get("tts_cfg_scale").IsNumber()) {
+        cfg_scale = options.Get("tts_cfg_scale").As<Napi::Number>().FloatValue();
+    }
+
+    float noise_temp = -1.0f;
+    if (options.Has("noise_temp") && options.Get("noise_temp").IsNumber()) {
+        noise_temp = options.Get("noise_temp").As<Napi::Number>().FloatValue();
+    } else if (options.Has("noiseTemp") && options.Get("noiseTemp").IsNumber()) {
+        noise_temp = options.Get("noiseTemp").As<Napi::Number>().FloatValue();
+    } else if (options.Has("noise_temperature") && options.Get("noise_temperature").IsNumber()) {
+        noise_temp = options.Get("noise_temperature").As<Napi::Number>().FloatValue();
+    } else if (options.Has("tts_noise_temp") && options.Get("tts_noise_temp").IsNumber()) {
+        noise_temp = options.Get("tts_noise_temp").As<Napi::Number>().FloatValue();
+    }
+
+    int num_candidates = -1;
+    if (options.Has("num_candidates") && options.Get("num_candidates").IsNumber()) {
+        num_candidates = options.Get("num_candidates").As<Napi::Number>().Int32Value();
+    } else if (options.Has("numCandidates") && options.Get("numCandidates").IsNumber()) {
+        num_candidates = options.Get("numCandidates").As<Napi::Number>().Int32Value();
+    } else if (options.Has("tts_num_candidates") && options.Get("tts_num_candidates").IsNumber()) {
+        num_candidates = options.Get("tts_num_candidates").As<Napi::Number>().Int32Value();
+    }
+
+    int min_speech_tokens = -1;
+    if (options.Has("min_speech_tokens") && options.Get("min_speech_tokens").IsNumber()) {
+        min_speech_tokens = options.Get("min_speech_tokens").As<Napi::Number>().Int32Value();
+    } else if (options.Has("minSpeechTokens") && options.Get("minSpeechTokens").IsNumber()) {
+        min_speech_tokens = options.Get("minSpeechTokens").As<Napi::Number>().Int32Value();
+    } else if (options.Has("tts_min_speech_tokens") && options.Get("tts_min_speech_tokens").IsNumber()) {
+        min_speech_tokens = options.Get("tts_min_speech_tokens").As<Napi::Number>().Int32Value();
+    }
+
+    int max_speech_tokens = -1;
+    if (options.Has("max_speech_tokens") && options.Get("max_speech_tokens").IsNumber()) {
+        max_speech_tokens = options.Get("max_speech_tokens").As<Napi::Number>().Int32Value();
+    } else if (options.Has("maxSpeechTokens") && options.Get("maxSpeechTokens").IsNumber()) {
+        max_speech_tokens = options.Get("maxSpeechTokens").As<Napi::Number>().Int32Value();
+    } else if (options.Has("tts_max_speech_tokens") && options.Get("tts_max_speech_tokens").IsNumber()) {
+        max_speech_tokens = options.Get("tts_max_speech_tokens").As<Napi::Number>().Int32Value();
+    }
+
+    float exaggeration = -1.0f;
+    if (options.Has("exaggeration") && options.Get("exaggeration").IsNumber()) {
+        exaggeration = options.Get("exaggeration").As<Napi::Number>().FloatValue();
+    } else if (options.Has("tts_exaggeration") && options.Get("tts_exaggeration").IsNumber()) {
+        exaggeration = options.Get("tts_exaggeration").As<Napi::Number>().FloatValue();
+    }
+
+    std::string phonemes = "";
+    if (options.Has("phonemes") && options.Get("phonemes").IsString()) {
+        phonemes = options.Get("phonemes").As<Napi::String>().Utf8Value();
+    } else if (options.Has("tts_phonemes") && options.Get("tts_phonemes").IsString()) {
+        phonemes = options.Get("tts_phonemes").As<Napi::String>().Utf8Value();
+    }
+
+    int pad_silence_ms = 0;
+    if (options.Has("pad_silence_ms") && options.Get("pad_silence_ms").IsNumber()) {
+        pad_silence_ms = options.Get("pad_silence_ms").As<Napi::Number>().Int32Value();
+    } else if (options.Has("padSilenceMs") && options.Get("padSilenceMs").IsNumber()) {
+        pad_silence_ms = options.Get("padSilenceMs").As<Napi::Number>().Int32Value();
+    } else if (options.Has("tts_pad_silence_ms") && options.Get("tts_pad_silence_ms").IsNumber()) {
+        pad_silence_ms = options.Get("tts_pad_silence_ms").As<Napi::Number>().Int32Value();
+    }
+
+    std::string speaker_identity = "";
+    if (options.Has("speaker_identity") && options.Get("speaker_identity").IsString()) {
+        speaker_identity = options.Get("speaker_identity").As<Napi::String>().Utf8Value();
+    } else if (options.Has("speakerIdentity") && options.Get("speakerIdentity").IsString()) {
+        speaker_identity = options.Get("speakerIdentity").As<Napi::String>().Utf8Value();
+    } else if (options.Has("tts_speaker_identity") && options.Get("tts_speaker_identity").IsString()) {
+        speaker_identity = options.Get("tts_speaker_identity").As<Napi::String>().Utf8Value();
+    }
+
+    std::string g2p_dict = "";
+    if (options.Has("g2p_dict") && options.Get("g2p_dict").IsString()) {
+        g2p_dict = options.Get("g2p_dict").As<Napi::String>().Utf8Value();
+    } else if (options.Has("g2pDict") && options.Get("g2pDict").IsString()) {
+        g2p_dict = options.Get("g2pDict").As<Napi::String>().Utf8Value();
+    }
+
+    std::string ref_lang = "";
+    if (options.Has("ref_language") && options.Get("ref_language").IsString()) {
+        ref_lang = options.Get("ref_language").As<Napi::String>().Utf8Value();
+    } else if (options.Has("refLanguage") && options.Get("refLanguage").IsString()) {
+        ref_lang = options.Get("refLanguage").As<Napi::String>().Utf8Value();
+    }
+
     CrispasrTTSWorker* worker = new CrispasrTTSWorker(
         callback, model_path, codec_model_path, text, voice, ref_text, instruct, language,
-        output_path, n_threads, use_gpu, temperature, seed, reuse_instance, auto_release_ms, env);
+        output_path, n_threads, use_gpu, temperature, seed, reuse_instance, auto_release_ms, env,
+        backend_name, watermark, speed, steps, cfg_scale, noise_temp, num_candidates,
+        min_speech_tokens, max_speech_tokens, exaggeration, phonemes, pad_silence_ms,
+        speaker_identity, g2p_dict, ref_lang);
     worker->Queue();
     return env.Undefined();
+}
+
+// ============================================================================
+// Standalone Audio Watermarking Interface (for Sherpa-ONNX, Kokoro, etc.)
+// ============================================================================
+
+struct WavAudioData {
+    std::vector<float> samples;
+    int sample_rate = 24000;
+    int channels = 1;
+    bool success = false;
+    std::string error;
+};
+
+static WavAudioData parse_wav_memory(const uint8_t* data, size_t size) {
+    WavAudioData result;
+    if (!data || size < 44) {
+        result.error = "Data too small for WAV header";
+        return result;
+    }
+    if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
+        result.error = "Not a valid RIFF/WAVE header";
+        return result;
+    }
+
+    size_t pos = 12;
+    uint16_t audio_format = 0;
+    uint16_t num_channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t bits_per_sample = 0;
+    const uint8_t* pcm_data = nullptr;
+    uint32_t pcm_data_size = 0;
+
+    while (pos + 8 <= size) {
+        char chunk_id[5] = {0};
+        std::memcpy(chunk_id, data + pos, 4);
+        uint32_t chunk_size = *reinterpret_cast<const uint32_t*>(data + pos + 4);
+        pos += 8;
+
+        if (std::strcmp(chunk_id, "fmt ") == 0) {
+            if (chunk_size < 16 || pos + 16 > size) {
+                result.error = "Corrupt fmt chunk";
+                return result;
+            }
+            audio_format = *reinterpret_cast<const uint16_t*>(data + pos);
+            num_channels = *reinterpret_cast<const uint16_t*>(data + pos + 2);
+            sample_rate = *reinterpret_cast<const uint32_t*>(data + pos + 4);
+            bits_per_sample = *reinterpret_cast<const uint16_t*>(data + pos + 14);
+            pos += chunk_size;
+        } else if (std::strcmp(chunk_id, "data") == 0) {
+            pcm_data = data + pos;
+            pcm_data_size = std::min(chunk_size, static_cast<uint32_t>(size - pos));
+            pos += chunk_size;
+            break;
+        } else {
+            pos += chunk_size;
+        }
+        if (chunk_size % 2 != 0) {
+            pos++;
+        }
+    }
+
+    if (!pcm_data || pcm_data_size == 0 || num_channels == 0 || sample_rate == 0) {
+        result.error = "Missing fmt or data chunk in WAV";
+        return result;
+    }
+
+    result.sample_rate = static_cast<int>(sample_rate);
+    result.channels = static_cast<int>(num_channels);
+
+    if (audio_format == 1 && bits_per_sample == 16) {
+        size_t total_samples = pcm_data_size / (sizeof(int16_t) * num_channels);
+        result.samples.resize(total_samples);
+        const int16_t* src = reinterpret_cast<const int16_t*>(pcm_data);
+        for (size_t i = 0; i < total_samples; ++i) {
+            float sum = 0.0f;
+            for (int c = 0; c < num_channels; ++c) {
+                sum += static_cast<float>(src[i * num_channels + c]) / 32768.0f;
+            }
+            result.samples[i] = sum / num_channels;
+        }
+        result.success = true;
+    } else if (audio_format == 3 && bits_per_sample == 32) {
+        size_t total_samples = pcm_data_size / (sizeof(float) * num_channels);
+        result.samples.resize(total_samples);
+        const float* src = reinterpret_cast<const float*>(pcm_data);
+        for (size_t i = 0; i < total_samples; ++i) {
+            float sum = 0.0f;
+            for (int c = 0; c < num_channels; ++c) {
+                sum += src[i * num_channels + c];
+            }
+            result.samples[i] = sum / num_channels;
+        }
+        result.success = true;
+    } else if (audio_format == 1 && bits_per_sample == 24) {
+        size_t total_samples = pcm_data_size / (3 * num_channels);
+        result.samples.resize(total_samples);
+        for (size_t i = 0; i < total_samples; ++i) {
+            float sum = 0.0f;
+            for (int c = 0; c < num_channels; ++c) {
+                const uint8_t* b = pcm_data + (i * num_channels + c) * 3;
+                int32_t val = (b[0]) | (b[1] << 8) | (b[2] << 16);
+                if (val & 0x800000) val |= ~0xFFFFFF;
+                sum += static_cast<float>(val) / 8388608.0f;
+            }
+            result.samples[i] = sum / num_channels;
+        }
+        result.success = true;
+    } else {
+        result.error = "Unsupported WAV format: format=" + std::to_string(audio_format) + ", bits=" + std::to_string(bits_per_sample);
+        return result;
+    }
+    return result;
+}
+
+static WavAudioData read_wav_file(const std::string& path) {
+    WavAudioData result;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        result.error = "Failed to open file: " + path;
+        return result;
+    }
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buffer(size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        result.error = "Failed to read file: " + path;
+        return result;
+    }
+    return parse_wav_memory(buffer.data(), buffer.size());
+}
+
+static std::vector<uint8_t> encode_wav_memory(const float* pcm, size_t n_samples, int sample_rate) {
+    uint32_t sr = static_cast<uint32_t>(sample_rate > 0 ? sample_rate : 24000);
+    uint16_t num_channels = 1;
+    uint16_t bits_per_sample = 16;
+    uint32_t byte_rate = sr * num_channels * (bits_per_sample / 8);
+    uint16_t block_align = num_channels * (bits_per_sample / 8);
+    uint32_t data_size = static_cast<uint32_t>(n_samples * sizeof(int16_t));
+    uint32_t chunk_size = 36 + data_size;
+
+    std::vector<uint8_t> out(44 + data_size);
+    uint8_t* p = out.data();
+
+    std::memcpy(p, "RIFF", 4);
+    std::memcpy(p + 4, &chunk_size, 4);
+    std::memcpy(p + 8, "WAVE", 4);
+    std::memcpy(p + 12, "fmt ", 4);
+    uint32_t subchunk1_size = 16;
+    uint16_t audio_format = 1;
+    std::memcpy(p + 16, &subchunk1_size, 4);
+    std::memcpy(p + 20, &audio_format, 2);
+    std::memcpy(p + 22, &num_channels, 2);
+    std::memcpy(p + 24, &sr, 4);
+    std::memcpy(p + 28, &byte_rate, 4);
+    std::memcpy(p + 32, &block_align, 2);
+    std::memcpy(p + 34, &bits_per_sample, 2);
+    std::memcpy(p + 36, "data", 4);
+    std::memcpy(p + 40, &data_size, 4);
+
+    int16_t* dst = reinterpret_cast<int16_t*>(p + 44);
+    for (size_t i = 0; i < n_samples; ++i) {
+        float s = std::max(-1.0f, std::min(1.0f, pcm[i]));
+        dst[i] = (s < 0) ? static_cast<int16_t>(s * 32768.0f) : static_cast<int16_t>(s * 32767.0f);
+    }
+    return out;
+}
+
+static bool write_wav_file(const std::string& path, const float* pcm, size_t n_samples, int sample_rate) {
+    auto bytes = encode_wav_memory(pcm, n_samples, sample_rate);
+    std::ofstream fout(path, std::ios::binary);
+    if (!fout.is_open()) return false;
+    fout.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return fout.good();
+}
+
+class WatermarkWorker : public Napi::AsyncWorker {
+public:
+    WatermarkWorker(Napi::Function& callback,
+                    std::string input_path,
+                    std::string output_path,
+                    std::vector<float> pcm_input,
+                    std::vector<uint8_t> wav_buffer_input,
+                    int sample_rate,
+                    float alpha,
+                    std::string watermark_model)
+        : Napi::AsyncWorker(callback),
+          m_input_path(input_path),
+          m_output_path(output_path),
+          m_pcm(std::move(pcm_input)),
+          m_wav_buffer(std::move(wav_buffer_input)),
+          m_sample_rate(sample_rate),
+          m_alpha(alpha),
+          m_watermark_model(watermark_model) {}
+
+    WatermarkWorker(Napi::Env env,
+                    std::string input_path,
+                    std::string output_path,
+                    std::vector<float> pcm_input,
+                    std::vector<uint8_t> wav_buffer_input,
+                    int sample_rate,
+                    float alpha,
+                    std::string watermark_model)
+        : Napi::AsyncWorker(env),
+          m_deferred(new Napi::Promise::Deferred(env)),
+          m_input_path(input_path),
+          m_output_path(output_path),
+          m_pcm(std::move(pcm_input)),
+          m_wav_buffer(std::move(wav_buffer_input)),
+          m_sample_rate(sample_rate),
+          m_alpha(alpha),
+          m_watermark_model(watermark_model) {}
+
+    Napi::Promise GetPromise() {
+        return m_deferred->Promise();
+    }
+
+    void Execute() override {
+        if (m_pcm.empty()) {
+            if (!m_wav_buffer.empty()) {
+                auto parsed = parse_wav_memory(m_wav_buffer.data(), m_wav_buffer.size());
+                if (parsed.success) {
+                    m_pcm = std::move(parsed.samples);
+                    m_sample_rate = parsed.sample_rate;
+                } else {
+                    SetError("Failed to parse WAV buffer: " + parsed.error);
+                    return;
+                }
+            } else if (!m_input_path.empty()) {
+                auto loaded = read_wav_file(m_input_path);
+                if (loaded.success) {
+                    m_pcm = std::move(loaded.samples);
+                    m_sample_rate = loaded.sample_rate;
+                } else {
+                    float* pcm = nullptr;
+                    int n_samples = 0;
+                    int sr = 0;
+                    if (crispasr_audio_load(m_input_path.c_str(), &pcm, &n_samples, &sr) == 0 && pcm && n_samples > 0) {
+                        m_pcm.assign(pcm, pcm + n_samples);
+                        m_sample_rate = (sr > 0) ? sr : 16000;
+                        crispasr_audio_free(pcm);
+                    } else {
+                        SetError("Failed to load audio from: " + m_input_path + " (" + loaded.error + ")");
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (m_pcm.empty()) {
+            SetError("No audio samples provided or audio is empty");
+            return;
+        }
+
+        if (!m_watermark_model.empty()) {
+            crispasr_watermark_load_model(m_watermark_model.c_str());
+        }
+
+        crispasr_watermark_embed(m_pcm.data(), static_cast<int>(m_pcm.size()), m_alpha);
+
+        std::string target_path = m_output_path;
+        if (target_path.empty() && !m_input_path.empty()) {
+            target_path = m_input_path;
+        }
+
+        if (!target_path.empty()) {
+            if (!write_wav_file(target_path, m_pcm.data(), m_pcm.size(), m_sample_rate)) {
+                SetError("Failed to write watermarked audio to: " + target_path);
+                return;
+            }
+            m_final_path = target_path;
+        } else {
+            m_out_wav_bytes = encode_wav_memory(m_pcm.data(), m_pcm.size(), m_sample_rate);
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object res = Napi::Object::New(Env());
+        res.Set("success", Napi::Boolean::New(Env(), true));
+        res.Set("sampleRate", Napi::Number::New(Env(), m_sample_rate));
+        res.Set("n_samples", Napi::Number::New(Env(), m_pcm.size()));
+        res.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm.size()) / static_cast<double>(m_sample_rate > 0 ? m_sample_rate : 24000)));
+        res.Set("watermarked", Napi::Boolean::New(Env(), true));
+
+        if (!m_final_path.empty()) {
+            res.Set("path", Napi::String::New(Env(), m_final_path));
+        }
+        if (!m_out_wav_bytes.empty()) {
+            res.Set("buffer", Napi::Buffer<uint8_t>::Copy(Env(), m_out_wav_bytes.data(), m_out_wav_bytes.size()));
+        }
+
+        if (m_deferred) {
+            m_deferred->Resolve(res);
+        } else {
+            Callback().Call({Env().Null(), res});
+        }
+    }
+
+    void OnError(const Napi::Error& e) override {
+        Napi::HandleScope scope(Env());
+        if (m_deferred) {
+            m_deferred->Reject(e.Value());
+        } else {
+            Callback().Call({e.Value(), Env().Undefined()});
+        }
+    }
+
+private:
+    std::string m_input_path;
+    std::string m_output_path;
+    std::string m_final_path;
+    std::vector<float> m_pcm;
+    std::vector<uint8_t> m_wav_buffer;
+    std::vector<uint8_t> m_out_wav_bytes;
+    int m_sample_rate = 24000;
+    float m_alpha = -1.0f;
+    std::string m_watermark_model;
+    std::unique_ptr<Napi::Promise::Deferred> m_deferred;
+};
+
+class WatermarkDetectWorker : public Napi::AsyncWorker {
+public:
+    WatermarkDetectWorker(Napi::Function& callback,
+                          std::string input_path,
+                          std::vector<float> pcm_input,
+                          std::vector<uint8_t> wav_buffer_input,
+                          int sample_rate,
+                          std::string watermark_model)
+        : Napi::AsyncWorker(callback),
+          m_input_path(input_path),
+          m_pcm(std::move(pcm_input)),
+          m_wav_buffer(std::move(wav_buffer_input)),
+          m_sample_rate(sample_rate),
+          m_watermark_model(watermark_model) {}
+
+    WatermarkDetectWorker(Napi::Env env,
+                          std::string input_path,
+                          std::vector<float> pcm_input,
+                          std::vector<uint8_t> wav_buffer_input,
+                          int sample_rate,
+                          std::string watermark_model)
+        : Napi::AsyncWorker(env),
+          m_deferred(new Napi::Promise::Deferred(env)),
+          m_input_path(input_path),
+          m_pcm(std::move(pcm_input)),
+          m_wav_buffer(std::move(wav_buffer_input)),
+          m_sample_rate(sample_rate),
+          m_watermark_model(watermark_model) {}
+
+    Napi::Promise GetPromise() {
+        return m_deferred->Promise();
+    }
+
+    void Execute() override {
+        if (m_pcm.empty()) {
+            if (!m_wav_buffer.empty()) {
+                auto parsed = parse_wav_memory(m_wav_buffer.data(), m_wav_buffer.size());
+                if (parsed.success) {
+                    m_pcm = std::move(parsed.samples);
+                    m_sample_rate = parsed.sample_rate;
+                } else {
+                    SetError("Failed to parse WAV buffer: " + parsed.error);
+                    return;
+                }
+            } else if (!m_input_path.empty()) {
+                auto loaded = read_wav_file(m_input_path);
+                if (loaded.success) {
+                    m_pcm = std::move(loaded.samples);
+                    m_sample_rate = loaded.sample_rate;
+                } else {
+                    float* pcm = nullptr;
+                    int n_samples = 0;
+                    int sr = 0;
+                    if (crispasr_audio_load(m_input_path.c_str(), &pcm, &n_samples, &sr) == 0 && pcm && n_samples > 0) {
+                        m_pcm.assign(pcm, pcm + n_samples);
+                        m_sample_rate = (sr > 0) ? sr : 16000;
+                        crispasr_audio_free(pcm);
+                    } else {
+                        SetError("Failed to load audio from: " + m_input_path + " (" + loaded.error + ")");
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (m_pcm.empty()) {
+            SetError("No audio samples provided or audio is empty");
+            return;
+        }
+
+        if (!m_watermark_model.empty()) {
+            crispasr_watermark_load_model(m_watermark_model.c_str());
+        }
+
+        m_score = crispasr_watermark_detect(m_pcm.data(), static_cast<int>(m_pcm.size()));
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object res = Napi::Object::New(Env());
+        res.Set("success", Napi::Boolean::New(Env(), true));
+        res.Set("score", Napi::Number::New(Env(), m_score));
+        res.Set("detected", Napi::Boolean::New(Env(), m_score >= 0.65f));
+        res.Set("threshold", Napi::Number::New(Env(), 0.65f));
+        res.Set("sampleRate", Napi::Number::New(Env(), m_sample_rate));
+        res.Set("n_samples", Napi::Number::New(Env(), m_pcm.size()));
+        res.Set("duration", Napi::Number::New(Env(), static_cast<double>(m_pcm.size()) / static_cast<double>(m_sample_rate > 0 ? m_sample_rate : 24000)));
+
+        if (m_deferred) {
+            m_deferred->Resolve(res);
+        } else {
+            Callback().Call({Env().Null(), res});
+        }
+    }
+
+    void OnError(const Napi::Error& e) override {
+        Napi::HandleScope scope(Env());
+        if (m_deferred) {
+            m_deferred->Reject(e.Value());
+        } else {
+            Callback().Call({e.Value(), Env().Undefined()});
+        }
+    }
+
+private:
+    std::string m_input_path;
+    std::vector<float> m_pcm;
+    std::vector<uint8_t> m_wav_buffer;
+    int m_sample_rate = 24000;
+    std::string m_watermark_model;
+    float m_score = 0.0f;
+    std::unique_ptr<Napi::Promise::Deferred> m_deferred;
+};
+
+Napi::Value applyWatermark(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Usage: applyWatermark(options, [callback])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string input_path = "";
+    std::string output_path = "";
+    std::vector<float> pcm_input;
+    std::vector<uint8_t> wav_buffer_input;
+    int sample_rate = 24000;
+    float alpha = -1.0f;
+    std::string watermark_model = "";
+
+    Napi::Function callback;
+    bool has_callback = false;
+
+    if (info.Length() >= 2 && info[1].IsFunction()) {
+        callback = info[1].As<Napi::Function>();
+        has_callback = true;
+    } else if (info[0].IsFunction()) {
+        callback = info[0].As<Napi::Function>();
+        has_callback = true;
+    }
+
+    if (info[0].IsString()) {
+        input_path = info[0].As<Napi::String>().Utf8Value();
+    } else if (info[0].IsObject()) {
+        Napi::Object opts = info[0].As<Napi::Object>();
+        if (opts.Has("path") && opts.Get("path").IsString()) {
+            input_path = opts.Get("path").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("input_path") && opts.Get("input_path").IsString()) {
+            input_path = opts.Get("input_path").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("filePath") && opts.Get("filePath").IsString()) {
+            input_path = opts.Get("filePath").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("file") && opts.Get("file").IsString()) {
+            input_path = opts.Get("file").As<Napi::String>().Utf8Value();
+        }
+
+        if (opts.Has("output_path") && opts.Get("output_path").IsString()) {
+            output_path = opts.Get("output_path").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("outputPath") && opts.Get("outputPath").IsString()) {
+            output_path = opts.Get("outputPath").As<Napi::String>().Utf8Value();
+        }
+
+        if (opts.Has("sample_rate") && opts.Get("sample_rate").IsNumber()) {
+            sample_rate = opts.Get("sample_rate").As<Napi::Number>().Int32Value();
+        } else if (opts.Has("sampleRate") && opts.Get("sampleRate").IsNumber()) {
+            sample_rate = opts.Get("sampleRate").As<Napi::Number>().Int32Value();
+        }
+
+        if (opts.Has("alpha") && opts.Get("alpha").IsNumber()) {
+            alpha = opts.Get("alpha").As<Napi::Number>().FloatValue();
+        }
+
+        if (opts.Has("watermark_model") && opts.Get("watermark_model").IsString()) {
+            watermark_model = opts.Get("watermark_model").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("watermarkModel") && opts.Get("watermarkModel").IsString()) {
+            watermark_model = opts.Get("watermarkModel").As<Napi::String>().Utf8Value();
+        }
+
+        if (opts.Has("buffer")) {
+            Napi::Value bufVal = opts.Get("buffer");
+            if (bufVal.IsBuffer()) {
+                Napi::Buffer<uint8_t> buf = bufVal.As<Napi::Buffer<uint8_t>>();
+                wav_buffer_input.assign(buf.Data(), buf.Data() + buf.Length());
+            } else if (bufVal.IsTypedArray()) {
+                Napi::TypedArray typedArray = bufVal.As<Napi::TypedArray>();
+                if (typedArray.TypedArrayType() == napi_float32_array) {
+                    Napi::Float32Array fArray = bufVal.As<Napi::Float32Array>();
+                    pcm_input.assign(fArray.Data(), fArray.Data() + fArray.ElementLength());
+                }
+            }
+        }
+    }
+
+    if (has_callback) {
+        WatermarkWorker* worker = new WatermarkWorker(callback, input_path, output_path, std::move(pcm_input), std::move(wav_buffer_input), sample_rate, alpha, watermark_model);
+        worker->Queue();
+        return env.Undefined();
+    } else {
+        WatermarkWorker* worker = new WatermarkWorker(env, input_path, output_path, std::move(pcm_input), std::move(wav_buffer_input), sample_rate, alpha, watermark_model);
+        auto promise = worker->GetPromise();
+        worker->Queue();
+        return promise;
+    }
+}
+
+Napi::Value detectWatermark(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1) {
+        Napi::TypeError::New(env, "Usage: detectWatermark(options, [callback])").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string input_path = "";
+    std::vector<float> pcm_input;
+    std::vector<uint8_t> wav_buffer_input;
+    int sample_rate = 24000;
+    std::string watermark_model = "";
+
+    Napi::Function callback;
+    bool has_callback = false;
+
+    if (info.Length() >= 2 && info[1].IsFunction()) {
+        callback = info[1].As<Napi::Function>();
+        has_callback = true;
+    } else if (info[0].IsFunction()) {
+        callback = info[0].As<Napi::Function>();
+        has_callback = true;
+    }
+
+    if (info[0].IsString()) {
+        input_path = info[0].As<Napi::String>().Utf8Value();
+    } else if (info[0].IsObject()) {
+        Napi::Object opts = info[0].As<Napi::Object>();
+        if (opts.Has("path") && opts.Get("path").IsString()) {
+            input_path = opts.Get("path").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("input_path") && opts.Get("input_path").IsString()) {
+            input_path = opts.Get("input_path").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("filePath") && opts.Get("filePath").IsString()) {
+            input_path = opts.Get("filePath").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("file") && opts.Get("file").IsString()) {
+            input_path = opts.Get("file").As<Napi::String>().Utf8Value();
+        }
+
+        if (opts.Has("sample_rate") && opts.Get("sample_rate").IsNumber()) {
+            sample_rate = opts.Get("sample_rate").As<Napi::Number>().Int32Value();
+        } else if (opts.Has("sampleRate") && opts.Get("sampleRate").IsNumber()) {
+            sample_rate = opts.Get("sampleRate").As<Napi::Number>().Int32Value();
+        }
+
+        if (opts.Has("watermark_model") && opts.Get("watermark_model").IsString()) {
+            watermark_model = opts.Get("watermark_model").As<Napi::String>().Utf8Value();
+        } else if (opts.Has("watermarkModel") && opts.Get("watermarkModel").IsString()) {
+            watermark_model = opts.Get("watermarkModel").As<Napi::String>().Utf8Value();
+        }
+
+        if (opts.Has("buffer")) {
+            Napi::Value bufVal = opts.Get("buffer");
+            if (bufVal.IsBuffer()) {
+                Napi::Buffer<uint8_t> buf = bufVal.As<Napi::Buffer<uint8_t>>();
+                wav_buffer_input.assign(buf.Data(), buf.Data() + buf.Length());
+            } else if (bufVal.IsTypedArray()) {
+                Napi::TypedArray typedArray = bufVal.As<Napi::TypedArray>();
+                if (typedArray.TypedArrayType() == napi_float32_array) {
+                    Napi::Float32Array fArray = bufVal.As<Napi::Float32Array>();
+                    pcm_input.assign(fArray.Data(), fArray.Data() + fArray.ElementLength());
+                }
+            }
+        }
+    }
+
+    if (has_callback) {
+        WatermarkDetectWorker* worker = new WatermarkDetectWorker(callback, input_path, std::move(pcm_input), std::move(wav_buffer_input), sample_rate, watermark_model);
+        worker->Queue();
+        return env.Undefined();
+    } else {
+        WatermarkDetectWorker* worker = new WatermarkDetectWorker(env, input_path, std::move(pcm_input), std::move(wav_buffer_input), sample_rate, watermark_model);
+        auto promise = worker->GetPromise();
+        worker->Queue();
+        return promise;
+    }
+}
+
+Napi::Value loadWatermarkModel(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Usage: loadWatermarkModel(modelPath)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::string path = info[0].As<Napi::String>().Utf8Value();
+    int rc = crispasr_watermark_load_model(path.c_str());
+    return Napi::Boolean::New(env, rc == 0);
 }
 
 void InitCrispASR(Napi::Env env, Napi::Object exports) {
@@ -2233,5 +3458,14 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("distilWhisper", Napi::Function::New(env, distilWhisper));
     exports.Set("crispasrTTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
+    exports.Set("tts", Napi::Function::New(env, crispasrTTS));
+
+    // Standalone Watermark APIs
+    exports.Set("applyWatermark", Napi::Function::New(env, applyWatermark));
+    exports.Set("watermarkAudio", Napi::Function::New(env, applyWatermark));
+    exports.Set("embedWatermark", Napi::Function::New(env, applyWatermark));
+    exports.Set("detectWatermark", Napi::Function::New(env, detectWatermark));
+    exports.Set("loadWatermarkModel", Napi::Function::New(env, loadWatermarkModel));
+
     CrispASRStream::Init(env, exports);
 }

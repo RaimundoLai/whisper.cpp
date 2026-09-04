@@ -776,11 +776,7 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     Napi::Value pcmf32Value = whisper_params.Get("pcmf32");
     if (pcmf32Value.IsTypedArray()) {
         Napi::Float32Array pcmf32 = pcmf32Value.As<Napi::Float32Array>();
-        size_t length = pcmf32.ElementLength();
-        params.pcmf32.reserve(length);
-        for (size_t i = 0; i < length; i++) {
-            params.pcmf32.push_back(pcmf32[i]);
-        }
+        params.pcmf32.assign(pcmf32.Data(), pcmf32.Data() + pcmf32.ElementLength());
     }
 
     Napi::Function callback = info[1].As<Napi::Function>();
@@ -996,12 +992,6 @@ Napi::Value WhisperStream::Start(const Napi::CallbackInfo& info) {
     }
     if (m_state.load() != StreamState::IDLE) {
         Napi::Error::New(env, "Stream has already been started").ThrowAsJavaScriptException(); return env.Undefined();
-    }
-    struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = m_use_gpu;
-    m_ctx = whisper_init_from_file_with_params(m_model_path.c_str(), cparams);
-    if (m_ctx == nullptr) {
-        Napi::Error::New(env, "Failed to initialize whisper context from model").ThrowAsJavaScriptException(); return env.Undefined();
     }
     m_audio_buffer.clear();
     m_pcmf32_local.clear();
@@ -1234,6 +1224,24 @@ void WhisperStream::emit_silence(double t) {
 }
 
 void WhisperStream::StreamWorker() {
+    if (!m_ctx) {
+        struct whisper_context_params cparams = whisper_context_default_params();
+        cparams.use_gpu = m_use_gpu;
+        m_ctx = whisper_init_from_file_with_params(m_model_path.c_str(), cparams);
+        if (m_ctx == nullptr) {
+            if (m_tsfn_callback) {
+                m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function cb) {
+                    cb.Call({Napi::Error::New(env, "Failed to initialize whisper context from model").Value(), env.Null()});
+                });
+            }
+            m_state = StreamState::IDLE;
+            return;
+        }
+    }
+    if (m_state.load() != StreamState::RUNNING && m_state.load() != StreamState::PAUSED) {
+        return;
+    }
+
     m_wparams.print_progress   = false;
     m_wparams.print_realtime   = false;
     m_wparams.print_timestamps = false;
@@ -1388,6 +1396,24 @@ void WhisperStream::StreamWorker() {
 }
 
 void WhisperStream::StreamWorkerVAD() {
+    if (!m_ctx) {
+        struct whisper_context_params cparams = whisper_context_default_params();
+        cparams.use_gpu = m_use_gpu;
+        m_ctx = whisper_init_from_file_with_params(m_model_path.c_str(), cparams);
+        if (m_ctx == nullptr) {
+            if (m_tsfn_callback) {
+                m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function cb) {
+                    cb.Call({Napi::Error::New(env, "Failed to initialize whisper context from model").Value(), env.Null()});
+                });
+            }
+            m_state = StreamState::IDLE;
+            return;
+        }
+    }
+    if (m_state.load() != StreamState::RUNNING && m_state.load() != StreamState::PAUSED) {
+        return;
+    }
+
     m_wparams.print_progress   = false;
     m_wparams.print_realtime   = false;
     m_wparams.print_timestamps = false;
@@ -1883,6 +1909,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(
         Napi::String::New(env, "transcribe"),
         Napi::Function::New(env, transcribe)
+    );
+    exports.Set(
+        Napi::String::New(env, "tts"),
+        Napi::Function::New(env, crispasrTTS)
     );
     exports.Set(
         Napi::String::New(env, "freeModelCache"),
