@@ -168,7 +168,7 @@ public:
 
     void Execute() override {
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::PARAKEET));
+        std::unique_lock<std::recursive_mutex> type_lock(cache.mutex(ModelType::PARAKEET));
 
         struct parakeet_context* ctx = nullptr;
         bool owned = false;
@@ -223,6 +223,7 @@ public:
             SetError("Parakeet transcription failed");
         }
 
+        type_lock.unlock();
         if (owned) {
             parakeet_free(ctx);
         } else {
@@ -672,7 +673,7 @@ public:
         }
 
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::CRISPASR_SESSION));
+        std::unique_lock<std::recursive_mutex> type_lock(cache.mutex(ModelType::CRISPASR_SESSION));
 
         crispasr_session* session = nullptr;
         bool owned = false;
@@ -831,6 +832,7 @@ public:
             
             whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
             if (!vctx) {
+                type_lock.unlock();
                 if (owned) {
                     crispasr_session_close(session);
                 } else {
@@ -920,6 +922,7 @@ public:
             whisper_vad_free(vctx);
         }
 
+        type_lock.unlock();
         if (owned) {
             crispasr_session_close(session);
         } else {
@@ -2361,7 +2364,7 @@ public:
         }
 
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::QWEN3_TTS));
+        std::unique_lock<std::recursive_mutex> type_lock(cache.mutex(ModelType::QWEN3_TTS));
 
         crispasr_session* session = nullptr;
         bool owned = false;
@@ -2489,6 +2492,7 @@ public:
         }
 
         if (!pcm || n_samples <= 0) {
+            type_lock.unlock();
             if (owned) {
                 crispasr_session_close(session);
             } else {
@@ -2509,6 +2513,7 @@ public:
         const char* b = crispasr_session_backend(session);
         m_backend = b ? b : "";
 
+        type_lock.unlock();
         if (owned) {
             crispasr_session_close(session);
         } else {

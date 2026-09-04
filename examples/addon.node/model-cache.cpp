@@ -22,7 +22,7 @@ ModelCache::~ModelCache() {
     releaseAll();
 }
 
-std::mutex& ModelCache::mutex(ModelType t) {
+std::recursive_mutex& ModelCache::mutex(ModelType t) {
     return mutexes_[static_cast<int>(t)];
 }
 
@@ -69,8 +69,8 @@ void ModelCache::markIdle(ModelType t) {
         slots_[idx].last_used = std::chrono::steady_clock::now();
 
         if (slots_[idx].pending_release) {
-            fprintf(stderr, "[ModelCache] Executing deferred release for %s\n", modelTypeToString(t));
-            freeSlotNoLock(t, false);
+            fprintf(stderr, "[ModelCache] Executing deferred release for %s (async)\n", modelTypeToString(t));
+            freeSlotNoLock(t, true);
         }
     }
 }
@@ -97,7 +97,7 @@ void ModelCache::freeSlotNoLock(ModelType t, bool async) {
     slot.auto_release_ms = 0;
 
     auto do_free = [ctx, t, this, idx]() {
-        std::lock_guard<std::mutex> type_lock(mutexes_[idx]);
+        std::lock_guard<std::recursive_mutex> type_lock(mutexes_[idx]);
         try {
             switch (t) {
                 case ModelType::WHISPER:
