@@ -97,7 +97,7 @@ public:
     void Execute() override {
         auto& cache = ModelCache::instance();
 
-        std::lock_guard<std::mutex> asr_lock(cache.mutex(ModelType::QWEN3_ASR));
+        std::unique_lock<std::recursive_mutex> asr_lock(cache.mutex(ModelType::QWEN3_ASR));
         qwen3_asr::Qwen3ASR* asr_ptr = nullptr;
         bool asr_owned = false;
 
@@ -122,7 +122,7 @@ public:
 
         qwen3_asr::Qwen3ASR& asr = *asr_ptr;
 
-        std::lock_guard<std::mutex> aligner_lock(cache.mutex(ModelType::QWEN3_ALIGNER));
+        std::unique_lock<std::recursive_mutex> aligner_lock(cache.mutex(ModelType::QWEN3_ALIGNER));
         qwen3_asr::ForcedAligner* aligner_ptr = nullptr;
         bool aligner_owned = false;
         bool use_aligner = !m_aligner_model_path.empty();
@@ -135,6 +135,8 @@ public:
             if (!aligner_ptr) {
                 aligner_ptr = new qwen3_asr::ForcedAligner();
                 if (!aligner_ptr->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                    asr_lock.unlock();
+                    aligner_lock.unlock();
                     if (asr_owned) { delete asr_ptr; }
                     else { cache.markIdle(ModelType::QWEN3_ASR); }
                     SetError("Failed to load aligner model: " + aligner_ptr->get_error());
@@ -181,6 +183,8 @@ public:
             m_progress_scale = 1.0f;
             auto res = asr.transcribe(m_pcmf32.data(), m_pcmf32.size(), tp);
             if (!res.success) {
+                asr_lock.unlock();
+                aligner_lock.unlock();
                 if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
                 if (use_aligner) { if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); } }
                 SetError("Transcription failed: " + res.error_msg);
@@ -214,6 +218,8 @@ public:
             
             whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
             if (!vctx) {
+                asr_lock.unlock();
+                aligner_lock.unlock();
                 if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
                 if (use_aligner) { if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); } }
                 SetError("Failed to initialize whisper VAD context");
@@ -302,6 +308,8 @@ public:
             whisper_vad_free(vctx);
         }
 
+        asr_lock.unlock();
+        aligner_lock.unlock();
         if (asr_owned) { delete asr_ptr; } else { cache.markIdle(ModelType::QWEN3_ASR); }
         if (use_aligner) {
             if (aligner_owned) { delete aligner_ptr; } else { cache.markIdle(ModelType::QWEN3_ALIGNER); }
@@ -571,7 +579,7 @@ public:
 
     void Execute() override {
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> lock(cache.mutex(ModelType::QWEN3_ALIGNER));
+        std::unique_lock<std::recursive_mutex> lock(cache.mutex(ModelType::QWEN3_ALIGNER));
 
         qwen3_asr::ForcedAligner* aligner_ptr = nullptr;
         bool owned = false;
@@ -597,6 +605,7 @@ public:
 
         m_result = aligner_ptr->align(m_pcmf32.data(), m_pcmf32.size(), m_text, m_language);
 
+        lock.unlock();
         if (owned) {
             delete aligner_ptr;
         } else {

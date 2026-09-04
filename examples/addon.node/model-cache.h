@@ -65,7 +65,7 @@ class ModelCache {
 public:
     static ModelCache& instance();
 
-    std::mutex& mutex(ModelType t);
+    std::recursive_mutex& mutex(ModelType t);
 
     // Lock global mutex, return ctx if matches. If mismatch, frees old instance and returns nullptr.
     void* acquire(ModelType t, const std::string& path, bool gpu, const std::string& secondary = "");
@@ -96,6 +96,6 @@ private:
     void freeSlotNoLock(ModelType t, bool async = false);
 
     CacheSlot slots_[static_cast<int>(ModelType::MODEL_TYPE_COUNT)];
-    std::mutex mutexes_[static_cast<int>(ModelType::MODEL_TYPE_COUNT)];
+    std::recursive_mutex mutexes_[static_cast<int>(ModelType::MODEL_TYPE_COUNT)];
     mutable std::mutex global_mutex_;
 };

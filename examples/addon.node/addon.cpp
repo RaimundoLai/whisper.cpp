@@ -240,7 +240,7 @@ public:
     std::shared_ptr<std::atomic<bool>> m_was_aborted;
 
     ProgressWorker(Napi::Function& callback, whisper_params params, Napi::Function progress_callback, Napi::Env env)
-        : Napi::AsyncWorker(callback), params(params), env(env),
+        : Napi::AsyncWorker(callback), params(std::move(params)), env(env),
           m_should_abort(std::make_shared<std::atomic<bool>>(false)),
           m_was_aborted(std::make_shared<std::atomic<bool>>(false)) {
         if (!progress_callback.IsEmpty()) {
@@ -351,7 +351,7 @@ private:
         }
 
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::WHISPER));
+        std::unique_lock<std::recursive_mutex> type_lock(cache.mutex(ModelType::WHISPER));
 
         struct whisper_context * ctx = nullptr;
         bool owned = false;
@@ -387,17 +387,16 @@ private:
 
         for (int f = 0; f < (int) params.fname_inp.size(); ++f) {
             const auto fname_inp = params.fname_inp[f];
-            std::vector<float> pcmf32;
+            std::vector<float> pcmf32_loaded;
             std::vector<std::vector<float>> pcmf32s;
 
             if (params.pcmf32.empty()) {
-                if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
+                if (!::read_audio_data(fname_inp, pcmf32_loaded, pcmf32s, params.diarize)) {
                     fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
                     continue;
                 }
-            } else {
-                pcmf32 = params.pcmf32;
             }
+            const std::vector<float>& pcmf32 = params.pcmf32.empty() ? pcmf32_loaded : params.pcmf32;
 
             if (!params.no_prints) {
                 fprintf(stderr, "\n");
@@ -661,6 +660,8 @@ private:
         }
 
         whisper_print_timings(ctx);
+        type_lock.unlock();
+
         if (owned) {
             whisper_free(ctx);
         } else {
@@ -780,7 +781,7 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
     }
 
     Napi::Function callback = info[1].As<Napi::Function>();
-    ProgressWorker* worker = new ProgressWorker(callback, params, progress_callback, env);
+    ProgressWorker* worker = new ProgressWorker(callback, std::move(params), progress_callback, env);
     worker->Queue();
     return env.Undefined();
 }

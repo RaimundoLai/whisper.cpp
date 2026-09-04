@@ -338,7 +338,7 @@ public:
 
     void Execute() override {
         auto& cache = ModelCache::instance();
-        std::lock_guard<std::mutex> type_lock(cache.mutex(ModelType::SENSE_VOICE));
+        std::unique_lock<std::recursive_mutex> type_lock(cache.mutex(ModelType::SENSE_VOICE));
 
         struct sense_voice_context* ctx = nullptr;
         bool owned = false;
@@ -418,6 +418,7 @@ public:
             
             if (vctx == nullptr) {
                 SetError("Failed to initialize whisper VAD context");
+                type_lock.unlock();
                 if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                 return;
             }
@@ -447,6 +448,7 @@ public:
                         m_was_aborted->store(true);
                         whisper_vad_free_segments(segments);
                         whisper_vad_free(vctx);
+                        type_lock.unlock();
                         if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                         return;
                     }
@@ -627,6 +629,7 @@ public:
                             m_was_aborted->store(true);
                             whisper_vad_free_segments(segments);
                             whisper_vad_free(vctx);
+                            type_lock.unlock();
                             if (owned) { sense_voice_free(ctx); } else { cache.markIdle(ModelType::SENSE_VOICE); }
                             return;
                         }
@@ -786,6 +789,7 @@ public:
             m_result.event = m_result.segments[0].event;
         }
 
+        type_lock.unlock();
         if (owned) {
             sense_voice_free(ctx);
         } else {
