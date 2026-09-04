@@ -119,7 +119,7 @@ void ModelCache::freeSlotNoLock(ModelType t, bool async) {
                     crispasr_session_close(static_cast<crispasr_session*>(ctx));
                     break;
                 case ModelType::QWEN3_TTS:
-                    qwen3_tts_free(static_cast<struct qwen3_tts_context*>(ctx));
+                    crispasr_session_close(static_cast<crispasr_session*>(ctx));
                     break;
                 default:
                     break;

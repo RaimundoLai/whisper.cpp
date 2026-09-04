@@ -248,7 +248,7 @@ target_link_libraries(whisper PUBLIC ggml Threads::Threads)
 
 # Link Accelerate framework on Apple for qwen3-asr mel spectrogram
 if(APPLE)
-    target_link_libraries(whisper PRIVATE "-framework Accelerate")
+    target_link_libraries(whisper PRIVATE "-framework Accelerate" "-framework AudioToolbox" "-framework CoreFoundation")
 endif()
 
 if(NOT WIN32)

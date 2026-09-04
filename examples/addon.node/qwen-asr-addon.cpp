@@ -845,26 +845,6 @@ public:
             return env.Undefined();
         }
         
-        m_asr = std::make_unique<qwen3_asr::Qwen3ASR>();
-        if (!m_asr->load_model(m_model_path, m_use_gpu, m_debug)) {
-            Napi::Error::New(env, "Failed to load ASR model").ThrowAsJavaScriptException();
-            return env.Undefined();
-        }
-        
-        if (!m_aligner_model_path.empty()) {
-            m_aligner = std::make_unique<qwen3_asr::ForcedAligner>();
-            if (!m_aligner->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
-                fprintf(stderr, "[STREAM] Warning: Failed to load Forced Align model\n");
-            }
-        }
-        
-        if (!m_vad_model_path.empty()) {
-            whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
-            vad_ctx_params.n_threads = m_n_threads;
-            vad_ctx_params.use_gpu = false;
-            m_vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
-        }
-        
         Napi::Function callback = info[0].As<Napi::Function>();
         m_tsfn_callback = Napi::ThreadSafeFunction::New(env, callback, "QwenASRStreamCallback", 0, 1);
         m_segment_index = 0;
@@ -947,6 +927,35 @@ public:
 
 private:
     void StreamWorker() {
+        m_asr = std::make_unique<qwen3_asr::Qwen3ASR>();
+        if (!m_asr->load_model(m_model_path, m_use_gpu, m_debug)) {
+            if (m_tsfn_callback) {
+                m_tsfn_callback.BlockingCall([](Napi::Env env, Napi::Function cb) {
+                    cb.Call({Napi::Error::New(env, "Failed to load ASR model").Value(), env.Null()});
+                });
+            }
+            m_state = StreamState::IDLE;
+            return;
+        }
+        
+        if (m_state.load() == StreamState::STOPPING || m_state.load() == StreamState::IDLE) {
+            return;
+        }
+
+        if (!m_aligner_model_path.empty()) {
+            m_aligner = std::make_unique<qwen3_asr::ForcedAligner>();
+            if (!m_aligner->load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
+                fprintf(stderr, "[STREAM] Warning: Failed to load Forced Align model\n");
+            }
+        }
+        
+        if (!m_vad_model_path.empty()) {
+            whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
+            vad_ctx_params.n_threads = m_n_threads;
+            vad_ctx_params.use_gpu = false;
+            m_vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
+        }
+
         const int sample_rate = 16000;
         const int chunk_samples = (m_chunk_size_ms * sample_rate) / 1000;
         

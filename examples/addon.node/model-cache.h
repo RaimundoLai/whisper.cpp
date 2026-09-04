@@ -17,6 +17,7 @@ enum class ModelType : int {
     PARAKEET,
     CRISPASR_SESSION,
     QWEN3_TTS,
+    CRISPASR_TTS = QWEN3_TTS,
     MODEL_TYPE_COUNT = 7
 };
 
@@ -28,7 +29,7 @@ inline const char* modelTypeToString(ModelType t) {
         case ModelType::QWEN3_ALIGNER: return "qwen3_aligner";
         case ModelType::PARAKEET: return "parakeet";
         case ModelType::CRISPASR_SESSION: return "crispasr";
-        case ModelType::QWEN3_TTS: return "qwen3_tts";
+        case ModelType::QWEN3_TTS: return "crispasr_tts";
         default: return "unknown";
     }
 }
@@ -40,7 +41,7 @@ inline bool stringToModelType(const std::string& s, ModelType& outType) {
     if (s == "qwen3_aligner" || s == "qwen_aligner" || s == "aligner" || s == "align") { outType = ModelType::QWEN3_ALIGNER; return true; }
     if (s == "parakeet") { outType = ModelType::PARAKEET; return true; }
     if (s == "crispasr" || s == "vibevoice" || s == "voxtral") { outType = ModelType::CRISPASR_SESSION; return true; }
-    if (s == "qwen3_tts" || s == "qwen_tts" || s == "tts") { outType = ModelType::QWEN3_TTS; return true; }
+    if (s == "qwen3_tts" || s == "qwen_tts" || s == "tts" || s == "crispasr_tts") { outType = ModelType::QWEN3_TTS; return true; }
     return false;
 }
 
