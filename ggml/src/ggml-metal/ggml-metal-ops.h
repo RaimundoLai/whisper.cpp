@@ -43,6 +43,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
 
+// Extra scratch space for the PREC_F32 Q8_0 weights x F32 input path.
+size_t ggml_metal_op_mul_mat_extra_q8_0(const struct ggml_tensor * op);
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);

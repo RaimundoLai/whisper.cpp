@@ -503,6 +503,34 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv_ext;
 
+// Extra arguments for the PREC_F32 Q8_0 x F32 path. The F32 input is
+// quantized into the same block_q8_0 representation used by the CPU dot
+// product before the integer dot is evaluated.
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  num_blocks_per_row;
+} ggml_metal_kargs_quantize_q8_0;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne0;
+    int32_t  ne1;
+    int16_t  r2;
+    int16_t  r3;
+} ggml_metal_kargs_mul_mv_q8_0_q8_0;
+
 typedef struct {
     int32_t  ne02;
     int32_t  ne10;

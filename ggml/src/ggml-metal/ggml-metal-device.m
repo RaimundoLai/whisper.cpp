@@ -1275,6 +1275,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            // Metal's FlashAttention implementation uses half-precision
+            // simdgroup tiles even when the operation requests F32 precision.
+            // Let the scheduler select the CPU implementation in that case.
+            if ((enum ggml_prec) ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+                return false;
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
