@@ -123,6 +123,97 @@ static void trim_leading_replacement_and_spaces(std::string& str) {
     }
 }
 
+static std::string clean_text_for_forced_aligner(const std::string& input) {
+    if (input.empty()) return "";
+
+    // 1. If it's JSON (e.g. VibeVoice [{"Start": ..., "Content": ...}]), extract clean content text
+    size_t start_idx = 0;
+    while (start_idx < input.length() && (input[start_idx] == ' ' || input[start_idx] == '\n' || input[start_idx] == '\r' || input[start_idx] == '\t')) {
+        start_idx++;
+    }
+    if (start_idx < input.length() && (input[start_idx] == '[' || input[start_idx] == '{')) {
+        if (input.find("\"Content\":") != std::string::npos ||
+            input.find("\"content\":") != std::string::npos ||
+            input.find("\"text\":") != std::string::npos) {
+            std::string json_cleaned = extract_clean_text_if_json(input);
+            if (!json_cleaned.empty() && json_cleaned != input) {
+                return json_cleaned;
+            }
+        }
+    }
+
+    // 2. Filter out bracketed tags: e.g. [0.0], [1.5], [S1], [S2], [music], [laughter]
+    std::string clean_text = "";
+    size_t i = 0;
+    while (i < input.length()) {
+        if (input[i] == '[') {
+            size_t close_bracket = input.find(']', i + 1);
+            if (close_bracket != std::string::npos) {
+                std::string tag_content = input.substr(i + 1, close_bracket - i - 1);
+                // Check speaker tag: e.g. "S1", "S2", "Speaker 1"
+                bool is_speaker = false;
+                if (!tag_content.empty() && (tag_content[0] == 'S' || tag_content[0] == 's')) {
+                    bool all_digits = true;
+                    for (size_t k = 1; k < tag_content.size(); k++) {
+                        if (!isdigit(static_cast<unsigned char>(tag_content[k]))) { all_digits = false; break; }
+                    }
+                    if (all_digits && tag_content.size() > 1) is_speaker = true;
+                }
+                if (tag_content.rfind("Speaker", 0) == 0 || tag_content.rfind("speaker", 0) == 0) {
+                    is_speaker = true;
+                }
+
+                // Check timestamp: e.g. "0.0", "12.34"
+                bool is_timestamp = false;
+                bool has_digit = false;
+                bool valid_num = true;
+                for (char c : tag_content) {
+                    if (isdigit(static_cast<unsigned char>(c))) has_digit = true;
+                    else if (c != '.') { valid_num = false; break; }
+                }
+                if (valid_num && has_digit) is_timestamp = true;
+
+                // Check non-speech event: e.g. "music", "laughter", "applause"
+                bool is_event = false;
+                bool all_alpha = true;
+                for (char c : tag_content) {
+                    if (!isalpha(static_cast<unsigned char>(c)) && c != '_' && c != '-') { all_alpha = false; break; }
+                }
+                if (all_alpha && !tag_content.empty()) is_event = true;
+
+                if (is_speaker || is_timestamp || is_event) {
+                    i = close_bracket + 1;
+                    if (!clean_text.empty() && clean_text.back() != ' ') {
+                        clean_text += ' ';
+                    }
+                    continue;
+                }
+            }
+        }
+        clean_text += input[i];
+        i++;
+    }
+
+    // 3. Normalize spaces
+    std::string final_text = "";
+    bool last_was_space = true;
+    for (char c : clean_text) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (!last_was_space) {
+                final_text += ' ';
+                last_was_space = true;
+            }
+        } else {
+            final_text += c;
+            last_was_space = false;
+        }
+    }
+    while (!final_text.empty() && final_text.back() == ' ') {
+        final_text.pop_back();
+    }
+    return final_text;
+}
+
 // ============================================================================
 // Parakeet ASR Implementation
 // ============================================================================
@@ -437,21 +528,226 @@ struct crispasr_addon_result {
     
     struct word_data {
         std::string text;
-        int64_t start_ms;
-        int64_t end_ms;
-        float p;
+        std::string speaker;
+        int64_t start_ms = 0;
+        int64_t end_ms = 0;
+        float p = 0.0f;
     };
 
     struct segment_data {
         std::string text;
-        int64_t start_ms;
-        int64_t end_ms;
+        std::string speaker;
+        int64_t start_ms = 0;
+        int64_t end_ms = 0;
         std::vector<word_data> words;
     };
     std::vector<segment_data> segments;
     
     std::string backend;
 };
+
+struct speaker_utterance {
+    std::string text;
+    std::string speaker;
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
+    std::vector<crispasr_addon_result::word_data> words;
+};
+
+static std::vector<speaker_utterance> parse_speaker_utterances(const std::string& input, int64_t total_duration_ms = 0) {
+    std::vector<speaker_utterance> utterances;
+    if (input.empty()) return utterances;
+
+    size_t start_idx = 0;
+    while (start_idx < input.length() && (input[start_idx] == ' ' || input[start_idx] == '\n' || input[start_idx] == '\r' || input[start_idx] == '\t')) {
+        start_idx++;
+    }
+
+    // 1. Try parsing as VibeVoice JSON: [{"Start": ..., "End": ..., "Speaker": ..., "Content": ...}]
+    if (start_idx < input.length() && (input[start_idx] == '[' || input[start_idx] == '{')) {
+        if (input.find("\"Content\":") != std::string::npos ||
+            input.find("\"content\":") != std::string::npos ||
+            input.find("\"text\":") != std::string::npos) {
+            size_t pos = start_idx;
+            while (pos < input.length()) {
+                size_t obj_start = input.find('{', pos);
+                if (obj_start == std::string::npos) break;
+                size_t obj_end = input.find('}', obj_start);
+                if (obj_end == std::string::npos) break;
+
+                std::string obj_str = input.substr(obj_start, obj_end - obj_start + 1);
+
+                double s_val = 0.0, e_val = 0.0;
+                int spk_val = 1;
+                std::string content_str = "";
+
+                // Parse Start
+                size_t p_start = obj_str.find("\"Start\":");
+                if (p_start == std::string::npos) p_start = obj_str.find("\"start\":");
+                if (p_start != std::string::npos) {
+                    s_val = atof(obj_str.c_str() + p_start + 8);
+                }
+
+                // Parse End
+                size_t p_end = obj_str.find("\"End\":");
+                if (p_end == std::string::npos) p_end = obj_str.find("\"end\":");
+                if (p_end != std::string::npos) {
+                    e_val = atof(obj_str.c_str() + p_end + 6);
+                }
+
+                // Parse Speaker
+                size_t p_spk = obj_str.find("\"Speaker\":");
+                if (p_spk == std::string::npos) p_spk = obj_str.find("\"speaker\":");
+                if (p_spk != std::string::npos) {
+                    spk_val = atoi(obj_str.c_str() + p_spk + 10);
+                }
+
+                // Parse Content
+                size_t p_cnt = obj_str.find("\"Content\":");
+                if (p_cnt == std::string::npos) p_cnt = obj_str.find("\"content\":");
+                if (p_cnt == std::string::npos) p_cnt = obj_str.find("\"text\":");
+                if (p_cnt != std::string::npos) {
+                    size_t v_start = obj_str.find("\"", p_cnt + 8);
+                    if (v_start != std::string::npos) {
+                        v_start++;
+                        size_t v_end = v_start;
+                        while (v_end < obj_str.length()) {
+                            if (obj_str[v_end] == '\\') v_end += 2;
+                            else if (obj_str[v_end] == '"') break;
+                            else v_end++;
+                        }
+                        if (v_end <= obj_str.length()) {
+                            std::string raw_val = obj_str.substr(v_start, v_end - v_start);
+                            for (size_t k = 0; k < raw_val.length(); k++) {
+                                if (raw_val[k] == '\\' && k + 1 < raw_val.length()) {
+                                    char c = raw_val[k+1];
+                                    if (c == '"' || c == '\\' || c == '/') content_str += c;
+                                    else if (c == 'n') content_str += '\n';
+                                    else if (c == 't') content_str += '\t';
+                                    else { content_str += raw_val[k]; content_str += c; }
+                                    k++;
+                                } else {
+                                    content_str += raw_val[k];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                trim_leading_replacement_and_spaces(content_str);
+                while (!content_str.empty() && (content_str.back() == ' ' || content_str.back() == '\t')) content_str.pop_back();
+
+                if (!content_str.empty() && !(content_str.front() == '[' && content_str.back() == ']')) {
+                    speaker_utterance u;
+                    u.text = content_str;
+                    u.speaker = "Speaker " + std::to_string(spk_val);
+                    u.start_ms = static_cast<int64_t>(s_val * 1000.0);
+                    u.end_ms = static_cast<int64_t>(e_val * 1000.0);
+                    utterances.push_back(std::move(u));
+                }
+
+                pos = obj_end + 1;
+            }
+            if (!utterances.empty()) return utterances;
+        }
+    }
+
+    // 2. Try parsing as Moss-Diarize: [0.0][S1] ... [1.5][S2] ...
+    if (input.find("[S") != std::string::npos || input.find("[s") != std::string::npos) {
+        struct token_item {
+            enum { TIME, SPEAKER, TEXT } type;
+            double time_val;
+            int speaker_val;
+            std::string text_val;
+        };
+        std::vector<token_item> tokens;
+
+        size_t idx = 0;
+        while (idx < input.length()) {
+            if (input[idx] == '[') {
+                size_t close_b = input.find(']', idx + 1);
+                if (close_b != std::string::npos) {
+                    std::string tag = input.substr(idx + 1, close_b - idx - 1);
+                    // check speaker
+                    if (!tag.empty() && (tag[0] == 'S' || tag[0] == 's')) {
+                        int s = atoi(tag.c_str() + 1);
+                        token_item it; it.type = token_item::SPEAKER; it.speaker_val = s;
+                        tokens.push_back(it);
+                        idx = close_b + 1;
+                        continue;
+                    }
+                    // check timestamp
+                    bool is_num = true; bool has_d = false;
+                    for (char c : tag) {
+                        if (isdigit(static_cast<unsigned char>(c))) has_d = true;
+                        else if (c != '.') { is_num = false; break; }
+                    }
+                    if (is_num && has_d) {
+                        token_item it; it.type = token_item::TIME; it.time_val = atof(tag.c_str());
+                        tokens.push_back(it);
+                        idx = close_b + 1;
+                        continue;
+                    }
+                }
+            }
+
+            size_t next_b = input.find('[', idx);
+            std::string piece = (next_b == std::string::npos) ? input.substr(idx) : input.substr(idx, next_b - idx);
+            trim_leading_replacement_and_spaces(piece);
+            while (!piece.empty() && (piece.back() == ' ' || piece.back() == '\t')) piece.pop_back();
+            if (!piece.empty()) {
+                token_item it; it.type = token_item::TEXT; it.text_val = piece;
+                tokens.push_back(it);
+            }
+            if (next_b == std::string::npos) break;
+            idx = next_b;
+        }
+
+        int cur_speaker = 1;
+        double cur_start = -1.0;
+        double cur_end = -1.0;
+        std::string cur_text = "";
+
+        auto flush_utt = [&]() {
+            trim_leading_replacement_and_spaces(cur_text);
+            while (!cur_text.empty() && (cur_text.back() == ' ' || cur_text.back() == '\t')) cur_text.pop_back();
+            if (!cur_text.empty()) {
+                speaker_utterance u;
+                u.text = cur_text;
+                u.speaker = "Speaker " + std::to_string(cur_speaker);
+                u.start_ms = cur_start >= 0 ? static_cast<int64_t>(cur_start * 1000.0) : 0;
+                u.end_ms = cur_end >= 0 ? static_cast<int64_t>(cur_end * 1000.0) : (total_duration_ms > 0 ? total_duration_ms : u.start_ms + 1000);
+                if (u.end_ms <= u.start_ms) u.end_ms = u.start_ms + 1000;
+                utterances.push_back(std::move(u));
+            }
+            cur_text = "";
+            cur_start = -1.0;
+            cur_end = -1.0;
+        };
+
+        for (const auto& t : tokens) {
+            if (t.type == token_item::TIME) {
+                if (cur_start < 0) {
+                    cur_start = t.time_val;
+                } else {
+                    cur_end = t.time_val;
+                }
+            } else if (t.type == token_item::SPEAKER) {
+                if (t.speaker_val != cur_speaker && !cur_text.empty()) {
+                    flush_utt();
+                }
+                cur_speaker = t.speaker_val;
+            } else if (t.type == token_item::TEXT) {
+                if (!cur_text.empty()) cur_text += " ";
+                cur_text += t.text_val;
+            }
+        }
+        flush_utt();
+        if (!utterances.empty()) return utterances;
+    }
+
+    return utterances;
+}
 
 class CrispASRWorker : public Napi::AsyncWorker {
 public:
@@ -595,68 +891,146 @@ public:
     void process_result(crispasr_session_result* res, int64_t offset_ms, const qwen3_asr::alignment_result* align_res = nullptr) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string full_text = m_result.text;
-        
         bool use_aligner_words = (align_res && align_res->success);
 
         for (int i = 0; i < n_segs; i++) {
-            crispasr_addon_result::segment_data sd;
             const char* seg_text = crispasr_session_result_segment_text(res, i);
-            sd.text = seg_text ? seg_text : "";
-            sd.start_ms = offset_ms + crispasr_session_result_segment_t0(res, i) * 10;
-            sd.end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
+            std::string raw_seg_text = seg_text ? seg_text : "";
+            int64_t seg_start_ms = offset_ms + crispasr_session_result_segment_t0(res, i) * 10;
+            int64_t seg_end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
+            int64_t seg_dur_ms = seg_end_ms - seg_start_ms;
 
-            std::string clean_seg_text = extract_clean_text_if_json(sd.text);
-            trim_leading_replacement_and_spaces(clean_seg_text);
-            sd.text = clean_seg_text;
-            if (!full_text.empty() && !clean_seg_text.empty()) {
-                full_text += " ";
-            }
-            full_text += clean_seg_text;
+            auto utterances = parse_speaker_utterances(raw_seg_text, seg_dur_ms);
 
-            if (!use_aligner_words) {
-                int n_words = crispasr_session_result_n_words(res, i);
-                for (int j = 0; j < n_words; j++) {
-                    crispasr_addon_result::word_data wd;
-                    const char* w_text = crispasr_session_result_word_text(res, i, j);
-                    wd.text = w_text ? w_text : "";
-                    
-                    int64_t t0 = crispasr_session_result_word_t0(res, i, j);
-                    if (t0 < 0) continue; 
-
-                    wd.start_ms = offset_ms + t0 * 10;
-                    wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
-                    wd.p = crispasr_session_result_word_p(res, i, j);
-
-                    sd.words.push_back(wd);
+            if (!utterances.empty()) {
+                // Multi-speaker mode: distribute words to each speaker utterance!
+                std::vector<crispasr_addon_result::word_data> seg_words;
+                if (use_aligner_words) {
+                    for (const auto& word : align_res->words) {
+                        crispasr_addon_result::word_data wd;
+                        wd.text = word.word;
+                        wd.start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
+                        wd.end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
+                        wd.p = 0.99f;
+                        seg_words.push_back(std::move(wd));
+                    }
+                } else {
+                    int n_words = crispasr_session_result_n_words(res, i);
+                    for (int j = 0; j < n_words; j++) {
+                        crispasr_addon_result::word_data wd;
+                        const char* w_text = crispasr_session_result_word_text(res, i, j);
+                        wd.text = w_text ? w_text : "";
+                        int64_t t0 = crispasr_session_result_word_t0(res, i, j);
+                        if (t0 < 0) continue;
+                        wd.start_ms = offset_ms + t0 * 10;
+                        wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
+                        wd.p = crispasr_session_result_word_p(res, i, j);
+                        seg_words.push_back(std::move(wd));
+                    }
                 }
+
+                for (auto& wd : seg_words) {
+                    int64_t w_mid = (wd.start_ms + wd.end_ms) / 2;
+                    int best_u = -1;
+                    int64_t min_dist = INT64_MAX;
+                    for (size_t u_idx = 0; u_idx < utterances.size(); u_idx++) {
+                        int64_t u_start = offset_ms + utterances[u_idx].start_ms;
+                        int64_t u_end = offset_ms + utterances[u_idx].end_ms;
+                        if (w_mid >= u_start && w_mid <= u_end) {
+                            best_u = static_cast<int>(u_idx);
+                            break;
+                        }
+                        int64_t d = std::min(std::abs(w_mid - u_start), std::abs(w_mid - u_end));
+                        if (d < min_dist) {
+                            min_dist = d;
+                            best_u = static_cast<int>(u_idx);
+                        }
+                    }
+                    if (best_u >= 0 && best_u < static_cast<int>(utterances.size())) {
+                        wd.speaker = utterances[best_u].speaker;
+                        utterances[best_u].words.push_back(std::move(wd));
+                    }
+                }
+
+                for (auto& u : utterances) {
+                    crispasr_addon_result::segment_data sd;
+                    sd.text = u.text;
+                    sd.speaker = u.speaker;
+                    sd.start_ms = offset_ms + u.start_ms;
+                    sd.end_ms = offset_ms + u.end_ms;
+                    sd.words = std::move(u.words);
+
+                    if (!full_text.empty() && !sd.text.empty()) {
+                        full_text += " ";
+                    }
+                    full_text += sd.text;
+
+                    m_result.segments.push_back(std::move(sd));
+                }
+            } else {
+                crispasr_addon_result::segment_data sd;
+                std::string clean_seg_text = clean_text_for_forced_aligner(raw_seg_text);
+                trim_leading_replacement_and_spaces(clean_seg_text);
+                sd.text = clean_seg_text.empty() ? raw_seg_text : clean_seg_text;
+                sd.speaker = "";
+                sd.start_ms = seg_start_ms;
+                sd.end_ms = seg_end_ms;
+
+                if (!full_text.empty() && !sd.text.empty()) {
+                    full_text += " ";
+                }
+                full_text += sd.text;
+
+                if (!use_aligner_words) {
+                    int n_words = crispasr_session_result_n_words(res, i);
+                    for (int j = 0; j < n_words; j++) {
+                        crispasr_addon_result::word_data wd;
+                        const char* w_text = crispasr_session_result_word_text(res, i, j);
+                        wd.text = w_text ? w_text : "";
+                        int64_t t0 = crispasr_session_result_word_t0(res, i, j);
+                        if (t0 < 0) continue;
+                        wd.start_ms = offset_ms + t0 * 10;
+                        wd.end_ms = offset_ms + crispasr_session_result_word_t1(res, i, j) * 10;
+                        wd.p = crispasr_session_result_word_p(res, i, j);
+                        sd.words.push_back(std::move(wd));
+                    }
+                }
+
+                m_result.segments.push_back(std::move(sd));
             }
-            
-            m_result.segments.push_back(std::move(sd));
         }
 
         m_result.text = full_text;
 
         if (use_aligner_words) {
-            for (const auto& word : align_res->words) {
-                crispasr_addon_result::word_data wd;
-                wd.text = word.word;
-                wd.start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
-                wd.end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
-                wd.p = 0.99f;
-                
-                if (m_result.segments.size() == 1) {
-                    m_result.segments.back().words.push_back(wd);
-                } else if (m_result.segments.size() > 1) {
-                    bool distributed = false;
-                    for (auto& sd : m_result.segments) {
-                        if (wd.start_ms >= (sd.start_ms - 500) && wd.start_ms <= (sd.end_ms + 500)) {
-                            sd.words.push_back(wd);
-                            distributed = true;
-                            break;
-                        }
-                    }
-                    if (!distributed) {
+            bool any_missing = false;
+            for (const auto& sd : m_result.segments) {
+                if (sd.words.empty() && !sd.text.empty()) {
+                    any_missing = true;
+                    break;
+                }
+            }
+            if (any_missing) {
+                for (const auto& word : align_res->words) {
+                    crispasr_addon_result::word_data wd;
+                    wd.text = word.word;
+                    wd.start_ms = offset_ms + static_cast<int64_t>(word.start * 1000.0);
+                    wd.end_ms = offset_ms + static_cast<int64_t>(word.end * 1000.0);
+                    wd.p = 0.99f;
+                    if (m_result.segments.size() == 1) {
                         m_result.segments.back().words.push_back(wd);
+                    } else if (m_result.segments.size() > 1) {
+                        bool distributed = false;
+                        for (auto& sd : m_result.segments) {
+                            if (wd.start_ms >= (sd.start_ms - 500) && wd.start_ms <= (sd.end_ms + 500)) {
+                                sd.words.push_back(wd);
+                                distributed = true;
+                                break;
+                            }
+                        }
+                        if (!distributed) {
+                            m_result.segments.back().words.push_back(wd);
+                        }
                     }
                 }
             }
@@ -813,7 +1187,7 @@ public:
                     }
                     if (!total_txt.empty()) {
                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                        std::string clean_txt = extract_clean_text_if_json(total_txt);
+                        std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                         trim_leading_replacement_and_spaces(clean_txt);
                         align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                     }
@@ -904,7 +1278,7 @@ public:
                                 }
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                    std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                                     trim_leading_replacement_and_spaces(clean_txt);
                                     align_res = aligner.align(chunk.data(), chunk.size(), clean_txt, detected_lang);
                                 }
@@ -943,6 +1317,9 @@ public:
         for (size_t i = 0; i < m_result.segments.size(); i++) {
             Napi::Object s_obj = Napi::Object::New(Env());
             s_obj.Set("text", Napi::String::New(Env(), m_result.segments[i].text));
+            if (!m_result.segments[i].speaker.empty()) {
+                s_obj.Set("speaker", Napi::String::New(Env(), m_result.segments[i].speaker));
+            }
             s_obj.Set("start", Napi::Number::New(Env(), m_result.segments[i].start_ms));
             s_obj.Set("end", Napi::Number::New(Env(), m_result.segments[i].end_ms));
 
@@ -953,6 +1330,11 @@ public:
                 w_obj.Set("start", Napi::Number::New(Env(), m_result.segments[i].words[j].start_ms / 1000.0));
                 w_obj.Set("end", Napi::Number::New(Env(), m_result.segments[i].words[j].end_ms / 1000.0));
                 w_obj.Set("p", Napi::Number::New(Env(), m_result.segments[i].words[j].p));
+                if (!m_result.segments[i].words[j].speaker.empty()) {
+                    w_obj.Set("speaker", Napi::String::New(Env(), m_result.segments[i].words[j].speaker));
+                } else if (!m_result.segments[i].speaker.empty()) {
+                    w_obj.Set("speaker", Napi::String::New(Env(), m_result.segments[i].speaker));
+                }
                 s_words[j] = w_obj;
             }
             s_obj.Set("words", s_words);
@@ -1981,7 +2363,7 @@ private:
                                             }
                                             if (!total_txt.empty()) {
                                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                                std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                                std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                                                 trim_leading_replacement_and_spaces(clean_txt);
                                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                                 if (align_res.success) {
@@ -2028,7 +2410,7 @@ private:
                                 }
                                 if (!total_txt.empty()) {
                                     std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                    std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                    std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                                     trim_leading_replacement_and_spaces(clean_txt);
                                     auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                     if (align_res.success) {
@@ -2098,7 +2480,7 @@ private:
                                     }
                                     if (!total_txt.empty()) {
                                         std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                        std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                        std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                                         trim_leading_replacement_and_spaces(clean_txt);
                                         auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                         if (align_res.success) {
@@ -2171,7 +2553,7 @@ private:
                             }
                             if (!total_txt.empty()) {
                                 std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                std::string clean_txt = extract_clean_text_if_json(total_txt);
+                                std::string clean_txt = clean_text_for_forced_aligner(total_txt);
                                 trim_leading_replacement_and_spaces(clean_txt);
                                 auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                                 if (align_res.success) {
