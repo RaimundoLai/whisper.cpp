@@ -2789,10 +2789,6 @@ public:
             }
         }
 
-        if (!m_codec_model_path.empty()) {
-            crispasr_session_set_codec_path(session, m_codec_model_path.c_str());
-        }
-
         if (m_temperature >= 0.0f) {
             crispasr_session_set_temperature(session, m_temperature, m_seed);
         }
