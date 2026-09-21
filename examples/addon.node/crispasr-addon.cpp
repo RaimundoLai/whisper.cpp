@@ -287,6 +287,17 @@ public:
             }
         }
 
+        auto discardContext = [&]() {
+            if (owned) {
+                parakeet_free(ctx);
+            } else {
+                // A failed inference may leave the cached native context in
+                // an unusable state. Do not keep it available for reuse.
+                cache.markIdle(ModelType::PARAKEET);
+                cache.release(ModelType::PARAKEET);
+            }
+        };
+
         struct parakeet_result* res = parakeet_transcribe_ex(ctx, m_pcmf32.data(), m_pcmf32.size(), 0);
         if (res) {
             m_result.text = res->text ? res->text : "";
@@ -312,6 +323,8 @@ public:
             parakeet_result_free(res);
         } else {
             SetError("Parakeet transcription failed");
+            discardContext();
+            return;
         }
 
         type_lock.unlock();
@@ -1081,6 +1094,17 @@ public:
             }
         }
 
+        auto discardSession = [&]() {
+            if (owned) {
+                crispasr_session_close(session);
+            } else {
+                // A failed or interrupted inference may leave the cached
+                // session in an unusable state. Remove it before reuse.
+                cache.markIdle(ModelType::CRISPASR_SESSION);
+                cache.release(ModelType::CRISPASR_SESSION);
+            }
+        };
+
         // Apply translate, target language, and context parameters
         crispasr_session_set_translate(session, m_translate ? 1 : 0);
         if (!m_target_language.empty()) {
@@ -1151,11 +1175,7 @@ public:
         bool use_aligner = !m_aligner_model_path.empty();
         if (use_aligner) {
             if (!aligner.load_model(m_aligner_model_path, m_use_gpu, m_debug)) {
-                if (owned) {
-                    crispasr_session_close(session);
-                } else {
-                    cache.markIdle(ModelType::CRISPASR_SESSION);
-                }
+                discardSession();
                 SetError("Failed to load aligner model: " + aligner.get_error());
                 return;
             }
@@ -1163,6 +1183,7 @@ public:
 
         m_result.backend = crispasr_session_backend(session);
         const char* lang_ptr = m_language.empty() ? nullptr : m_language.c_str();
+        bool discard_session = false;
 
         if (m_vad_model_path.empty()) {
             std::vector<float> transcribe_pcm = m_pcmf32;
@@ -1171,34 +1192,43 @@ public:
             }
             
             OnProgress(0);
-
-            crispasr_session_result* res = crispasr_session_transcribe_lang(session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
-            if (res) {
-                qwen3_asr::alignment_result align_res;
-                if (use_aligner) {
-                    int n_segs = crispasr_session_result_n_segments(res);
-                    std::string total_txt = "";
-                    for (int i = 0; i < n_segs; i++) {
-                        const char* s_text = crispasr_session_result_segment_text(res, i);
-                        if (s_text) {
-                            if (!total_txt.empty()) total_txt += " ";
-                            total_txt += s_text;
+            if (ShouldAbort()) {
+                m_was_aborted->store(true);
+                discard_session = true;
+            } else {
+                crispasr_session_result* res = crispasr_session_transcribe_lang(session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
+                if (res) {
+                    qwen3_asr::alignment_result align_res;
+                    if (use_aligner) {
+                        int n_segs = crispasr_session_result_n_segments(res);
+                        std::string total_txt = "";
+                        for (int i = 0; i < n_segs; i++) {
+                            const char* s_text = crispasr_session_result_segment_text(res, i);
+                            if (s_text) {
+                                if (!total_txt.empty()) total_txt += " ";
+                                total_txt += s_text;
+                            }
+                        }
+                        if (!total_txt.empty()) {
+                            std::string detected_lang = m_language.empty() ? "zh" : m_language;
+                            std::string clean_txt = clean_text_for_forced_aligner(total_txt);
+                            trim_leading_replacement_and_spaces(clean_txt);
+                            align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                         }
                     }
-                    if (!total_txt.empty()) {
-                        std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                        std::string clean_txt = clean_text_for_forced_aligner(total_txt);
-                        trim_leading_replacement_and_spaces(clean_txt);
-                        align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
-                    }
+                    process_result(res, 0, use_aligner ? &align_res : nullptr);
+                    crispasr_session_result_free(res);
+                } else {
+                    SetError("CrispASR transcription failed");
+                    discard_session = true;
                 }
-                process_result(res, 0, use_aligner ? &align_res : nullptr);
-                crispasr_session_result_free(res);
-            } else {
-                SetError("CrispASR transcription failed");
             }
             
             OnProgress(100);
+            if (ShouldAbort()) {
+                m_was_aborted->store(true);
+                discard_session = true;
+            }
         } else {
             whisper_vad_context_params vad_ctx_params = whisper_vad_default_context_params();
             vad_ctx_params.n_threads = m_n_threads;
@@ -1206,12 +1236,7 @@ public:
             
             whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(m_vad_model_path.c_str(), vad_ctx_params);
             if (!vctx) {
-                type_lock.unlock();
-                if (owned) {
-                    crispasr_session_close(session);
-                } else {
-                    cache.markIdle(ModelType::CRISPASR_SESSION);
-                }
+                discardSession();
                 SetError("Failed to initialize whisper VAD context");
                 return;
             }
@@ -1231,6 +1256,7 @@ public:
                 for (int i = 0; i < n_segments; i++) {
                     if (ShouldAbort()) {
                         m_was_aborted->store(true);
+                        discard_session = true;
                         break;
                     }
                     float t0 = whisper_vad_segments_get_segment_t0(segments, i) / 100.0f;
@@ -1247,6 +1273,7 @@ public:
                     while (chunk_start < seg_end_sample) {
                         if (ShouldAbort()) {
                             m_was_aborted->store(true);
+                            discard_session = true;
                             break;
                         }
 
@@ -1257,6 +1284,12 @@ public:
 
                         int progress = static_cast<int>(((float)chunk_start / m_pcmf32.size()) * 100);
                         OnProgress(progress);
+
+                        if (ShouldAbort()) {
+                            m_was_aborted->store(true);
+                            discard_session = true;
+                            break;
+                        }
 
                         std::vector<float> chunk(m_pcmf32.begin() + chunk_start, m_pcmf32.begin() + chunk_end);
                         if (chunk.size() < 32000) {
@@ -1285,6 +1318,8 @@ public:
                             }
                             process_result(res, static_cast<int64_t>(chunk_t0 * 1000), use_aligner ? &align_res : nullptr);
                             crispasr_session_result_free(res);
+                        } else {
+                            discard_session = true;
                         }
 
                         chunk_start = chunk_end;
@@ -1296,11 +1331,19 @@ public:
             whisper_vad_free(vctx);
         }
 
-        type_lock.unlock();
-        if (owned) {
-            crispasr_session_close(session);
+        if (ShouldAbort()) {
+            m_was_aborted->store(true);
+            discard_session = true;
+        }
+        if (discard_session) {
+            discardSession();
         } else {
-            cache.markIdle(ModelType::CRISPASR_SESSION);
+            type_lock.unlock();
+            if (owned) {
+                crispasr_session_close(session);
+            } else {
+                cache.markIdle(ModelType::CRISPASR_SESSION);
+            }
         }
     }
 
@@ -2789,6 +2832,16 @@ public:
             }
         }
 
+        auto discardSession = [&]() {
+            if (owned) {
+                crispasr_session_close(session);
+            } else {
+                // Do not leave a failed synthesis session in the cache.
+                cache.markIdle(ModelType::QWEN3_TTS);
+                cache.release(ModelType::QWEN3_TTS);
+            }
+        };
+
         if (m_temperature >= 0.0f) {
             crispasr_session_set_temperature(session, m_temperature, m_seed);
         }
@@ -2870,12 +2923,7 @@ public:
         }
 
         if (!pcm || n_samples <= 0) {
-            type_lock.unlock();
-            if (owned) {
-                crispasr_session_close(session);
-            } else {
-                cache.markIdle(ModelType::QWEN3_TTS);
-            }
+            discardSession();
             SetError("CrispASR TTS synthesis failed or returned empty audio");
             return;
         }
