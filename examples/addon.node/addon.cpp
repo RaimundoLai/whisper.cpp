@@ -481,7 +481,16 @@ private:
 
                 if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                     fprintf(stderr, "failed to process audio\n");
-                    whisper_free(ctx);
+                    // An aborted/error run must not free a cached context
+                    // directly.  The cache would still contain the dangling
+                    // pointer and the next transcription could crash inside
+                    // whisper_pcm_to_mel_with_state().
+                    if (owned) {
+                        whisper_free(ctx);
+                    } else {
+                        cache.markIdle(ModelType::WHISPER);
+                        cache.release(ModelType::WHISPER);
+                    }
                     return 10;
                 }
             }
