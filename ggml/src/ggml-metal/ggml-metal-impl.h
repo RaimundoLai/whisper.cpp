@@ -87,6 +87,9 @@
 #define N_R0_IQ4_XS 2
 #define N_SG_IQ4_XS 2
 
+#define N_R0_TQ2_0 4
+#define N_SG_TQ2_0 2
+
 // function constants offsets
 #define FC_FLASH_ATTN_EXT_PAD          100
 #define FC_FLASH_ATTN_EXT_BLK          200
@@ -154,6 +157,10 @@
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
+
+#define OP_SSM_SCAN_SSD_CS  64 // Metal-specific; Chunk Size; 64 is largest multiple of 8 (simdgroup tile) fitting into 32 KiB Metal threadgroup mem limit (~26.75 KiB shared mem; see smem layout comment in kernel_ssm_scan_ssd_mma_f32)
+#define OP_SSM_SCAN_SSD_HD  64 // Metal-specific; Head Dim the MMA kernel is specialized for (Mamba-2); use_mma gates on d_inner == this
+#define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
 
 // kernel argument structs
 //
@@ -326,6 +333,7 @@ typedef struct {
     uint64_t nb3;
     int32_t  n_past;
     int32_t  n_dims;
+    int32_t  n_offs;
     int32_t  n_ctx_orig;
     float    freq_base;
     float    freq_scale;
@@ -338,7 +346,20 @@ typedef struct {
     int32_t  sect_2;
     int32_t  sect_3;
     bool     src2;
+    bool     inplace;
 } ggml_metal_kargs_rope;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  nblocks;
+} ggml_metal_kargs_flash_attn_ext_kv_f16;
 
 typedef struct {
     int32_t  ne11;
@@ -437,7 +458,20 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;
+
+typedef struct {
+    int32_t  ne30;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  n_kv_max;
+    int32_t  n_kv_max_padded;
+} ggml_metal_kargs_flash_attn_ext_vec_idx;
 
 typedef struct {
     int32_t  nrows;
@@ -503,30 +537,66 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv_ext;
 
-// Extra arguments for the PREC_F32 Q8_0 x F32 path. The F32 input is
-// quantized into the same block_q8_0 representation used by the CPU dot
-// product before the integer dot is evaluated.
+// CrispASR patch (#83): kargs for Q8_K input quantize + Q4_K×Q8_K matmul.
+// Pre-step kernel_quantize_q8_K_f32 packs F32 input into block_q8_K format
+// matching CPU's quantize_row_q8_K_ref output. Main kernel
+// kernel_mul_mv_q4_K_q8_K then mirrors ggml_vec_dot_q4_K_q8_K_generic
+// bit-for-bit (CPU's Q4_K × Q8_K-quantised input → F32). Used when an op
+// carries GGML_PREC_F32 — see LEARNINGS §"Methodical bisect, round 2".
 typedef struct {
-    int32_t  ne00;
-    int32_t  ne01;
+    int32_t  ne00;     // hidden dim (must be % 256 == 0)
+    int32_t  ne01;     // num input rows = ne11 of the parent matmul
     int32_t  ne02;
-    uint64_t nb01;
+    uint64_t nb01;     // input row stride (bytes), src
     uint64_t nb02;
     uint64_t nb03;
-    int32_t  num_blocks_per_row;
+    int32_t  num_blocks_per_row; // ne00 / 256
+} ggml_metal_kargs_quantize_q8_K;
+
+typedef struct {
+    int32_t  ne00;     // K dim (hidden)
+    int32_t  ne01;     // M dim (output rows)
+    int32_t  ne02;
+    uint64_t nb01;     // weight row stride (bytes), src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;     // N dim (input cols / output cols)
+    int32_t  ne12;
+    int32_t  ne0;      // dst stride along M
+    int32_t  ne1;      // dst stride along N (== ne11)
+    int16_t  r2;
+    int16_t  r3;
+} ggml_metal_kargs_mul_mv_q4_K_q8_K;
+
+// CrispASR patch (#83 r9): kargs for Q8_0 input quantize + Q8_0×Q8_0 matmul.
+// Pre-step kernel_quantize_q8_0_f32 packs F32 input into block_q8_0 format
+// matching CPU's quantize_row_q8_0_ref output (32-elem blocks, F16 scale).
+// Main kernel kernel_mul_mv_q8_0_q8_0 mirrors ggml_vec_dot_q8_0_q8_0_generic
+// bit-for-bit. Used when an op carries GGML_PREC_F32 — chatterbox S3Gen UNet
+// uses Q8_0 weights × F32 input, the GPU mul_mv_ext path drifts ~1e-3 vs
+// CPU (compound F32 accumulator/round-down loss across 396 mul_mats x 10
+// CFM steps) so we mirror the CPU integer-dot path exactly.
+typedef struct {
+    int32_t  ne00;     // hidden dim (must be % 32 == 0)
+    int32_t  ne01;     // num input rows = ne11 of the parent matmul
+    int32_t  ne02;
+    uint64_t nb01;     // input row stride (bytes), src
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  num_blocks_per_row; // ne00 / 32
 } ggml_metal_kargs_quantize_q8_0;
 
 typedef struct {
-    int32_t  ne00;
-    int32_t  ne01;
+    int32_t  ne00;     // K dim (hidden)
+    int32_t  ne01;     // M dim (output rows)
     int32_t  ne02;
-    uint64_t nb01;
+    uint64_t nb01;     // weight row stride (bytes), src0
     uint64_t nb02;
     uint64_t nb03;
-    int32_t  ne11;
+    int32_t  ne11;     // N dim (input cols / output cols)
     int32_t  ne12;
-    int32_t  ne0;
-    int32_t  ne1;
+    int32_t  ne0;      // dst stride along M
+    int32_t  ne1;      // dst stride along N (== ne11)
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv_q8_0_q8_0;
@@ -641,6 +711,22 @@ typedef struct {
     uint64_t nb1;
 } ggml_metal_kargs_conv_transpose_1d;
 
+// CrispASR patch (PR #160 col2im_1d decomposition): kargs for the
+// CrispASR patch (PR #07-metal-aa-snake-beta): kargs for the fused
+// BigVGAN v2 anti-aliased SnakeBeta kernel. K is fixed at 12 by the
+// kernel — left in kargs only for sanity-checking on the host side.
+// MUST RE-APPLY after every ggml bump.
+typedef struct {
+    int32_t T;             // sequence length per channel
+    int32_t C;             // channels (input == output)
+    int32_t K;             // filter taps (always 12 in current kernel)
+    int32_t up_pad;        // 5  — replicate-pad before upsample
+    int32_t up_pad_left;   // 15 — left crop of upsample output
+    int32_t up_pad_right;  // 15 — right crop of upsample output
+    int32_t ds_pad_left;   // 5  — replicate-pad before downsample
+    int32_t ds_pad_right;  // 6
+} ggml_metal_kargs_aa_snake_beta;
+
 typedef struct {
     int32_t  T_in;
     int32_t  T_out;
@@ -667,6 +753,7 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    uint64_t nb3;
 } ggml_metal_kargs_conv_transpose_2d;
 
 typedef struct {
@@ -698,17 +785,6 @@ typedef struct {
     int32_t  d0;
     int32_t  d1;
 } ggml_metal_kargs_conv_2d;
-
-typedef struct {
-    int32_t T;             // sequence length per channel
-    int32_t C;             // channels (input == output)
-    int32_t K;             // filter taps (always 12 in current kernel)
-    int32_t up_pad;        // 5  — replicate-pad before upsample
-    int32_t up_pad_left;   // 15 — left crop of upsample output
-    int32_t up_pad_right;  // 15 — right crop of upsample output
-    int32_t ds_pad_left;   // 5  — replicate-pad before downsample
-    int32_t ds_pad_right;  // 6
-} ggml_metal_kargs_aa_snake_beta;
 
 typedef struct {
     uint64_t nb00;  // kernel strides
@@ -754,6 +830,10 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    // CrispASR patch (CrispEmbed ppocr rec): OW/OH for kernel_im2col_flat,
+    // whose flat dispatch no longer encodes them in the threadgroup grid.
+    int32_t  OW;
+    int32_t  OH;
 } ggml_metal_kargs_im2col;
 
 typedef struct {
@@ -915,7 +995,10 @@ typedef struct {
     int64_t  n_head;
     int64_t  n_group;
     int64_t  n_seq_tokens;
+    int64_t  n_seq_tokens_total;
+    int64_t  token_offset;
     int64_t  n_seqs;
+    int64_t  K;
     uint64_t s_off;
     uint64_t nb00;
     uint64_t nb01;
@@ -1202,6 +1285,17 @@ typedef struct {
     int32_t  top_k;
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
+
+typedef struct {
+    int32_t  ne00;   // number of columns (elements per row)
+    int32_t  ne01;   // rows
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;   // row stride in src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  top_k;  // k
+} ggml_metal_kargs_top_k;
 
 typedef struct {
     int32_t nrows;

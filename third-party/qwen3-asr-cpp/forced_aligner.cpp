@@ -2,6 +2,7 @@
 #include "mel_spectrogram.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <climits>
@@ -451,11 +452,20 @@ bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_conte
     // Try GPU device buffer
     if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Check GPU device type\n");
     ggml_backend_dev_t gpu_dev = use_gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    // QWEN_USE_VRAM overrides host-pointer mapping on GPU devices. Keep the
+    // override inert when GPU use was disabled or no GPU backend is available.
+    bool use_vram = gpu_dev && std::getenv("QWEN_USE_VRAM") != nullptr;
+    if (!use_vram && gpu_dev) {
+        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+        if (dev_name && (std::strstr(dev_name, "CUDA") != nullptr || std::strstr(dev_name, "cuda") != nullptr)) {
+            use_vram = true;
+        }
+    }
     bool copy_needed = false;
     if (gpu_dev) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(gpu_dev, &props);
-        if (props.caps.buffer_from_host_ptr) {
+        if (!use_vram && props.caps.buffer_from_host_ptr) {
             if (debug) fprintf(stderr, "[DEBUG] load_tensor_data (aligner): Device is GPU. Calling buf_from_host_ptr\n");
             model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
         }

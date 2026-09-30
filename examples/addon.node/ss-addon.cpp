@@ -271,15 +271,36 @@ static int whisper_ss_get_embedding(struct ss_model * model, struct whisper_cont
 
     // 2. Build GGML Compute Graph for SS Module
     int n_threads = 4;
-    size_t buf_size = 128 * 1024 * 1024; // 128MB for activations
+    // Attention tensors scale quadratically with the encoded sequence length.
+    // Keep the original floor for short clips, then reserve extra room for
+    // the two transformer layers' attention intermediates on longer audio.
+    const size_t seq = static_cast<size_t>(std::max(1, seq_len));
+    const size_t min_buf_size = 128 * 1024 * 1024;
+    const size_t attention_scratch = seq * seq * 8 * sizeof(float) * 4;
+    const size_t buf_size = min_buf_size + attention_scratch;
     void * buf = malloc(buf_size);
+    if (!buf) {
+        whisper_free_state(wstate);
+        return -1;
+    }
     struct ggml_init_params ggml_params = {
         /* .mem_size   = */ buf_size,
         /* .mem_buffer = */ buf,
         /* .no_alloc   = */ false,
     };
     struct ggml_context * ctx0 = ggml_init(ggml_params);
+    if (!ctx0) {
+        free(buf);
+        whisper_free_state(wstate);
+        return -1;
+    }
     struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    if (!gf) {
+        ggml_free(ctx0);
+        free(buf);
+        whisper_free_state(wstate);
+        return -1;
+    }
 
     // Inputs: whisper encoder features [seq_len, 512]. (C-array layout: [seq_len, 512], meaning ne[0]=512, ne[1]=seq_len in GGML)
     struct ggml_tensor * x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 512, seq_len);
