@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
@@ -1100,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
 
+    // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
     "AA_SNAKE_BETA",
 };
 
@@ -1132,7 +1134,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "concat(x, y)",
     "silu_back(x)",
     "norm(x)",
-    "norm_affine(x)",
+    "w*norm(x)+b",
     "rms_norm(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
@@ -1218,7 +1220,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
 
-    "aa_snake_beta(x)",
+    // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
+    "aa_snake_beta(x, log_a, log_b, usf, dsf)",
 };
 
 static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
@@ -1259,10 +1262,11 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SWIGLU_CLAMP",
     "SIGLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3113,19 +3117,6 @@ struct ggml_tensor * ggml_geglu_quick_split(
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_GEGLU_QUICK, false);
 }
 
-struct ggml_tensor * ggml_swiglu_oai(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        float                 alpha,
-        float                 limit) {
-    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
-    ggml_set_op_params_f32(result, 2, alpha);
-    ggml_set_op_params_f32(result, 3, limit);
-
-    return result;
-}
-
 // ggml_siglu
 
 struct ggml_tensor * ggml_siglu(
@@ -3145,6 +3136,30 @@ struct ggml_tensor * ggml_siglu_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
+}
+
+struct ggml_tensor * ggml_swiglu_oai(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 alpha,
+        float                 limit) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
+    ggml_set_op_params_f32(result, 2, alpha);
+    ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_swiglu_clamp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 limit) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_CLAMP, false);
+    ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
 }
 
 // ggml_norm
@@ -3198,36 +3213,6 @@ struct ggml_tensor * ggml_norm_affine(
     result->src[1] = w;
     result->src[2] = b;
 
-    return result;
-}
-
-// ggml_aa_snake_beta
-
-struct ggml_tensor * ggml_aa_snake_beta(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * log_alpha,
-        struct ggml_tensor  * log_beta,
-        struct ggml_tensor  * us_filter,
-        struct ggml_tensor  * ds_filter) {
-    GGML_ASSERT(ggml_is_matrix(x));                  // [T, C]
-    GGML_ASSERT(log_alpha->ne[0] == x->ne[1]);       // C matches
-    GGML_ASSERT(log_beta->ne[0]  == x->ne[1]);
-    GGML_ASSERT(us_filter->ne[0] == 12);             // K fixed at 12 for now
-    GGML_ASSERT(ds_filter->ne[0] == 12);
-    GGML_ASSERT(x->type         == GGML_TYPE_F32);
-    GGML_ASSERT(log_alpha->type == GGML_TYPE_F32);
-    GGML_ASSERT(log_beta->type  == GGML_TYPE_F32);
-    GGML_ASSERT(us_filter->type == GGML_TYPE_F32);
-    GGML_ASSERT(ds_filter->type == GGML_TYPE_F32);
-
-    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
-    result->op     = GGML_OP_AA_SNAKE_BETA;
-    result->src[0] = x;
-    result->src[1] = log_alpha;
-    result->src[2] = log_beta;
-    result->src[3] = us_filter;
-    result->src[4] = ds_filter;
     return result;
 }
 
@@ -4123,6 +4108,41 @@ struct ggml_tensor * ggml_diag_mask_zero_inplace(
     return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
 }
 
+// ggml_clamp
+
+static struct ggml_tensor * ggml_clamp_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 min,
+        float                 max,
+        bool                  inplace) {
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    float params[] = { min, max };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CLAMP;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_clamp(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a,
+    float                 min,
+    float                 max) {
+    return ggml_clamp_impl(ctx, a, min, max, false);
+}
+
+struct ggml_tensor * ggml_clamp_inplace(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a,
+    float                 min,
+    float                 max) {
+    return ggml_clamp_impl(ctx, a, min, max, true);
+}
+
 // ggml_soft_max
 
 static struct ggml_tensor * ggml_soft_max_impl(
@@ -4281,7 +4301,7 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -4293,6 +4313,8 @@ static struct ggml_tensor * ggml_rope_impl(
     } else {
         memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
     }
+    params[15] = 0; // n_offs, set via ggml_rope_set_offset()
+
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -4503,23 +4525,18 @@ struct ggml_tensor * ggml_rope_multi_back(
     result->op = GGML_OP_ROPE_BACK;
     return result;
 }
-// ggml_clamp
 
-struct ggml_tensor * ggml_clamp(
-        struct ggml_context * ctx,
+struct ggml_tensor * ggml_rope_set_offset(
         struct ggml_tensor  * a,
-        float                 min,
-        float                 max) {
-    // TODO: when implement backward, fix this:
-    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+        int                   n_offs) {
+    GGML_ASSERT(a->op == GGML_OP_ROPE || a->op == GGML_OP_ROPE_BACK);
+    GGML_ASSERT(n_offs >= 0);
 
-    float params[] = { min, max };
-    ggml_set_op_params(result, params, sizeof(params));
+    const int32_t mode = ggml_get_op_params_i32(a, 2);
+    GGML_ASSERT(mode != GGML_ROPE_TYPE_VISION);
 
-    result->op     = GGML_OP_CLAMP;
-    result->src[0] = a;
-
-    return result;
+    ggml_set_op_params_i32(a, 15, n_offs);
+    return a;
 }
 
 static int64_t ggml_calc_conv_output_size(int64_t ins, int64_t ks, int s, int p, int d) {
@@ -4624,6 +4641,31 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, a_mat, (a_mat->ne[0] * a_mat->ne[1]), a_mat->ne[2]));    // [OC, IC, K] => [OC, IC * K]
 
     // CrispASR fork: fix the batch (N > 1) reshape. MUST RE-APPLY after a bump.
+    //
+    // `result` above is mul_mat(a=col[IC*K, N*OL], b=w[IC*K, OC]), so its ne is
+    // [N*OL, OC] — i.e. OC is the SLOWEST axis, flat = oc*(N*OL) + n*OL + ol.
+    // The old one-step reshape to [OL, OC, N] instead claims N is slowest
+    // (flat = n*OL*OC + oc*OL + ol). Those two expressions are identical when
+    // N == 1 and differ otherwise, which is why every existing caller was
+    // correct and the batch path was silently wrong. Verified: N=1 cos=1.0,
+    // N=2 cos=0.41, N=3 cos=0.06 against a hand-rolled conv reference.
+    //
+    // Reshape to the TRUE layout [OL, N, OC], then permute to [OL, OC, N].
+    // N == 1 keeps the old zero-copy path (the permute would be a no-op).
+    //
+    // Compatibility, audited across CrispASR (141 call sites incl. the
+    // ggml_conv_1d_ph forwarders) and CrispEmbed (zero callers):
+    //   * 136 sites pass N == 1 and take the unchanged branch.
+    //   * 2 sites DO pass N > 1 (indextts_voc.cpp aa_snake_beta_native, which
+    //     maps CHANNELS onto the batch axis to run a depthwise FIR across all
+    //     of them at once). They are unaffected because their filter is
+    //     [K,1,1], i.e. OC == 1 -- and with OC == 1 both branches produce the
+    //     identical flat layout n*OL+ol AND the identical declared ne. Verified
+    //     empirically on that exact shape class, N = 1..4.
+    //   * Neither batched site compensates for the old transpose, so nothing
+    //     depended on the broken layout.
+    // The two branches therefore diverge only when N > 1 AND OC > 1, which no
+    // caller in either repo currently does.
     if (im2col->ne[2] == 1) {
         result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [OL, OC, 1]
     } else {
@@ -4665,6 +4707,22 @@ struct ggml_tensor * ggml_conv_1d_dw(
                                      ? ggml_cast(ctx, a, GGML_TYPE_F32) : a;
 
     // CrispASR fork: support batch N > 1. MUST RE-APPLY after every ggml bump.
+    //
+    // The original body reshapes b [T, C, N] to [T, 1, C, N] and hands that to
+    // the 1-D im2col path, whose GGML_ASSERT(b->ne[3] == 1) then fires for any
+    // N > 1 -- so batched depthwise conv ABORTED rather than miscomputing (a
+    // safe failure, but an unsupported one). The trailing
+    // ggml_reshape_3d(..., result->ne[2], 1) also hardcodes 1 into ne[2],
+    // dropping the batch dim.
+    //
+    // Fold the batch into the channel axis instead: b -> [T, 1, C*N, 1], where
+    // the flattened index is cn = n*C + ch (reshape preserves flat order). The
+    // per-channel kernel is tiled to match with ggml_repeat -- element cn reads
+    // kernel (cn mod C) = ch, which is exactly repeat's tiling semantics. The
+    // mul_mat result [OL, 1, C*N] has flat cn*OL + ol = n*C*OL + ch*OL + ol,
+    // which is bit-for-bit the [OL, C, N] layout, so the final reshape is free.
+    //
+    // N == 1 keeps the original path unchanged.
     const int64_t C = b->ne[1];
     const int64_t N = b->ne[2];
 
@@ -4765,6 +4823,42 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+
+// ggml_aa_snake_beta
+//
+// CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2 anti-aliased
+// SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×). All inputs F32.
+// Output has the same shape as `x` ([T, C]). The CPU forward and Metal kernel
+// assume K=12 — kept generic in the builder but asserted in the forward.
+// MUST RE-APPLY after every ggml bump.
+GGML_API struct ggml_tensor * ggml_aa_snake_beta(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * log_alpha,
+        struct ggml_tensor  * log_beta,
+        struct ggml_tensor  * us_filter,
+        struct ggml_tensor  * ds_filter) {
+    GGML_ASSERT(ggml_is_matrix(x));                  // [T, C]
+    GGML_ASSERT(log_alpha->ne[0] == x->ne[1]);       // C matches
+    GGML_ASSERT(log_beta->ne[0]  == x->ne[1]);
+    GGML_ASSERT(us_filter->ne[0] == 12);             // K fixed at 12 for now
+    GGML_ASSERT(ds_filter->ne[0] == 12);
+    GGML_ASSERT(x->type         == GGML_TYPE_F32);
+    GGML_ASSERT(log_alpha->type == GGML_TYPE_F32);
+    GGML_ASSERT(log_beta->type  == GGML_TYPE_F32);
+    GGML_ASSERT(us_filter->type == GGML_TYPE_F32);
+    GGML_ASSERT(ds_filter->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->op     = GGML_OP_AA_SNAKE_BETA;
+    result->src[0] = x;
+    result->src[1] = log_alpha;
+    result->src[2] = log_beta;
+    result->src[3] = us_filter;
+    result->src[4] = ds_filter;
     return result;
 }
 
@@ -4929,7 +5023,8 @@ struct ggml_tensor * ggml_conv_2d_dw(
     // src0 with F16 src1 under our vec_dot_type=F32 patch. Pick F32 when
     // either side is F32 and cast the kernel to F32 to match. MUST RE-APPLY
     // after every ggml bump.
-    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16)
+                                            ? GGML_TYPE_F32 : GGML_TYPE_F16;
     struct ggml_tensor * new_a = ggml_reshape_4d(ctx, a, a->ne[0], a->ne[1], 1, a->ne[2] * a->ne[3]);
     struct ggml_tensor * im2col = ggml_im2col(ctx, new_a,
                                         ggml_reshape_4d(ctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
@@ -4944,7 +5039,6 @@ struct ggml_tensor * ggml_conv_2d_dw(
 
     return result;
 }
-
 
 // ggml_conv_2d_dw_direct
 
@@ -5602,6 +5696,15 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_n_kv_max(
+        struct ggml_tensor * a,
+        int32_t              n_kv_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_max >= 0);
+
+    ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5727,7 +5830,10 @@ struct ggml_tensor * ggml_ssm_scan(
         struct ggml_tensor  * A,
         struct ggml_tensor  * B,
         struct ggml_tensor  * C,
-        struct ggml_tensor  * ids) {
+        struct ggml_tensor  * ids,
+        int64_t               K) {
+    GGML_ASSERT(K >= 1);
+    GGML_ASSERT(K <= INT32_MAX);
     GGML_ASSERT(ggml_is_contiguous(s));
     GGML_ASSERT(ggml_is_contiguous(dt));
     GGML_ASSERT(ggml_is_contiguous(A));
@@ -5764,11 +5870,12 @@ struct ggml_tensor * ggml_ssm_scan(
         if (A->ne[0] != 1) {
             // Mamba-1 has more granular decay factors
             GGML_ASSERT(A->ne[0] == d_state);
+            GGML_ASSERT(K == 1);
         }
     }
 
     // concatenated y + ssm_states
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + K*s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
 
     result->op   = GGML_OP_SSM_SCAN;
     result->src[0] = s;
@@ -5778,6 +5885,8 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[4] = B;
     result->src[5] = C;
     result->src[6] = ids;
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
 
     return result;
 }
@@ -7416,7 +7525,7 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
-        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
+        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);

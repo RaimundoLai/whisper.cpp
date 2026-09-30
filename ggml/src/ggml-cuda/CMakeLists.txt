@@ -129,10 +129,12 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
-
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+    endif()
+
+    if (GGML_CUDA_CRISPASR_FA_PERHEAD_MASK)
+        add_compile_definitions(GGML_CUDA_CRISPASR_FA_PERHEAD_MASK)
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)
@@ -176,9 +178,27 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
+    # CrispASR patch — MUST RE-APPLY after every ggml bump.
+    #
+    # The VMM pool calls the CUDA *driver* API (cuMemCreate, cuMemMap, ...), so
+    # it needs libcuda.so. Upstream links the CUDA::cuda_driver imported target
+    # unconditionally, but FindCUDAToolkit does not always define it — notably on
+    # Kaggle (configure fails outright: "Target ggml-cuda links to CUDA::cuda_driver
+    # but the target was not found") and inside nvidia/cuda devel containers,
+    # which ship only the stub. Both are environments we build in.
+    #
+    # Degrade gracefully instead of failing: prefer the imported target, then the
+    # driver library (including the stub, which is link-time sufficient), and only
+    # as a last resort disable VMM so the build still succeeds.
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
     else()
+        # Resolve libcuda.so ourselves FIRST. CUDA::cuda_driver is unreliable: on
+        # Kaggle the imported target is not defined at all (configure hard-fails),
+        # and in nvidia/cuda devel containers it IS defined but contributes no
+        # library, so the link ends with undefined cuMemCreate/cuMemMap/...
+        # A concrete path works in both. Linking the stub is fine — it carries the
+        # same SONAME (libcuda.so.1), so the real driver is used at runtime.
         find_library(GGML_CUDA_DRIVER_LIB NAMES cuda
                      HINTS ${CUDAToolkit_LIBRARY_DIR}
                            ${CUDAToolkit_LIBRARY_ROOT}/lib64

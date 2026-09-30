@@ -449,6 +449,42 @@ Napi::Value distilWhisper(const Napi::CallbackInfo& info) {
 struct crispasr_session;
 struct crispasr_session_result;
 
+// Mirrors the stable C ABI records in CrispASR's crispasr_session.h. The
+// header keeps these structs opaque to C callers, so the addon supplies the
+// same append-only layout here.
+struct crispasr_diarize_seg_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker;
+    int32_t _pad;
+};
+
+struct crispasr_diarize_turn_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker;
+    int32_t _pad;
+};
+
+struct crispasr_diarize_opts_abi {
+    int32_t method;
+    int32_t n_threads;
+    int64_t slice_t0_cs;
+    const char* pyannote_model_path; // Nemotron Sortformer model path for method 5
+    const char* foxnose_embedder_path;
+    int32_t min_speakers;
+    int32_t max_speakers;
+    int32_t num_speakers;
+    int32_t _pad2;
+};
+
+static_assert(sizeof(void*) != 8 || sizeof(crispasr_diarize_seg_abi) == 24,
+              "CrispASR diarization segment ABI changed");
+static_assert(sizeof(void*) != 8 || sizeof(crispasr_diarize_turn_abi) == 24,
+              "CrispASR diarization turn ABI changed");
+static_assert(sizeof(void*) != 8 || sizeof(crispasr_diarize_opts_abi) == 48,
+              "CrispASR diarization options ABI changed");
+
 struct crispasr_open_params_v1 {
     int abi_version; // = 1 or 2
     int n_threads;
@@ -508,7 +544,14 @@ extern "C" {
     float crispasr_watermark_detect(const float* pcm, int n_samples);
     int crispasr_watermark_load_model(const char* gguf_path);
     int crispasr_audio_load(const char* path, float** out_pcm, int* out_samples, int* out_sample_rate);
+    int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
+                                    int* out_sample_rate);
     void crispasr_audio_free(float* pcm);
+    int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                            const crispasr_diarize_opts_abi* opts,
+                                            crispasr_diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                            int32_t* out_n_turns);
     int crispasr_session_output_sample_rate(crispasr_session* s);
     int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
     int crispasr_session_set_voice(crispasr_session* s, const char* path, const char* ref_text_or_null);
@@ -3882,10 +3925,145 @@ Napi::Value loadWatermarkModel(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, rc == 0);
 }
 
+struct CrispasrDiarizeTurnResult {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker;
+};
+
+class CrispasrDiarizeWorker : public Napi::AsyncWorker {
+public:
+    CrispasrDiarizeWorker(Napi::Function& callback, std::string model_path, std::string audio_path,
+                          int n_threads, int max_speakers)
+        : Napi::AsyncWorker(callback),
+          m_model_path(std::move(model_path)),
+          m_audio_path(std::move(audio_path)),
+          m_n_threads(n_threads),
+          m_max_speakers(max_speakers) {}
+
+    void Execute() override {
+        constexpr int sample_rate = 16000;
+        float* loaded_pcm = nullptr;
+        int n_samples = 0;
+        int loaded_sample_rate = 0;
+        const int load_rc = crispasr_audio_load_at_rate(m_audio_path.c_str(), sample_rate, &loaded_pcm,
+                                                        &n_samples, &loaded_sample_rate);
+        std::unique_ptr<float, void (*)(float*)> pcm(loaded_pcm, crispasr_audio_free);
+        if (load_rc != 0 || !loaded_pcm || n_samples <= 0 || loaded_sample_rate != sample_rate) {
+            SetError("failed to decode audio as 16 kHz PCM: " + m_audio_path);
+            return;
+        }
+
+        // Sortformer emits one activity value per 10 ms frame for up to eight
+        // speakers. No speaker can produce more turns than there are frames.
+        const int64_t n_frames = (static_cast<int64_t>(n_samples) + 159) / 160;
+        const int64_t capacity = n_frames * 8 + 8;
+        if (capacity > INT32_MAX) {
+            SetError("audio is too long for the CrispASR diarization turn buffer");
+            return;
+        }
+
+        crispasr_diarize_seg_abi full_audio{};
+        full_audio.t1_cs = n_frames;
+        full_audio.speaker = -1;
+
+        crispasr_diarize_opts_abi opts{};
+        opts.method = 5; // CrispASR Sortformer / NVIDIA Nemotron-3-Diarization
+        opts.n_threads = m_n_threads;
+        opts.pyannote_model_path = m_model_path.c_str();
+        opts.min_speakers = 1;
+        opts.max_speakers = m_max_speakers;
+
+        std::vector<crispasr_diarize_turn_abi> turns(static_cast<size_t>(capacity));
+        int32_t n_turns = 0;
+        int rc = crispasr_diarize_segments_turns_abi(loaded_pcm, nullptr, n_samples, 0, &full_audio, 1, &opts,
+                                                     turns.data(), static_cast<int32_t>(turns.size()), &n_turns);
+        if (rc == 2 && n_turns > static_cast<int32_t>(turns.size())) {
+            turns.resize(static_cast<size_t>(n_turns));
+            rc = crispasr_diarize_segments_turns_abi(loaded_pcm, nullptr, n_samples, 0, &full_audio, 1, &opts,
+                                                      turns.data(), n_turns, &n_turns);
+        }
+        if (rc != 0) {
+            SetError("CrispASR Nemotron diarization failed (status " + std::to_string(rc) + ")");
+            return;
+        }
+
+        m_duration = static_cast<double>(n_samples) / sample_rate;
+        m_turns.reserve(static_cast<size_t>(n_turns));
+        for (int32_t i = 0; i < n_turns; ++i) {
+            m_turns.push_back({turns[static_cast<size_t>(i)].t0_cs,
+                               turns[static_cast<size_t>(i)].t1_cs,
+                               turns[static_cast<size_t>(i)].speaker});
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object response = Napi::Object::New(Env());
+        response.Set("sampleRate", Napi::Number::New(Env(), 16000));
+        response.Set("duration", Napi::Number::New(Env(), m_duration));
+        Napi::Array turns = Napi::Array::New(Env(), m_turns.size());
+        for (uint32_t i = 0; i < m_turns.size(); ++i) {
+            Napi::Object turn = Napi::Object::New(Env());
+            turn.Set("start", Napi::Number::New(Env(), m_turns[i].t0_cs / 100.0));
+            turn.Set("end", Napi::Number::New(Env(), m_turns[i].t1_cs / 100.0));
+            turn.Set("speaker", Napi::Number::New(Env(), m_turns[i].speaker));
+            turns[i] = turn;
+        }
+        response.Set("turns", turns);
+        Callback().Call({Env().Null(), response});
+    }
+
+private:
+    std::string m_model_path;
+    std::string m_audio_path;
+    int m_n_threads;
+    int m_max_speakers;
+    double m_duration = 0.0;
+    std::vector<CrispasrDiarizeTurnResult> m_turns;
+};
+
+Napi::Value crispasrDiarize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "expected (params: { model, fname_inp }, callback: function)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    const std::string model_path = options.Has("model") && options.Get("model").IsString()
+                                       ? options.Get("model").As<Napi::String>().Utf8Value()
+                                       : std::string();
+    const std::string audio_path = options.Has("fname_inp") && options.Get("fname_inp").IsString()
+                                       ? options.Get("fname_inp").As<Napi::String>().Utf8Value()
+                                       : std::string();
+    const int n_threads = options.Has("n_threads") && options.Get("n_threads").IsNumber()
+                              ? options.Get("n_threads").As<Napi::Number>().Int32Value()
+                              : 4;
+    const int max_speakers = options.Has("max_speakers") && options.Get("max_speakers").IsNumber()
+                                 ? options.Get("max_speakers").As<Napi::Number>().Int32Value()
+                                 : 8;
+    if (model_path.empty() || audio_path.empty()) {
+        Napi::TypeError::New(env, "model and fname_inp must be file paths").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (n_threads <= 0 || max_speakers < 1 || max_speakers > 8) {
+        Napi::RangeError::New(env, "n_threads must be positive and max_speakers must be between 1 and 8")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Function callback = info[1].As<Napi::Function>();
+    (new CrispasrDiarizeWorker(callback, model_path, audio_path, n_threads, max_speakers))->Queue();
+    return env.Undefined();
+}
+
 void InitCrispASR(Napi::Env env, Napi::Object exports) {
     printf("InitCrispASR: Initializing CrispASR exports...\n");
     exports.Set("parakeetASR", Napi::Function::New(env, parakeetASR));
     exports.Set("crispasrASR", Napi::Function::New(env, crispasrASR));
+    exports.Set("crispasrDiarize", Napi::Function::New(env, crispasrDiarize));
     exports.Set("distilWhisper", Napi::Function::New(env, distilWhisper));
     exports.Set("crispasrTTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));

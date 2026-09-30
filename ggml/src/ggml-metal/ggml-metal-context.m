@@ -69,6 +69,10 @@ struct ggml_metal {
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
 
+    // buffers to release after async Metal operations complete
+    // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
+    NSMutableArray * buf_refs;
+
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
@@ -84,106 +88,109 @@ struct ggml_metal {
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
 
+    @autoreleasepool {
 #if TARGET_OS_OSX && !GGML_METAL_NDEBUG
-    // Show all the Metal device instances in the system
-    NSArray * devices = MTLCopyAllDevices();
-    for (id<MTLDevice> device in devices) {
-        GGML_LOG_INFO("%s: found device: %s\n", __func__, [[device name] UTF8String]);
-    }
-    [devices release]; // since it was created by a *Copy* C method
+        // Show all the Metal device instances in the system
+        NSArray * devices = MTLCopyAllDevices();
+        for (id<MTLDevice> device in devices) {
+            GGML_LOG_INFO("%s: found device: %s\n", __func__, [[device name] UTF8String]);
+        }
+        [devices release]; // since it was created by a *Copy* C method
 #endif
 
-    // init context
-    ggml_metal_t res = calloc(1, sizeof(struct ggml_metal));
+        // init context
+        ggml_metal_t res = calloc(1, sizeof(struct ggml_metal));
 
-    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+        id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
-    GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
+        GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 
-    // TODO: would it be better to have one queue for the backend and one queue for the device?
-    //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
-    //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
-    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
-    if (queue == nil) {
-        GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
-        return NULL;
-    }
-
-    res->dev = dev;
-    res->lib = ggml_metal_device_get_library(dev);
-    if (res->lib == NULL) {
-        GGML_LOG_WARN("%s: the device does not have a precompiled Metal library - this is unexpected\n", __func__);
-        GGML_LOG_WARN("%s: will try to compile it on the fly\n", __func__);
-
-        res->lib = ggml_metal_library_init(dev);
-        if (res->lib == NULL) {
-            GGML_LOG_ERROR("%s: error: failed to initialize the Metal library\n", __func__);
-
-            free(res);
-
+        // TODO: would it be better to have one queue for the backend and one queue for the device?
+        //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
+        //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
+        if (queue == nil) {
+            GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
             return NULL;
         }
-    }
 
-    res->ev_cpy = ggml_metal_device_event_init(dev);
+        res->dev = dev;
+        res->lib = ggml_metal_device_get_library(dev);
+        if (res->lib == NULL) {
+            GGML_LOG_WARN("%s: the device does not have a precompiled Metal library - this is unexpected\n", __func__);
+            GGML_LOG_WARN("%s: will try to compile it on the fly\n", __func__);
 
-    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+            res->lib = ggml_metal_library_init(dev);
+            if (res->lib == NULL) {
+                GGML_LOG_ERROR("%s: error: failed to initialize the Metal library\n", __func__);
 
-    snprintf(res->name, sizeof(res->name), "%s", props_dev->name);
+                free(res);
 
-    res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
-
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
-
-    {
-        const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
-        res->debug_graph = val ? atoi(val) : 0;
-    }
-
-    {
-        const char * val = getenv("GGML_METAL_FUSION_DEBUG");
-        res->debug_fusion = val ? atoi(val) : 0;
-    }
-
-    res->use_graph_optimize = true;
-
-    if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
-        res->use_graph_optimize = false;
-    }
-
-    memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
-
-    GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, res->use_fusion         ? "true" : "false");
-    GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
-    GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
-
-    res->capture_compute = 0;
-    res->capture_started = false;
-    res->capture_scope = nil;
-
-    {
-        const char * val = getenv("GGML_METAL_CAPTURE_COMPUTE");
-        if (val) {
-            res->capture_compute = atoi(val);
+                return NULL;
+            }
         }
+
+        res->ev_cpy = ggml_metal_device_event_init(dev);
+
+        const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+
+        snprintf(res->name, sizeof(res->name), "%s", props_dev->name);
+
+        res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
+
+        res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+        res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+
+        {
+            const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
+            res->debug_graph = val ? atoi(val) : 0;
+        }
+
+        {
+            const char * val = getenv("GGML_METAL_FUSION_DEBUG");
+            res->debug_fusion = val ? atoi(val) : 0;
+        }
+
+        res->use_graph_optimize = true;
+
+        if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
+            res->use_graph_optimize = false;
+        }
+
+        memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
+
+        GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, res->use_fusion         ? "true" : "false");
+        GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
+        GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
+
+        res->capture_compute = 0;
+        res->capture_started = false;
+        res->capture_scope = nil;
+
+        {
+            const char * val = getenv("GGML_METAL_CAPTURE_COMPUTE");
+            if (val) {
+                res->capture_compute = atoi(val);
+            }
+        }
+
+        res->has_error = false;
+
+        res->gf = nil;
+        res->encode_async = nil;
+        for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+            res->cmd_bufs[i].obj = nil;
+        }
+
+        res->cmd_bufs_ext = [[NSMutableArray alloc] init];
+        res->buf_refs     = [[NSMutableArray alloc] init];
+
+        res->cmd_buf_last = nil;
+
+        res->pipelines_ext = ggml_metal_pipelines_init();
+
+        return res;
     }
-
-    res->has_error = false;
-
-    res->gf = nil;
-    res->encode_async = nil;
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
-        res->cmd_bufs[i].obj = nil;
-    }
-
-    res->cmd_bufs_ext = [[NSMutableArray alloc] init];
-
-    res->cmd_buf_last = nil;
-
-    res->pipelines_ext = ggml_metal_pipelines_init();
-
-    return res;
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
@@ -203,6 +210,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
+
+    @autoreleasepool {
+        [ctx->buf_refs removeAllObjects];
+        [ctx->buf_refs release];
+    }
 
     if (ctx->pipelines_ext) {
         ggml_metal_pipelines_free(ctx->pipelines_ext);
@@ -292,6 +304,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
         [ctx->cmd_bufs_ext removeAllObjects];
     }
+
+    @autoreleasepool {
+        [ctx->buf_refs removeAllObjects];
+    }
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -335,6 +351,8 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         [encoder endEncoding];
         [cmd_buf commit];
+
+        [ctx->buf_refs addObject:buf_src];
         [buf_src release];
 
         // do not wait here for completion
@@ -379,6 +397,8 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         [encoder endEncoding];
         [cmd_buf commit];
+
+        [ctx->buf_refs addObject:buf_dst];
         [buf_dst release];
 
         // do not wait here for completion
@@ -435,10 +455,135 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// CrispASR ICB-feasibility probe (§210): split each graph_compute into the
+// host-side encode+commit time (what an MTLIndirectCommandBuffer replay would
+// collapse to a single encode) vs the GPU execute+sync time (which ICB cannot
+// remove). Gated by CRISPASR_METAL_PROFILE; when set, this forces a synchronous
+// waitUntilCompleted after the encode so the two halves are cleanly attributable
+// (it serializes the step — for measurement only, not a perf path).
+static int g_crisp_metal_prof = -1; // -1 unread, 0 off, 1 whole-graph, 2 per-op
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    if (g_crisp_metal_prof < 0) {
+        const char * e = getenv("CRISPASR_METAL_PROFILE");
+        if (!e || !*e || *e == '0') g_crisp_metal_prof = 0;
+        else if (e[0] == '2' || e[0] == '3') g_crisp_metal_prof = 2; // per-op breakdown ('3' adds a per-node trace)
+        else                        g_crisp_metal_prof = 1; // whole-graph host/gpu split
+    }
+    const bool crisp_prof = g_crisp_metal_prof == 1;
+    const int64_t crisp_t0 = crisp_prof ? ggml_time_us() : 0;
+
+    // CrispASR §3 per-op GPU profiler (measurement-only, CRISPASR_METAL_PROFILE=2).
+    // Execute the graph one node per command buffer, in topological order — this
+    // preserves data flow and gallocr aliasing exactly like the normal sequential
+    // run, so the final output is correct — and attribute each node's
+    // (GPUEndTime - GPUStartTime) to its GGML_OP. Serialized: absolute times inflate
+    // vs the async multi-cb path, but the per-op-TYPE breakdown is the signal we want
+    // (localizes where the melotts HiFi-GAN 37x-off-roofline GPU time actually lives).
+    if (g_crisp_metal_prof == 2) {
+        ggml_metal_device_rsets_keep_alive(ctx->dev);
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        double  op_us [GGML_OP_COUNT];
+        int64_t op_cnt[GGML_OP_COUNT];
+        for (int i = 0; i < GGML_OP_COUNT; ++i) { op_us[i] = 0.0; op_cnt[i] = 0; }
+        double total_us = 0.0;
+        ctx->gf = gf;
+
+        // Measure the empty-command-buffer scheduling floor: each timed op rides this
+        // fixed per-buffer GPU-queue latency (large under contention), so real kernel
+        // time ~= measured - floor. Median of 21 empty commits.
+        double floor_samp[21];
+        for (int i = 0; i < 21; ++i) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                [cb retain];
+                [cb commit];
+                [cb waitUntilCompleted];
+                double dt = (cb.GPUEndTime - cb.GPUStartTime) * 1e6;
+                floor_samp[i] = dt < 0.0 ? 0.0 : dt;
+                [cb release];
+            }
+        }
+        for (int i = 0; i < 21; ++i) for (int j = i + 1; j < 21; ++j)
+            if (floor_samp[j] < floor_samp[i]) { double t = floor_samp[i]; floor_samp[i] = floor_samp[j]; floor_samp[j] = t; }
+        const double floor_us = floor_samp[10];
+
+        const int64_t t0 = ggml_time_us();
+        // Init the op-encoder over the FULL remaining range [cur, n_nodes) each step so
+        // any residual (structural) fusion is tolerated: encode one op-group, then
+        // advance by however many nodes it consumed (res). A tight [cur,cur+1) range
+        // trips the ggml-metal-ops fusion guard when an op fuses its successor.
+        int cur = 0;
+        while (cur < gf->n_nodes) {
+            struct ggml_tensor * node = gf->nodes[cur];
+            // Skip pure-metadata no-ops: they encode no kernel, so timing them only
+            // captures scheduling-latency noise (they polluted the first run at 40%+).
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE) { cur += 1; continue; }
+            int res = 1;
+            @autoreleasepool {
+                // CrispASR patch (CrispEmbed O6/sched-replay debugging): with
+                // CRISPASR_METAL_PROFILE=3 announce each node BEFORE encoding —
+                // when an encode faults on a stale buffer, the last line names
+                // the node. Costs a flush per node; profile output unchanged.
+                if (getenv("CRISPASR_METAL_PROFILE")[0] == '3') {
+                    fprintf(stderr, "[perop-trace] node %d op=%s name=%s buf=%p(%s) data=%p", cur,
+                            ggml_op_name(node->op), node->name, (void *) node->buffer,
+                            node->buffer ? ggml_backend_buffer_name(node->buffer) : "nil", node->data);
+                    for (int si = 0; si < GGML_MAX_SRC && node->src[si]; ++si) {
+                        const struct ggml_tensor * s = node->src[si];
+                        const struct ggml_tensor * sb = s->view_src ? s->view_src : s;
+                        fprintf(stderr, " src%d=%s buf=%p(%s) data=%p", si, s->name, (void *) sb->buffer,
+                                sb->buffer ? ggml_backend_buffer_name(sb->buffer) : "nil", s->data);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+                [cmd_buf retain];
+                ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, cur, gf->n_nodes,
+                                                        /*use_fusion=*/false, /*use_concurrency=*/false,
+                                                        /*use_capture=*/false, /*debug_graph=*/0, /*debug_fusion=*/0);
+                res = ggml_metal_op_encode(op, 0);
+                ggml_metal_op_free(op);
+                if (res <= 0) res = 1;
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+                if (cmd_buf.status == MTLCommandBufferStatusCompleted) {
+                    double dt = (cmd_buf.GPUEndTime - cmd_buf.GPUStartTime) * 1e6;
+                    if (dt < 0.0) dt = 0.0;
+                    op_us[node->op]  += dt;
+                    op_cnt[node->op] += 1;
+                    total_us         += dt;
+                }
+                [cmd_buf release];
+            }
+            cur += res;
+        }
+        const int64_t t1 = ggml_time_us();
+        // Floor-subtracted totals: net_us[i] = op_us[i] - floor*cnt (real kernel time).
+        double net_total = 0.0;
+        double net_us[GGML_OP_COUNT];
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            net_us[i] = op_us[i] - floor_us * (double) op_cnt[i];
+            if (net_us[i] < 0.0) net_us[i] = 0.0;
+            net_total += net_us[i];
+        }
+        fprintf(stderr, "[metal-perop] nodes=%d sum_gpu_us=%.0f net_gpu_us=%.0f floor_us/buf=%.0f wall_us=%lld\n",
+                gf->n_nodes, total_us, net_total, floor_us, (long long)(t1 - t0));
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (op_cnt[i] == 0) continue;
+            fprintf(stderr, "[metal-perop]   %-18s cnt=%5lld raw_us=%11.0f net_us=%11.0f (net %5.1f%%) net_avg=%8.1f\n",
+                    ggml_op_name((enum ggml_op) i), (long long) op_cnt[i], op_us[i], net_us[i],
+                    100.0 * net_us[i] / (net_total > 0.0 ? net_total : 1.0), net_us[i] / (double) op_cnt[i]);
+        }
+        return GGML_STATUS_SUCCESS;
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -548,6 +693,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        // CrispASR ICB-feasibility probe (§210): attribute host-encode vs GPU.
+        // crisp_t1 = all ops encoded + all command buffers committed (this is the
+        // host work an ICB replay collapses). crisp_t2 = GPU finished. The split
+        // tells us whether the ~100 ms/step decode floor is host re-encode (ICB
+        // would remove it) or GPU execute+submit (ICB cannot).
+        if (crisp_prof) {
+            const int64_t crisp_t1 = ggml_time_us();
+            if (ctx->cmd_buf_last) {
+                [ctx->cmd_buf_last waitUntilCompleted];
+            }
+            const int64_t crisp_t2 = ggml_time_us();
+            fprintf(stderr, "[metal-prof] nodes=%4d n_cb=%d encode_us=%6lld gpu_us=%6lld total_us=%6lld\n",
+                    gf->n_nodes, n_cb, (long long)(crisp_t1 - crisp_t0),
+                    (long long)(crisp_t2 - crisp_t1), (long long)(crisp_t2 - crisp_t0));
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -661,6 +822,14 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // CrispASR debug (#83 r9 follow-up #5): override n_cb via env to test
+    // hypothesis that cross-cmd-buf concurrency violates mem_ranges tracking.
+    {
+        const char * env = getenv("CRISPASR_METAL_N_CB");
+        if (env && *env) {
+            n_cb = atoi(env);
+        }
+    }
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 

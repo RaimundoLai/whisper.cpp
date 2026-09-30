@@ -505,7 +505,7 @@ extern "C" {
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
-        GGML_OP_NORM_AFFINE,
+        GGML_OP_NORM_AFFINE, // fused normalize + affine (w*norm(x)+b)
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
@@ -591,6 +591,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2
+        // anti-aliased SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×).
+        // MUST RE-APPLY after every ggml bump.
         GGML_OP_AA_SNAKE_BETA,
 
         GGML_OP_COUNT,
@@ -630,6 +633,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
         GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
@@ -1384,6 +1388,12 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1395,6 +1405,7 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // fused: w * norm(a, eps) + b   (LayerNorm affine in one kernel)
     GGML_API struct ggml_tensor * ggml_norm_affine(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1748,6 +1759,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    GGML_API struct ggml_tensor * ggml_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_clamp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2005,14 +2029,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-
-    // clamp
-    // in-place, returns view(a)
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
             struct ggml_tensor  * a,
-            float                 min,
-            float                 max);
+            int                   n_offs);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2094,6 +2118,16 @@ extern "C" {
             int                   p0,  // padding
             int                   d0); // dilation
 
+    // CrispASR patch (PR #07-metal-aa-snake-beta): BigVGAN v2 anti-aliased
+    // SnakeBeta — fused upsample 2× + sin²(α·x)/β + downsample 2×.
+    // All inputs F32; output same shape as `x`.
+    //   x        : [T, C]      — time-fastest, channel-major
+    //   log_alpha: [C]         — per-channel α frequency, log-scale
+    //   log_beta : [C]         — per-channel β amplitude, log-scale
+    //   us_filter: [K, 1, 1]   — Kaiser-windowed sinc, sum=1
+    //   ds_filter: [K, 1, 1]   — Kaiser-windowed sinc, sum=1
+    // K must be 12 (asserted in the CPU forward).
+    // MUST RE-APPLY after every ggml bump.
     GGML_API struct ggml_tensor * ggml_aa_snake_beta(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -2465,6 +2499,12 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2491,7 +2531,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:

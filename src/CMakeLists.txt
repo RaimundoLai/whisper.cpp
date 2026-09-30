@@ -165,12 +165,26 @@ file(GLOB_RECURSE WEBRTC_VAD_SOURCES
     "${CRISPASR_DIR}/third_party/webrtc/*.cpp"
 )
 list(APPEND CRISPASR_SOURCES ${CRISPASR_CORE_SOURCES})
-list(APPEND CRISPASR_SOURCES ${CRISPASR_RNNOISE_SOURCES})
+if (NOT MSVC)
+    list(APPEND CRISPASR_SOURCES ${CRISPASR_RNNOISE_SOURCES})
+else()
+    # CrispASR disables its RNNoise backend on MSVC because the vendored
+    # C99 sources use variable-length arrays, which MSVC does not support.
+    list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr_enhance.cpp")
+endif()
 list(APPEND CRISPASR_SOURCES ${CRISP_AUDIO_SOURCES})
 list(APPEND CRISPASR_SOURCES ${GLINT_SOURCES})
 list(APPEND CRISPASR_SOURCES ${CRISPASR_C2PA_SOURCES})
 list(APPEND CRISPASR_SOURCES ${WEBRTC_VAD_SOURCES})
 list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp" "${CRISPASR_DIR}/src/miniaudio_libopus.c")
+
+if (MSVC)
+    # CrispASR 0.8.38 still uses shared_ptr::unique() in this translation
+    # unit. Compile it as C++17 while the rest of whisper remains C++20;
+    # MSVC removed that member from its C++20 library mode.
+    set_source_files_properties("${CRISPASR_DIR}/src/firered_asr.cpp"
+        PROPERTIES COMPILE_OPTIONS "/std:c++17")
+endif()
 
 # Add CoreML support for SenseVoice when WHISPER_COREML is enabled
 if (WHISPER_COREML)

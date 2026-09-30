@@ -34,6 +34,10 @@ static __global__ void conv_transpose_1d_kernel(
                 continue;
             }
 
+            // CrispASR patch (upstream-prs 14: F16 kernel weights) — MUST RE-APPLY
+            // after every ggml bump. src0_t is float OR half; `half * float` is
+            // ambiguous to nvcc ("more than one operator * matches"), so widen the
+            // weight explicitly rather than relying on an implicit conversion.
             accumulator += ggml_cuda_cast<float>(src0[kernel_offset + k]) * src1[input_offset + input_t];
         }
     }
@@ -86,15 +90,13 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
         conv_transpose_1d_cuda<float>(s0, p0, d0, output_size,
             src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
             src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-            dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
             (const float *)src0->data, src1_d, dst_d, stream);
-    } else if (src0->type == GGML_TYPE_F16) {
+    } else {
         conv_transpose_1d_cuda<half>(s0, p0, d0, output_size,
             src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
             src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
-            dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
             (const half *)src0->data, src1_d, dst_d, stream);
-    } else {
-        GGML_ABORT("unsupported type");
     }
 }

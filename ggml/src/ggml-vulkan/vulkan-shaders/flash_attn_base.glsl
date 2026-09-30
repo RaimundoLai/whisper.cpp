@@ -40,7 +40,10 @@ layout (push_constant) uniform parameter {
     uint32_t ne3;
 
     uint32_t neq2;
-    uint32_t neq3;
+    // Mask row stride in elements (mask->nb[1] / sizeof(f16)). This slot was
+    // neq3, which always equals ne3 (the result's ne3 is q->ne[3]); the struct
+    // is at the 128-byte push-constant limit, so the stride reuses it.
+    uint32_t nbm1;
     uint32_t nek2;
     uint32_t nek3;
     uint32_t nev2;
@@ -88,17 +91,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
 
-// FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
-// host can pass the type directly. Keep in sync with ggml.h.
-#define FA_TYPE_F32   0u
-#define FA_TYPE_F16   1u
-#define FA_TYPE_Q4_0  2u
-#define FA_TYPE_Q4_1  3u
-#define FA_TYPE_Q5_0  6u
-#define FA_TYPE_Q5_1  7u
-#define FA_TYPE_Q8_0  8u
-#define FA_TYPE_IQ4_NL 20u
-#define FA_TYPE_BF16 30u
+#include "fa_types.glsl"
 
 #if defined(BFLOAT16)
 #define O_TYPE float
@@ -107,45 +100,6 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
 #endif
-
-// Number of matrix elements per buffer block, derived from the K/V type spec
-// constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
-// and bypasses the dequant path entirely. Quants follow their ggml block sizes.
-uint fa_block_elems(uint ty) {
-    switch (ty) {
-        case FA_TYPE_F32:  return 4u;
-        case FA_TYPE_F16:  return 1u;
-        case FA_TYPE_Q4_0: return uint(QUANT_K_Q4_0);
-        case FA_TYPE_Q4_1: return uint(QUANT_K_Q4_1);
-        case FA_TYPE_Q5_0: return uint(QUANT_K_Q5_0);
-        case FA_TYPE_Q5_1: return uint(QUANT_K_Q5_1);
-        case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
-        case FA_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
-        case FA_TYPE_BF16: return 1u;
-        default:           return 1u;
-    }
-}
-
-// QUANT_R_MMQ for FA-eligible K types. Q4_*/Q5_* store two nibbles per byte
-// (R==2); Q8_0 stores one byte per element (R==1). Used to derive the number
-// of int32s per 32-element block on the MMQ K path: ints_per_block == 8 / R.
-uint fa_quant_r_mmq(uint ty) {
-    switch (ty) {
-        case FA_TYPE_Q4_0: return uint(QUANT_R_Q4_0);
-        case FA_TYPE_Q4_1: return uint(QUANT_R_Q4_1);
-        case FA_TYPE_Q5_0: return uint(QUANT_R_Q5_0);
-        case FA_TYPE_Q5_1: return uint(QUANT_R_Q5_1);
-        case FA_TYPE_Q8_0: return uint(QUANT_R_Q8_0);
-        default:           return 1u;
-    }
-}
-
-bool fa_type_needs_shmem(uint ty) {
-    switch (ty) {
-        case FA_TYPE_IQ4_NL: return true;
-        default:             return false;
-    }
-}
 
 // These can't be `const` globals because GLSL forbids function calls in global
 // const initializers, even when the spec constants would let the driver fold
@@ -233,10 +187,10 @@ void init_indices()
 
     // broadcast factors
     rk2 = p.neq2/p.nek2;
-    rk3 = p.neq3/p.nek3;
+    rk3 = p.ne3/p.nek3;
 
     rv2 = p.neq2/p.nev2;
-    rv3 = p.neq3/p.nev3;
+    rv3 = p.ne3/p.nev3;
 
     // k indices
     ik3 = iq3 / rk3;
@@ -256,7 +210,9 @@ void init_indices()
     // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // Otherwise a row is the mask's real stride: a mask wider than KV (padded,
+    // or shared across K/V lengths) is legal and the CPU/CUDA backends honour it.
+    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : p.nbm1;
 }
 
 // Bias applied to softmax to stay in fp16 range.
