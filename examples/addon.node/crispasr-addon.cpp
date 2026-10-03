@@ -4,9 +4,18 @@
 #include "model-cache.h"
 #include "../../third-party/CrispASR/src/parakeet.h"
 #include "../../third-party/CrispASR/src/qwen3_tts.h"
+#include "../../third-party/CrispASR/src/nemotron3_diar.h"
 #include "whisper.h"
 #include "forced_aligner.h"
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <sys/stat.h>
 
 static bool crisp_file_exists(const std::string& path) {
@@ -3934,10 +3943,11 @@ struct CrispasrDiarizeTurnResult {
 class CrispasrDiarizeWorker : public Napi::AsyncWorker {
 public:
     CrispasrDiarizeWorker(Napi::Function& callback, std::string model_path, std::string audio_path,
-                          int n_threads, int max_speakers)
+                          std::vector<float> in_memory_pcm, int n_threads, int max_speakers)
         : Napi::AsyncWorker(callback),
           m_model_path(std::move(model_path)),
           m_audio_path(std::move(audio_path)),
+          m_in_memory_pcm(std::move(in_memory_pcm)),
           m_n_threads(n_threads),
           m_max_speakers(max_speakers) {}
 
@@ -3946,12 +3956,20 @@ public:
         float* loaded_pcm = nullptr;
         int n_samples = 0;
         int loaded_sample_rate = 0;
-        const int load_rc = crispasr_audio_load_at_rate(m_audio_path.c_str(), sample_rate, &loaded_pcm,
-                                                        &n_samples, &loaded_sample_rate);
-        std::unique_ptr<float, void (*)(float*)> pcm(loaded_pcm, crispasr_audio_free);
-        if (load_rc != 0 || !loaded_pcm || n_samples <= 0 || loaded_sample_rate != sample_rate) {
-            SetError("failed to decode audio as 16 kHz PCM: " + m_audio_path);
-            return;
+        std::unique_ptr<float, void (*)(float*)> pcm(nullptr, crispasr_audio_free);
+
+        if (!m_in_memory_pcm.empty()) {
+            loaded_pcm = m_in_memory_pcm.data();
+            n_samples = static_cast<int>(m_in_memory_pcm.size());
+            loaded_sample_rate = sample_rate;
+        } else {
+            const int load_rc = crispasr_audio_load_at_rate(m_audio_path.c_str(), sample_rate, &loaded_pcm,
+                                                            &n_samples, &loaded_sample_rate);
+            pcm.reset(loaded_pcm);
+            if (load_rc != 0 || !loaded_pcm || n_samples <= 0 || loaded_sample_rate != sample_rate) {
+                SetError("failed to decode audio as 16 kHz PCM: " + m_audio_path);
+                return;
+            }
         }
 
         // Sortformer emits one activity value per 10 ms frame for up to eight
@@ -4017,6 +4035,7 @@ public:
 private:
     std::string m_model_path;
     std::string m_audio_path;
+    std::vector<float> m_in_memory_pcm;
     int m_n_threads;
     int m_max_speakers;
     double m_duration = 0.0;
@@ -4026,7 +4045,7 @@ private:
 Napi::Value crispasrDiarize(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
-        Napi::TypeError::New(env, "expected (params: { model, fname_inp }, callback: function)")
+        Napi::TypeError::New(env, "expected (params: { model, fname_inp | pcmf32 }, callback: function)")
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -4038,14 +4057,27 @@ Napi::Value crispasrDiarize(const Napi::CallbackInfo& info) {
     const std::string audio_path = options.Has("fname_inp") && options.Get("fname_inp").IsString()
                                        ? options.Get("fname_inp").As<Napi::String>().Utf8Value()
                                        : std::string();
+    std::vector<float> in_memory_pcm;
+    if (options.Has("pcmf32")) {
+        Napi::Value pcmf32_value = options.Get("pcmf32");
+        if (!pcmf32_value.IsUndefined()) {
+            if (!pcmf32_value.IsTypedArray() ||
+                pcmf32_value.As<Napi::TypedArray>().TypedArrayType() != napi_float32_array) {
+                Napi::TypeError::New(env, "pcmf32 must be a Float32Array").ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+            Napi::Float32Array arr = pcmf32_value.As<Napi::Float32Array>();
+            in_memory_pcm.assign(arr.Data(), arr.Data() + arr.ElementLength());
+        }
+    }
     const int n_threads = options.Has("n_threads") && options.Get("n_threads").IsNumber()
                               ? options.Get("n_threads").As<Napi::Number>().Int32Value()
                               : 4;
     const int max_speakers = options.Has("max_speakers") && options.Get("max_speakers").IsNumber()
                                  ? options.Get("max_speakers").As<Napi::Number>().Int32Value()
                                  : 8;
-    if (model_path.empty() || audio_path.empty()) {
-        Napi::TypeError::New(env, "model and fname_inp must be file paths").ThrowAsJavaScriptException();
+    if (model_path.empty() || (audio_path.empty() && in_memory_pcm.empty())) {
+        Napi::TypeError::New(env, "model and either fname_inp or pcmf32 must be provided").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     if (n_threads <= 0 || max_speakers < 1 || max_speakers > 8) {
@@ -4055,7 +4087,315 @@ Napi::Value crispasrDiarize(const Napi::CallbackInfo& info) {
     }
 
     Napi::Function callback = info[1].As<Napi::Function>();
-    (new CrispasrDiarizeWorker(callback, model_path, audio_path, n_threads, max_speakers))->Queue();
+    (new CrispasrDiarizeWorker(callback, model_path, audio_path, std::move(in_memory_pcm), n_threads, max_speakers))->Queue();
+    return env.Undefined();
+}
+
+struct CrispasrDiarizeStreamState {
+    nemotron3_diar_context* context = nullptr;
+    nemotron3_diar_stream* stream = nullptr;
+    int speaker_count = 0;
+    int rows_emitted = 0;
+    bool ended = false;
+    std::mutex mutex;
+
+    void release() {
+        if (stream) {
+            nemotron3_diar_stream_free(stream);
+            stream = nullptr;
+        }
+        if (context) {
+            nemotron3_diar_free(context);
+            context = nullptr;
+        }
+    }
+
+    ~CrispasrDiarizeStreamState() { release(); }
+};
+
+static std::mutex g_crispasr_diar_streams_mutex;
+static std::unordered_map<int64_t, std::shared_ptr<CrispasrDiarizeStreamState>> g_crispasr_diar_streams;
+static std::atomic<int64_t> g_crispasr_next_diar_stream_id{1};
+
+static std::shared_ptr<CrispasrDiarizeStreamState> crispasrFindDiarizeStream(int64_t stream_id) {
+    std::lock_guard<std::mutex> lock(g_crispasr_diar_streams_mutex);
+    const auto it = g_crispasr_diar_streams.find(stream_id);
+    return it == g_crispasr_diar_streams.end() ? nullptr : it->second;
+}
+
+class CrispasrDiarizeStreamStartWorker : public Napi::AsyncWorker {
+public:
+    CrispasrDiarizeStreamStartWorker(Napi::Function& callback, std::string model_path, int n_threads,
+                                     bool use_gpu, std::string mode)
+        : Napi::AsyncWorker(callback),
+          m_model_path(std::move(model_path)),
+          m_n_threads(n_threads),
+          m_use_gpu(use_gpu),
+          m_mode(std::move(mode)),
+          m_stream_id(g_crispasr_next_diar_stream_id.fetch_add(1)) {}
+
+    void Execute() override {
+        auto params = nemotron3_diar_default_params();
+        params.n_threads = m_n_threads;
+        params.use_gpu = m_use_gpu;
+        params.verbosity = 0;
+
+        m_state = std::make_shared<CrispasrDiarizeStreamState>();
+        m_state->context = nemotron3_diar_init_from_file(m_model_path.c_str(), params);
+        if (!m_state->context) {
+            SetError("failed to load Nemotron diarization GGUF model: " + m_model_path);
+            return;
+        }
+
+        m_state->speaker_count = nemotron3_diar_n_speakers(m_state->context);
+        m_state->stream = nemotron3_diar_stream_begin(m_state->context, m_mode.c_str());
+        if (!m_state->stream || m_state->speaker_count <= 0 || m_state->speaker_count > 8) {
+            m_state->release();
+            SetError("failed to start Nemotron diarization stream");
+            return;
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        {
+            std::lock_guard<std::mutex> lock(g_crispasr_diar_streams_mutex);
+            g_crispasr_diar_streams.emplace(m_stream_id, m_state);
+        }
+        Napi::Object response = Napi::Object::New(Env());
+        response.Set("streamId", Napi::Number::New(Env(), static_cast<double>(m_stream_id)));
+        response.Set("speakerCount", Napi::Number::New(Env(), m_state->speaker_count));
+        response.Set("frameDurationMs", Napi::Number::New(Env(), 10));
+        Callback().Call({Env().Null(), response});
+    }
+
+private:
+    std::string m_model_path;
+    int m_n_threads;
+    bool m_use_gpu;
+    std::string m_mode;
+    int64_t m_stream_id;
+    std::shared_ptr<CrispasrDiarizeStreamState> m_state;
+};
+
+class CrispasrDiarizeStreamPushWorker : public Napi::AsyncWorker {
+public:
+    CrispasrDiarizeStreamPushWorker(Napi::Function& callback, int64_t stream_id,
+                                    std::shared_ptr<CrispasrDiarizeStreamState> state, std::vector<float> pcm)
+        : Napi::AsyncWorker(callback),
+          m_stream_id(stream_id),
+          m_state(std::move(state)),
+          m_pcm(std::move(pcm)) {}
+
+    void Execute() override {
+        if (m_pcm.empty() || m_pcm.size() > static_cast<size_t>(INT32_MAX)) {
+            SetError("Nemotron diarization stream chunk must contain between 1 and INT32_MAX samples");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        if (m_state->ended || !m_state->stream) {
+            SetError("Nemotron diarization stream has ended");
+            return;
+        }
+
+        int rows = 0;
+        float* raw = nemotron3_diar_stream_push(m_state->stream, m_pcm.data(),
+                                                static_cast<int>(m_pcm.size()), &rows);
+        std::unique_ptr<float, decltype(&std::free)> probabilities(raw, std::free);
+        if (rows < 0 || (rows > 0 && !raw)) {
+            SetError("Nemotron diarization stream failed while processing audio");
+            return;
+        }
+
+        m_frame_start = m_state->rows_emitted;
+        m_rows = rows;
+        m_speaker_count = m_state->speaker_count;
+        if (rows > 0) {
+            const size_t value_count = static_cast<size_t>(rows) * m_speaker_count;
+            m_probabilities.assign(raw, raw + value_count);
+            m_state->rows_emitted += rows;
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object response = Napi::Object::New(Env());
+        response.Set("streamId", Napi::Number::New(Env(), static_cast<double>(m_stream_id)));
+        response.Set("frameStart", Napi::Number::New(Env(), m_frame_start));
+        response.Set("rows", Napi::Number::New(Env(), m_rows));
+        response.Set("speakerCount", Napi::Number::New(Env(), m_speaker_count));
+        Napi::Float32Array values = Napi::Float32Array::New(Env(), m_probabilities.size());
+        std::copy(m_probabilities.begin(), m_probabilities.end(), values.Data());
+        response.Set("probabilities", values);
+        Callback().Call({Env().Null(), response});
+    }
+
+private:
+    int64_t m_stream_id;
+    std::shared_ptr<CrispasrDiarizeStreamState> m_state;
+    std::vector<float> m_pcm;
+    int m_frame_start = 0;
+    int m_rows = 0;
+    int m_speaker_count = 0;
+    std::vector<float> m_probabilities;
+};
+
+class CrispasrDiarizeStreamEndWorker : public Napi::AsyncWorker {
+public:
+    CrispasrDiarizeStreamEndWorker(Napi::Function& callback, int64_t stream_id,
+                                   std::shared_ptr<CrispasrDiarizeStreamState> state)
+        : Napi::AsyncWorker(callback), m_stream_id(stream_id), m_state(std::move(state)) {}
+
+    void Execute() override {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        if (m_state->ended || !m_state->stream) {
+            SetError("Nemotron diarization stream has already ended");
+            return;
+        }
+
+        int rows = 0;
+        float* raw = nemotron3_diar_stream_end(m_state->stream, &rows);
+        std::unique_ptr<float, decltype(&std::free)> probabilities(raw, std::free);
+        if (rows < 0 || (rows > 0 && !raw)) {
+            m_state->ended = true;
+            m_state->release();
+            SetError("Nemotron diarization stream failed while flushing audio");
+            return;
+        }
+
+        m_frame_start = m_state->rows_emitted;
+        m_rows = rows;
+        m_speaker_count = m_state->speaker_count;
+        if (rows > 0) {
+            const size_t value_count = static_cast<size_t>(rows) * m_speaker_count;
+            m_probabilities.assign(raw, raw + value_count);
+            m_state->rows_emitted += rows;
+        }
+        m_state->ended = true;
+        m_state->release();
+    }
+
+    void OnError(const Napi::Error& error) override {
+        {
+            std::lock_guard<std::mutex> lock(g_crispasr_diar_streams_mutex);
+            const auto it = g_crispasr_diar_streams.find(m_stream_id);
+            if (it != g_crispasr_diar_streams.end() && it->second == m_state)
+                g_crispasr_diar_streams.erase(it);
+        }
+        Napi::AsyncWorker::OnError(error);
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        {
+            std::lock_guard<std::mutex> lock(g_crispasr_diar_streams_mutex);
+            const auto it = g_crispasr_diar_streams.find(m_stream_id);
+            if (it != g_crispasr_diar_streams.end() && it->second == m_state)
+                g_crispasr_diar_streams.erase(it);
+        }
+        Napi::Object response = Napi::Object::New(Env());
+        response.Set("streamId", Napi::Number::New(Env(), static_cast<double>(m_stream_id)));
+        response.Set("frameStart", Napi::Number::New(Env(), m_frame_start));
+        response.Set("rows", Napi::Number::New(Env(), m_rows));
+        response.Set("speakerCount", Napi::Number::New(Env(), m_speaker_count));
+        Napi::Float32Array values = Napi::Float32Array::New(Env(), m_probabilities.size());
+        std::copy(m_probabilities.begin(), m_probabilities.end(), values.Data());
+        response.Set("probabilities", values);
+        Callback().Call({Env().Null(), response});
+    }
+
+private:
+    int64_t m_stream_id;
+    std::shared_ptr<CrispasrDiarizeStreamState> m_state;
+    int m_frame_start = 0;
+    int m_rows = 0;
+    int m_speaker_count = 0;
+    std::vector<float> m_probabilities;
+};
+
+Napi::Value crispasrDiarizeStreamStart(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "expected (params: { model, n_threads?, use_gpu?, mode? }, callback: function)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Object options = info[0].As<Napi::Object>();
+    const std::string model_path = options.Has("model") && options.Get("model").IsString()
+                                       ? options.Get("model").As<Napi::String>().Utf8Value()
+                                       : std::string();
+    const int n_threads = options.Has("n_threads") && options.Get("n_threads").IsNumber()
+                              ? options.Get("n_threads").As<Napi::Number>().Int32Value()
+                              : 2;
+    const bool use_gpu = options.Has("use_gpu") && options.Get("use_gpu").IsBoolean()
+                             ? options.Get("use_gpu").As<Napi::Boolean>().Value()
+                             : false;
+    const std::string mode = options.Has("mode") && options.Get("mode").IsString()
+                                 ? options.Get("mode").As<Napi::String>().Utf8Value()
+                                 : "ultra_low_latency";
+    if (model_path.empty()) {
+        Napi::TypeError::New(env, "model must be a Nemotron diarization GGUF path").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (n_threads <= 0) {
+        Napi::RangeError::New(env, "n_threads must be positive").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (mode != "low_latency" && mode != "very_low_latency" && mode != "ultra_low_latency") {
+        Napi::RangeError::New(env, "mode must be low_latency, very_low_latency, or ultra_low_latency")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Function callback = info[1].As<Napi::Function>();
+    (new CrispasrDiarizeStreamStartWorker(callback, model_path, n_threads, use_gpu, mode))->Queue();
+    return env.Undefined();
+}
+
+Napi::Value crispasrDiarizeStreamPush(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsTypedArray() || !info[2].IsFunction()) {
+        Napi::TypeError::New(env, "expected (streamId, pcmf32: Float32Array, callback: function)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::TypedArray typed = info[1].As<Napi::TypedArray>();
+    if (typed.TypedArrayType() != napi_float32_array) {
+        Napi::TypeError::New(env, "pcmf32 must be a Float32Array").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int64_t stream_id = info[0].As<Napi::Number>().Int64Value();
+    auto state = crispasrFindDiarizeStream(stream_id);
+    if (stream_id <= 0 || !state) {
+        Napi::RangeError::New(env, "unknown Nemotron diarization stream id").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Float32Array array = info[1].As<Napi::Float32Array>();
+    if (array.ElementLength() == 0 || array.ElementLength() > static_cast<size_t>(INT32_MAX)) {
+        Napi::RangeError::New(env, "pcmf32 chunk must contain between 1 and INT32_MAX samples")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::vector<float> pcm(array.Data(), array.Data() + array.ElementLength());
+    Napi::Function callback = info[2].As<Napi::Function>();
+    (new CrispasrDiarizeStreamPushWorker(callback, stream_id, std::move(state), std::move(pcm)))->Queue();
+    return env.Undefined();
+}
+
+Napi::Value crispasrDiarizeStreamEnd(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "expected (streamId, callback: function)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int64_t stream_id = info[0].As<Napi::Number>().Int64Value();
+    auto state = crispasrFindDiarizeStream(stream_id);
+    if (stream_id <= 0 || !state) {
+        Napi::RangeError::New(env, "unknown Nemotron diarization stream id").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Function callback = info[1].As<Napi::Function>();
+    (new CrispasrDiarizeStreamEndWorker(callback, stream_id, std::move(state)))->Queue();
     return env.Undefined();
 }
 
@@ -4064,6 +4404,9 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("parakeetASR", Napi::Function::New(env, parakeetASR));
     exports.Set("crispasrASR", Napi::Function::New(env, crispasrASR));
     exports.Set("crispasrDiarize", Napi::Function::New(env, crispasrDiarize));
+    exports.Set("crispasrDiarizeStreamStart", Napi::Function::New(env, crispasrDiarizeStreamStart));
+    exports.Set("crispasrDiarizeStreamPush", Napi::Function::New(env, crispasrDiarizeStreamPush));
+    exports.Set("crispasrDiarizeStreamEnd", Napi::Function::New(env, crispasrDiarizeStreamEnd));
     exports.Set("distilWhisper", Napi::Function::New(env, distilWhisper));
     exports.Set("crispasrTTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
