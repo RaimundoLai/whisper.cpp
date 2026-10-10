@@ -7,12 +7,21 @@
 #include "../../third-party/CrispASR/src/nemotron3_diar.h"
 #include "whisper.h"
 #include "forced_aligner.h"
+#include "../../third-party/CrispASR/src/htdemucs.h"
+#include "../../third-party/CrispASR/src/core/separation_io.h"
+#include "../../third-party/CrispASR/src/miniaudio.h"
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
+
+Napi::Value crispasrSeparate(const Napi::CallbackInfo& info);
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -1513,6 +1522,18 @@ Napi::Value crispasrASR(const Napi::CallbackInfo& info) {
         } else if (backend_name == "moss" || backend_name == "moss-transcribe" || backend_name == "moss_transcribe") {
             backend_name = "moss-diarize";
         }
+    }
+
+    bool is_separate = false;
+    if (options.Has("separate") && (options.Get("separate").IsBoolean() ? options.Get("separate").As<Napi::Boolean>().Value() : true)) {
+        is_separate = true;
+    } else if (options.Has("--separate")) {
+        is_separate = true;
+    } else if (backend_name == "htdemucs" || backend_name == "separate") {
+        is_separate = true;
+    }
+    if (is_separate) {
+        return crispasrSeparate(info);
     }
 
     std::vector<float> pcmf32;
@@ -4399,6 +4420,487 @@ Napi::Value crispasrDiarizeStreamEnd(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static constexpr int kSeparationSampleRate = 44100;
+static constexpr int kMaxSeparationDurationSeconds = 120;
+static constexpr ma_uint64 kMaxSeparationFrames =
+    static_cast<ma_uint64>(kSeparationSampleRate) * kMaxSeparationDurationSeconds;
+
+static bool crisp_read_audio_44100_stereo(const std::string& path, std::vector<float>& out_pcm, int& out_frames,
+                                          std::string& out_error) {
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 2, kSeparationSampleRate);
+    ma_decoder decoder;
+    ma_result res = ma_decoder_init_file(path.c_str(), &config, &decoder);
+    if (res != MA_SUCCESS) {
+        out_error = "Failed to initialize audio decoder (error " + std::to_string(static_cast<int>(res)) + ")";
+        return false;
+    }
+
+    // Release decoder-owned buffers and file handles even if a vector allocation throws.
+    std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> decoder_guard(&decoder, ma_decoder_uninit);
+
+    ma_uint64 total_frames = 0;
+    res = ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
+    std::vector<float> buffer;
+    if (res == MA_SUCCESS && total_frames > kMaxSeparationFrames) {
+        out_error = "Audio separation supports inputs up to 2 minutes per request";
+        return false;
+    }
+
+    if (res == MA_SUCCESS && total_frames > 0) {
+        buffer.resize(static_cast<size_t>(total_frames) * 2);
+        ma_uint64 frames_read = 0;
+        res = ma_decoder_read_pcm_frames(&decoder, buffer.data(), total_frames, &frames_read);
+        if (frames_read > 0 && (res == MA_SUCCESS || res == MA_AT_END) &&
+            (frames_read == total_frames || res == MA_AT_END)) {
+            buffer.resize(static_cast<size_t>(frames_read) * 2);
+            out_pcm = std::move(buffer);
+            out_frames = static_cast<int>(frames_read);
+            return true;
+        }
+
+        if (res != MA_SUCCESS && res != MA_AT_END) {
+            out_error = "Failed to decode audio (error " + std::to_string(static_cast<int>(res)) + ")";
+            return false;
+        }
+        if (res == MA_SUCCESS && frames_read > 0 && frames_read < total_frames) {
+            res = ma_decoder_seek_to_pcm_frame(&decoder, 0);
+            if (res != MA_SUCCESS) {
+                out_error = "Failed to restart audio decoder after a partial read";
+                return false;
+            }
+        }
+    }
+
+    const ma_uint64 chunk_frames = 4096;
+    std::vector<float> chunk(chunk_frames * 2);
+    buffer.clear();
+    ma_uint64 buffered_frames = 0;
+    while (true) {
+        ma_uint64 frames_read = 0;
+        res = ma_decoder_read_pcm_frames(&decoder, chunk.data(), chunk_frames, &frames_read);
+        if (frames_read > kMaxSeparationFrames - buffered_frames) {
+            out_error = "Audio separation supports inputs up to 2 minutes per request";
+            return false;
+        }
+        if (frames_read > 0) {
+            buffer.insert(buffer.end(), chunk.data(), chunk.data() + static_cast<size_t>(frames_read) * 2);
+            buffered_frames += frames_read;
+        }
+        if (res == MA_AT_END) {
+            break;
+        }
+        if (res != MA_SUCCESS) {
+            out_error = "Failed to decode audio (error " + std::to_string(static_cast<int>(res)) + ")";
+            return false;
+        }
+        if (frames_read == 0) {
+            break;
+        }
+    }
+    if (buffer.empty()) {
+        out_error = "Audio file contains no decodable samples";
+        return false;
+    }
+    out_frames = static_cast<int>(buffer.size() / 2);
+    out_pcm = std::move(buffer);
+    return true;
+}
+
+static bool crisp_write_separation_wav(const std::string& path, const float* const* sources, size_t source_count,
+                                       int n_frames, int channels, int sample_rate, std::string& out_error) {
+    if (!sources || source_count == 0 || n_frames <= 0 || channels < 1 || channels > 2 || sample_rate <= 0) {
+        out_error = "Invalid audio data for stem output: " + path;
+        return false;
+    }
+    for (size_t i = 0; i < source_count; ++i) {
+        if (!sources[i]) {
+            out_error = "Missing audio samples for stem output: " + path;
+            return false;
+        }
+    }
+
+    const uint64_t sample_count = static_cast<uint64_t>(n_frames) * static_cast<uint64_t>(channels);
+    const uint64_t data_size_64 = sample_count * sizeof(int16_t);
+    if (data_size_64 > std::numeric_limits<uint32_t>::max() - 36) {
+        out_error = "Stem is too large for WAV output: " + path;
+        return false;
+    }
+    const uint32_t data_size = static_cast<uint32_t>(data_size_64);
+    const uint16_t block_align = static_cast<uint16_t>(channels * sizeof(int16_t));
+    const uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * block_align;
+
+    const std::filesystem::path target_path(path);
+    if (target_path.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(target_path.parent_path(), ec);
+        if (ec) {
+            out_error = "Failed to create stem output directory for " + path + ": " + ec.message();
+            return false;
+        }
+    }
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        out_error = "Failed to open stem output file: " + path;
+        return false;
+    }
+
+    auto fail_output = [&](const std::string& message) {
+        output.close();
+        std::error_code ec;
+        std::filesystem::remove(target_path, ec);
+        out_error = message;
+        return false;
+    };
+    auto write_u16 = [&output](uint16_t value) {
+        const char bytes[2] = {static_cast<char>(value & 0xff), static_cast<char>((value >> 8) & 0xff)};
+        output.write(bytes, sizeof(bytes));
+    };
+    auto write_u32 = [&output](uint32_t value) {
+        const char bytes[4] = {
+            static_cast<char>(value & 0xff), static_cast<char>((value >> 8) & 0xff),
+            static_cast<char>((value >> 16) & 0xff), static_cast<char>((value >> 24) & 0xff)
+        };
+        output.write(bytes, sizeof(bytes));
+    };
+
+    output.write("RIFF", 4);
+    write_u32(36 + data_size);
+    output.write("WAVEfmt ", 8);
+    write_u32(16);
+    write_u16(1);
+    write_u16(static_cast<uint16_t>(channels));
+    write_u32(static_cast<uint32_t>(sample_rate));
+    write_u32(byte_rate);
+    write_u16(block_align);
+    write_u16(16);
+    output.write("data", 4);
+    write_u32(data_size);
+    if (!output) {
+        return fail_output("Failed to write WAV header: " + path);
+    }
+
+    constexpr size_t kChunkSamples = 4096;
+    std::vector<char> encoded(kChunkSamples * sizeof(int16_t));
+    size_t offset = 0;
+    const size_t total_samples = static_cast<size_t>(sample_count);
+    while (offset < total_samples) {
+        const size_t count = std::min(kChunkSamples, total_samples - offset);
+        for (size_t i = 0; i < count; ++i) {
+            float sample = 0.0f;
+            for (size_t source = 0; source < source_count; ++source) {
+                sample += sources[source][offset + i];
+            }
+            sample = std::max(-1.0f, std::min(1.0f, sample));
+            const uint16_t value = static_cast<uint16_t>(static_cast<int16_t>(std::lround(sample * 32767.0f)));
+            encoded[i * 2] = static_cast<char>(value & 0xff);
+            encoded[i * 2 + 1] = static_cast<char>((value >> 8) & 0xff);
+        }
+        output.write(encoded.data(), static_cast<std::streamsize>(count * sizeof(int16_t)));
+        if (!output) {
+            return fail_output("Failed while writing stem output file: " + path);
+        }
+        offset += count;
+    }
+
+    output.close();
+    if (!output) {
+        std::error_code ec;
+        std::filesystem::remove(target_path, ec);
+        out_error = "Failed to finish writing stem output file: " + path;
+        return false;
+    }
+    return true;
+}
+
+class CrispasrSeparateWorker : public Napi::AsyncWorker {
+public:
+    CrispasrSeparateWorker(
+        Napi::Function& callback,
+        std::string model_path,
+        std::string audio_file,
+        std::vector<float> pcmf32,
+        std::string output_dir,
+        std::string stems_selection,
+        int n_threads,
+        bool use_gpu,
+        bool save_files
+    ) : Napi::AsyncWorker(callback),
+        m_model_path(std::move(model_path)),
+        m_audio_file(std::move(audio_file)),
+        m_pcmf32(std::move(pcmf32)),
+        m_output_dir(std::move(output_dir)),
+        m_stems_selection(std::move(stems_selection)),
+        m_n_threads(n_threads),
+        m_use_gpu(use_gpu),
+        m_save_files(save_files),
+        m_sample_rate(kSeparationSampleRate),
+        m_channels(2),
+        m_n_samples(0) {}
+
+    void Execute() override {
+        std::vector<float> pcm_stereo;
+        int n_frames = 0;
+
+        if (!m_audio_file.empty()) {
+            std::string decode_error;
+            if (!crisp_read_audio_44100_stereo(m_audio_file, pcm_stereo, n_frames, decode_error)) {
+                SetError(decode_error + ": " + m_audio_file);
+                return;
+            }
+        } else if (!m_pcmf32.empty()) {
+            if ((m_pcmf32.size() % 2) != 0 || m_pcmf32.size() / 2 > kMaxSeparationFrames) {
+                SetError("Audio separation supports up to 2 minutes of stereo audio per request");
+                return;
+            }
+            pcm_stereo = std::move(m_pcmf32);
+            n_frames = static_cast<int>(pcm_stereo.size() / 2);
+        } else {
+            SetError("No audio input provided for separation");
+            return;
+        }
+
+        if (n_frames <= 0) {
+            SetError("Audio has no samples to separate");
+            return;
+        }
+
+        m_n_samples = n_frames;
+
+        htdemucs_params params = htdemucs_default_params();
+        params.n_threads = m_n_threads;
+        params.use_gpu = m_use_gpu;
+        std::unique_ptr<htdemucs_context, decltype(&htdemucs_free)> ctx(
+            htdemucs_init_from_file(m_model_path.c_str(), params), htdemucs_free);
+        if (!ctx) {
+            SetError("Failed to load HTDemucs model: " + m_model_path);
+            return;
+        }
+
+        std::unique_ptr<htdemucs_result, decltype(&htdemucs_result_free)> res(
+            htdemucs_separate(ctx.get(), pcm_stereo.data(), n_frames), htdemucs_result_free);
+        std::vector<float>().swap(pcm_stereo);
+        if (!res) {
+            SetError("HTDemucs separation failed");
+            return;
+        }
+
+        // Copy source names while ctx and res are valid, with robust fallbacks
+        std::vector<std::string> stem_names(res->n_sources);
+        static const char* k_default_stems[4] = {"drums", "bass", "other", "vocals"};
+        for (int s = 0; s < res->n_sources; ++s) {
+            if (res->source_names && res->source_names[s] && strlen(res->source_names[s]) > 0 && strlen(res->source_names[s]) < 32) {
+                stem_names[s] = res->source_names[s];
+            } else if (s < 4) {
+                stem_names[s] = k_default_stems[s];
+            } else {
+                stem_names[s] = "stem" + std::to_string(s);
+            }
+        }
+
+        ctx.reset();
+
+        std::string base_path = m_audio_file.empty() ? "audio.wav" : m_audio_file;
+        const bool save_no_vocals = m_save_files && res->n_sources >= 3 &&
+            (m_stems_selection.empty() || m_stems_selection == "all" ||
+             crispasr_stem_selected(m_stems_selection, "no_vocals") ||
+             crispasr_stem_selected(m_stems_selection, "accompaniment") ||
+             crispasr_stem_selected(m_stems_selection, "instrumental"));
+
+        if (m_save_files) {
+            std::string output_error;
+            for (int s = 0; s < res->n_sources; ++s) {
+                const std::string& name = stem_names[s];
+                if (crispasr_stem_selected(m_stems_selection, name)) {
+                    const std::string out_path = crispasr_stem_output_path(base_path, name, m_output_dir);
+                    const float* source[] = {res->sources[s]};
+                    if (!crisp_write_separation_wav(out_path, source, 1, res->n_samples, res->n_channels,
+                                                    res->sample_rate, output_error)) {
+                        SetError(output_error);
+                        return;
+                    }
+                    m_stem_paths[name] = out_path;
+                }
+            }
+
+            if (save_no_vocals) {
+                const std::string out_path = crispasr_stem_output_path(base_path, "no_vocals", m_output_dir);
+                const float* accompaniment_sources[] = {res->sources[0], res->sources[1], res->sources[2]};
+                if (!crisp_write_separation_wav(out_path, accompaniment_sources, 3, res->n_samples,
+                                                res->n_channels, res->sample_rate, output_error)) {
+                    SetError(output_error);
+                    return;
+                }
+                m_stem_paths["no_vocals"] = out_path;
+            }
+        }
+    }
+
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object result = Napi::Object::New(Env());
+        result.Set("status", Napi::String::New(Env(), "ok"));
+        result.Set("sample_rate", Napi::Number::New(Env(), m_sample_rate));
+        result.Set("channels", Napi::Number::New(Env(), m_channels));
+        result.Set("samples", Napi::Number::New(Env(), m_n_samples));
+
+        Napi::Object stems = Napi::Object::New(Env());
+        for (const auto& kv : m_stem_paths) {
+            stems.Set(kv.first, Napi::String::New(Env(), kv.second));
+        }
+        result.Set("stems", stems);
+
+        auto it_voc = m_stem_paths.find("vocals");
+        if (it_voc != m_stem_paths.end()) {
+            result.Set("vocals_path", Napi::String::New(Env(), it_voc->second));
+        }
+        auto it_novoc = m_stem_paths.find("no_vocals");
+        if (it_novoc != m_stem_paths.end()) {
+            result.Set("no_vocals_path", Napi::String::New(Env(), it_novoc->second));
+        }
+
+        Callback().Call({Env().Null(), result});
+    }
+
+private:
+    std::string m_model_path;
+    std::string m_audio_file;
+    std::vector<float> m_pcmf32;
+    std::string m_output_dir;
+    std::string m_stems_selection;
+    int m_n_threads;
+    bool m_use_gpu;
+    bool m_save_files;
+    int m_sample_rate;
+    int m_channels;
+    int m_n_samples;
+    std::unordered_map<std::string, std::string> m_stem_paths;
+};
+
+static Napi::Value crispasrSeparateImpl(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "Usage: crispasrSeparate(options, callback)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    if (!options.Has("model") || !options.Get("model").IsString()) {
+        Napi::TypeError::New(env, "options.model (string) is required").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string model_path = options.Get("model").As<Napi::String>();
+
+    std::string audio_file = "";
+    if (options.Has("file") && options.Get("file").IsString()) {
+        audio_file = options.Get("file").As<Napi::String>();
+    } else if (options.Has("audio_file") && options.Get("audio_file").IsString()) {
+        audio_file = options.Get("audio_file").As<Napi::String>();
+    } else if (options.Has("fname_inp") && options.Get("fname_inp").IsString()) {
+        audio_file = options.Get("fname_inp").As<Napi::String>();
+    }
+
+    std::vector<float> pcmf32;
+    if (audio_file.empty() && options.Has("pcmf32")) {
+        Napi::Value pcm_value = options.Get("pcmf32");
+        if (!pcm_value.IsTypedArray() || pcm_value.As<Napi::TypedArray>().TypedArrayType() != napi_float32_array) {
+            Napi::TypeError::New(env, "options.pcmf32 must be a Float32Array").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Float32Array arr = pcm_value.As<Napi::Float32Array>();
+        int channels = 2;
+        if (options.Has("channels") && options.Get("channels").IsNumber()) {
+            channels = options.Get("channels").As<Napi::Number>().Int32Value();
+        }
+        if (channels != 1 && channels != 2) {
+            Napi::RangeError::New(env, "options.channels must be 1 or 2").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        if (arr.ElementLength() % static_cast<size_t>(channels) != 0) {
+            Napi::RangeError::New(env, "options.pcmf32 must contain complete audio frames").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        const size_t frame_count = arr.ElementLength() / static_cast<size_t>(channels);
+        if (frame_count > kMaxSeparationFrames) {
+            Napi::RangeError::New(env, "Audio separation supports inputs up to 2 minutes per request").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        if (channels == 1) {
+            pcmf32.reserve(frame_count * 2);
+            for (size_t i = 0; i < frame_count; ++i) {
+                pcmf32.push_back(arr.Data()[i]);
+                pcmf32.push_back(arr.Data()[i]);
+            }
+        } else if (arr.ElementLength() > 0) {
+            pcmf32.assign(arr.Data(), arr.Data() + arr.ElementLength());
+        }
+    }
+
+    if (audio_file.empty() && pcmf32.empty()) {
+        Napi::TypeError::New(env, "options.file (string) or options.pcmf32 is required").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string output_dir = "";
+    if (options.Has("output_dir") && options.Get("output_dir").IsString()) {
+        output_dir = options.Get("output_dir").As<Napi::String>();
+    } else if (options.Has("sep_output_dir") && options.Get("sep_output_dir").IsString()) {
+        output_dir = options.Get("sep_output_dir").As<Napi::String>();
+    }
+
+    std::string stems = "";
+    if (options.Has("stems") && options.Get("stems").IsString()) {
+        stems = options.Get("stems").As<Napi::String>();
+    }
+
+    int n_threads = std::min(4, static_cast<int32_t>(std::thread::hardware_concurrency()));
+    if (options.Has("n_threads") && options.Get("n_threads").IsNumber()) {
+        n_threads = options.Get("n_threads").As<Napi::Number>().Int32Value();
+    }
+
+    bool use_gpu = true;
+    if (options.Has("use_gpu") && options.Get("use_gpu").IsBoolean()) {
+        use_gpu = options.Get("use_gpu").As<Napi::Boolean>();
+    }
+
+    bool save_files = true;
+    if (options.Has("save_files") && options.Get("save_files").IsBoolean()) {
+        save_files = options.Get("save_files").As<Napi::Boolean>();
+    }
+
+    Napi::Function callback = info[1].As<Napi::Function>();
+    auto worker = std::make_unique<CrispasrSeparateWorker>(
+        callback,
+        std::move(model_path),
+        std::move(audio_file),
+        std::move(pcmf32),
+        std::move(output_dir),
+        std::move(stems),
+        n_threads,
+        use_gpu,
+        save_files
+    );
+    worker->Queue();
+    worker.release();
+
+    return env.Undefined();
+}
+
+Napi::Value crispasrSeparate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    try {
+        return crispasrSeparateImpl(info);
+    } catch (const Napi::Error& error) {
+        error.ThrowAsJavaScriptException();
+    } catch (const std::exception& error) {
+        Napi::Error::New(env, error.what()).ThrowAsJavaScriptException();
+    } catch (...) {
+        Napi::Error::New(env, "Unknown native audio separation error").ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 void InitCrispASR(Napi::Env env, Napi::Object exports) {
     printf("InitCrispASR: Initializing CrispASR exports...\n");
     exports.Set("parakeetASR", Napi::Function::New(env, parakeetASR));
@@ -4411,6 +4913,8 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("crispasrTTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("tts", Napi::Function::New(env, crispasrTTS));
+    exports.Set("crispasrSeparate", Napi::Function::New(env, crispasrSeparate));
+    exports.Set("separate", Napi::Function::New(env, crispasrSeparate));
 
     // Standalone Watermark APIs
     exports.Set("applyWatermark", Napi::Function::New(env, applyWatermark));
