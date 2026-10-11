@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 #include "qwen_mmap.h"
 
 #define QWEN3_ASR_MAX_NODES 8192
@@ -868,19 +869,113 @@ bool TextDecoder::load_vocab(struct gguf_context * ctx) {
         error_msg_ = "Vocabulary not found in GGUF file";
         return false;
     }
-    
+
     int64_t n_vocab = gguf_get_arr_n(ctx, tokens_idx);
     if (n_vocab <= 0) {
         error_msg_ = "Empty vocabulary in GGUF file";
         return false;
     }
-    
+
+    vocab_.clear();
+    vocab_ids_.clear();
+    merge_ranks_.clear();
     vocab_.resize(n_vocab);
     for (int64_t i = 0; i < n_vocab; ++i) {
         vocab_[i] = gguf_get_arr_str(ctx, tokens_idx, i);
+        vocab_ids_.emplace(vocab_[i], static_cast<int32_t>(i));
     }
-    
+
+    int64_t merges_idx = gguf_find_key(ctx, "tokenizer.ggml.merges");
+    if (merges_idx >= 0) {
+        const int64_t n_merges = gguf_get_arr_n(ctx, merges_idx);
+        for (int64_t rank = 0; rank < n_merges; ++rank) {
+            const std::string merge = gguf_get_arr_str(ctx, merges_idx, rank);
+            const size_t separator = merge.find(' ');
+            if (separator == std::string::npos || separator == 0 || separator + 1 >= merge.size()) {
+                continue;
+            }
+            merge_ranks_.emplace(
+                std::make_pair(merge.substr(0, separator), merge.substr(separator + 1)),
+                static_cast<int32_t>(rank)
+            );
+        }
+    }
+
     return true;
+}
+
+static void append_utf8_codepoint(std::string & out, uint32_t codepoint) {
+    if (codepoint <= 0x7F) {
+        out.push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    }
+}
+
+std::vector<int32_t> TextDecoder::encode_tokens(const std::string & text) const {
+    std::vector<uint32_t> byte_to_codepoint(256);
+    std::vector<bool> assigned(256, false);
+    auto mark = [&](int first, int last) {
+        for (int byte = first; byte <= last; ++byte) {
+            byte_to_codepoint[byte] = static_cast<uint32_t>(byte);
+            assigned[byte] = true;
+        }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+
+    uint32_t extra_codepoint = 256;
+    for (int byte = 0; byte < 256; ++byte) {
+        if (!assigned[byte]) {
+            byte_to_codepoint[byte] = extra_codepoint++;
+        }
+    }
+
+    std::vector<std::string> pieces;
+    pieces.reserve(text.size());
+    for (unsigned char byte : text) {
+        std::string piece;
+        append_utf8_codepoint(piece, byte_to_codepoint[byte]);
+        pieces.push_back(std::move(piece));
+    }
+
+    while (pieces.size() > 1) {
+        int32_t best_rank = std::numeric_limits<int32_t>::max();
+        size_t best_index = pieces.size();
+        for (size_t i = 0; i + 1 < pieces.size(); ++i) {
+            const auto merge = merge_ranks_.find(std::make_pair(pieces[i], pieces[i + 1]));
+            if (merge != merge_ranks_.end() && merge->second < best_rank) {
+                best_rank = merge->second;
+                best_index = i;
+            }
+        }
+        if (best_index == pieces.size()) {
+            break;
+        }
+        pieces[best_index] += pieces[best_index + 1];
+        pieces.erase(pieces.begin() + best_index + 1);
+    }
+
+    std::vector<int32_t> token_ids;
+    token_ids.reserve(pieces.size());
+    for (const std::string & piece : pieces) {
+        const auto token = vocab_ids_.find(piece);
+        if (token != vocab_ids_.end()) {
+            token_ids.push_back(token->second);
+        }
+    }
+    return token_ids;
 }
 
 // GPT-2 byte-level BPE: reverse mapping from Unicode codepoints back to raw bytes.

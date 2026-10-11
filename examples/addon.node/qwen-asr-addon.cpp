@@ -44,6 +44,7 @@ public:
                   std::string vad_model_path,
                   std::vector<float> pcmf32,
                   std::string language,
+                  std::vector<std::string> hotwords,
                   int n_threads,
                   int max_tokens,
                   bool debug,
@@ -63,6 +64,7 @@ public:
           m_vad_model_path(std::move(vad_model_path)),
           m_pcmf32(std::move(pcmf32)),
           m_language(std::move(language)),
+          m_hotwords(std::move(hotwords)),
           m_n_threads(n_threads),
           m_max_tokens(max_tokens),
           m_debug(debug),
@@ -174,6 +176,7 @@ public:
         qwen3_asr::transcribe_params tp;
         tp.max_tokens = m_max_tokens;
         tp.language = m_language;
+        tp.hotwords = m_hotwords;
         tp.n_threads = m_n_threads;
         tp.print_progress = m_debug;
         tp.print_timing = m_debug;
@@ -394,6 +397,7 @@ private:
     std::string m_vad_model_path;
     std::vector<float> m_pcmf32;
     std::string m_language;
+    std::vector<std::string> m_hotwords;
     int m_n_threads;
     int m_max_tokens;
     bool m_debug;
@@ -465,6 +469,20 @@ Napi::Value qwenASR(const Napi::CallbackInfo& info) {
     std::string language = "";
     if (options.Has("language") && options.Get("language").IsString()) {
         language = options.Get("language").As<Napi::String>();
+    }
+
+    std::vector<std::string> hotwords;
+    if (options.Has("hotwords") && options.Get("hotwords").IsArray()) {
+        Napi::Array values = options.Get("hotwords").As<Napi::Array>();
+        for (uint32_t i = 0; i < values.Length() && hotwords.size() < 128; ++i) {
+            Napi::Value value = values.Get(i);
+            if (value.IsString()) {
+                std::string hotword = value.As<Napi::String>().Utf8Value();
+                if (!hotword.empty() && hotword.size() <= 256) {
+                    hotwords.push_back(std::move(hotword));
+                }
+            }
+        }
     }
 
     int n_threads = std::min(4, static_cast<int>(std::thread::hardware_concurrency()));
@@ -541,7 +559,7 @@ Napi::Value qwenASR(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[1].As<Napi::Function>();
     QwenASRWorker* worker = new QwenASRWorker(
         callback, model_path, aligner_model_path, vad_model_path, std::move(pcmf32),
-        language, n_threads, max_tokens, debug, use_gpu,
+        language, std::move(hotwords), n_threads, max_tokens, debug, use_gpu,
         vad_threshold, min_speech_ms, max_speech_ms, min_silence_ms, speech_pad_ms,
         reuse_instance, auto_release_ms,
         progress_callback, env);
@@ -789,7 +807,20 @@ public:
             
         if (options.Has("language") && options.Get("language").IsString()) 
             m_language = options.Get("language").As<Napi::String>();
-            
+
+        if (options.Has("hotwords") && options.Get("hotwords").IsArray()) {
+            Napi::Array values = options.Get("hotwords").As<Napi::Array>();
+            for (uint32_t i = 0; i < values.Length() && m_hotwords.size() < 128; ++i) {
+                Napi::Value value = values.Get(i);
+                if (value.IsString()) {
+                    std::string hotword = value.As<Napi::String>().Utf8Value();
+                    if (!hotword.empty() && hotword.size() <= 256) {
+                        m_hotwords.push_back(std::move(hotword));
+                    }
+                }
+            }
+        }
+
         if (options.Has("n_threads") && options.Get("n_threads").IsNumber()) 
             m_n_threads = options.Get("n_threads").As<Napi::Number>().Int32Value();
             
@@ -971,6 +1002,7 @@ private:
         qwen3_asr::transcribe_params tp;
         tp.max_tokens = m_max_tokens;
         tp.language = m_language;
+        tp.hotwords = m_hotwords;
         tp.n_threads = m_n_threads;
         tp.print_progress = false;
         tp.print_timing = false;
@@ -1290,6 +1322,7 @@ private:
     std::string m_aligner_model_path;
     std::string m_vad_model_path;
     std::string m_language = "";
+    std::vector<std::string> m_hotwords;
     int m_n_threads = 4;
     int m_max_tokens = 1024;
     int m_chunk_size_ms = 32;

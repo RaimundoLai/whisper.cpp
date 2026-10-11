@@ -18,6 +18,7 @@ struct transcribe_params {
     
     // Language code (optional, for prompting)
     std::string language = "";
+    std::vector<std::string> hotwords;
     
     // Number of threads for mel computation
     int32_t n_threads = 4;
@@ -87,8 +88,9 @@ private:
                                            const transcribe_params & params);
     
     // Build input token sequence for audio
-    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames, 
-                                             const std::string & language);
+    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames,
+                                             const std::string & language,
+                                             const std::vector<std::string> & hotwords);
     
     // Greedy decoding loop
     bool decode_greedy(const std::vector<int32_t> & input_tokens,
