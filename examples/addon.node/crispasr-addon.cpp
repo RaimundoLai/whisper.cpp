@@ -2927,11 +2927,28 @@ public:
             crispasr_session_set_tts_reference_language(session, m_ref_lang.c_str());
         }
 
-        if (!m_voice.empty() || !m_ref_text.empty()) {
+        const bool is_voxcpm2 = m_backend_name == "voxcpm2-tts" || m_backend_name == "voxcpm2" ||
+                               m_backend_name == "voxcpm2_tts" ||
+                               m_model_path.find("voxcpm2") != std::string::npos;
+        if (is_voxcpm2 || !m_voice.empty() || !m_ref_text.empty()) {
             crispasr_session_set_voice(session, m_voice.c_str(), m_ref_text.empty() ? nullptr : m_ref_text.c_str());
         }
-
-        if (!m_instruct.empty()) {
+        std::string synthesis_text = m_text;
+        if (is_voxcpm2) {
+            std::string control = m_instruct;
+            if (m_speed > 0.0f && std::abs(m_speed - 1.0f) > 0.01f) {
+                const int speed_percent = static_cast<int>(std::lround(m_speed * 100.0f));
+                if (!control.empty()) {
+                    control += "; ";
+                }
+                control += "Speak at about " + std::to_string(speed_percent) +
+                           "% of the normal speaking pace.";
+            }
+            if (!control.empty()) {
+                // VoxCPM2's official control path prefixes the text with (instruction).
+                synthesis_text = "(" + control + ")" + synthesis_text;
+            }
+        } else if (!m_instruct.empty()) {
             crispasr_session_set_instruct(session, m_instruct.c_str());
         }
 
@@ -2959,7 +2976,7 @@ public:
             crispasr_session_set_tts_num_candidates(session, m_num_candidates);
         }
 
-        if (m_speed > 0.0f && m_speed != 1.0f) {
+        if (!is_voxcpm2 && m_speed > 0.0f && m_speed != 1.0f) {
             crispasr_session_set_length_scale(session, 1.0f / m_speed);
         }
 
@@ -2986,12 +3003,12 @@ public:
         float* pcm = nullptr;
 
         if (m_watermark) {
-            pcm = crispasr_session_synthesize(session, m_text.c_str(), &n_samples);
+            pcm = crispasr_session_synthesize(session, synthesis_text.c_str(), &n_samples);
         } else {
             crispasr_session_accept_marking_responsibility(session, "Caller accepted marking responsibility via addon options");
-            pcm = crispasr_session_synthesize_raw(session, m_text.c_str(), &n_samples);
+            pcm = crispasr_session_synthesize_raw(session, synthesis_text.c_str(), &n_samples);
             if (!pcm) {
-                pcm = crispasr_session_synthesize(session, m_text.c_str(), &n_samples);
+                pcm = crispasr_session_synthesize(session, synthesis_text.c_str(), &n_samples);
             }
         }
 

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <map>
 
@@ -188,7 +189,7 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
         fprintf(stderr, "Audio features: [%d, %d]\n", n_audio_frames, text_hparams.hidden_size);
     }
     
-    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.language);
+    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.language, params.hotwords);
     
     if (params.print_progress) {
         fprintf(stderr, "Input tokens: %zu\n", input_tokens.size());
@@ -334,67 +335,110 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     return result;
 }
 
-std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
-                                                   const std::string & language) {
+std::vector<int32_t> Qwen3ASR::build_input_tokens(
+    int32_t n_audio_frames,
+    const std::string & language,
+    const std::vector<std::string> & hotwords) {
     const auto & cfg = decoder_.get_config();
-    
+
+    std::string system_prompt;
+    size_t included_hotwords = 0;
+    if (!hotwords.empty()) {
+        system_prompt = "Use these hotwords when they are clearly spoken in the audio: ";
+        for (const std::string & hotword : hotwords) {
+            if (included_hotwords >= 32) {
+                break;
+            }
+
+            std::string cleaned;
+            cleaned.reserve(hotword.size());
+            for (unsigned char ch : hotword) {
+                if (ch == '<' || ch == '>' || ch == '|') {
+                    continue;
+                }
+                if (ch < 0x20) {
+                    if (std::isspace(ch) && !cleaned.empty() && cleaned.back() != ' ') {
+                        cleaned.push_back(' ');
+                    }
+                    continue;
+                }
+                cleaned.push_back(static_cast<char>(ch));
+            }
+            while (!cleaned.empty() && cleaned.back() == ' ') {
+                cleaned.pop_back();
+            }
+            if (cleaned.empty() || cleaned.size() > 128) {
+                continue;
+            }
+
+            const size_t extra_size = cleaned.size() + (included_hotwords > 0 ? 2 : 0);
+            if (system_prompt.size() + extra_size + 1 > 512) {
+                break;
+            }
+            if (included_hotwords > 0) {
+                system_prompt += ", ";
+            }
+            system_prompt += cleaned;
+            ++included_hotwords;
+        }
+
+        if (included_hotwords == 0) {
+            system_prompt.clear();
+        } else {
+            system_prompt.push_back('.');
+        }
+    }
+
     std::vector<int32_t> tokens;
-    tokens.reserve(n_audio_frames + 20);
-    
-    // Chat template format:
-    // <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|>...<|audio_end|><|im_end|>\n<|im_start|>assistant\n
-    
-    // Token IDs from Qwen3 tokenizer:
-    // <|im_start|> = 151644
-    // <|im_end|> = 151645
-    // system = 8948
-    // user = 872
-    // assistant = 77091
-    // \n = 198
-    
+    tokens.reserve(n_audio_frames + system_prompt.size() + 20);
+
+    // Chat template:
+    // <|im_start|>system\n{optional hotword context}<|im_end|>\n
+    // <|im_start|>user\n<audio_start><audio_pad>...<audio_end><|im_end|>\n
+    // <|im_start|>assistant\n
     const int32_t im_start = 151644;
     const int32_t im_end = 151645;
     const int32_t system_token = 8948;
     const int32_t user_token = 872;
     const int32_t assistant_token = 77091;
     const int32_t newline = 198;
-    
-    // <|im_start|>system\n<|im_end|>\n
+
     tokens.push_back(im_start);
     tokens.push_back(system_token);
     tokens.push_back(newline);
+    if (!system_prompt.empty()) {
+        const std::vector<int32_t> prompt_tokens = decoder_.encode_tokens(system_prompt);
+        tokens.insert(tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
+    }
     tokens.push_back(im_end);
     tokens.push_back(newline);
-    
-    // <|im_start|>user\n
+
     tokens.push_back(im_start);
     tokens.push_back(user_token);
     tokens.push_back(newline);
-    
-    // <|audio_start|><|audio_pad|>...<|audio_end|>
+
     tokens.push_back(cfg.audio_start_token_id);
     for (int32_t i = 0; i < n_audio_frames; ++i) {
         tokens.push_back(cfg.audio_pad_token_id);
     }
     tokens.push_back(cfg.audio_end_token_id);
-    
-    // <|im_end|>\n<|im_start|>assistant\n
+
     tokens.push_back(im_end);
     tokens.push_back(newline);
     tokens.push_back(im_start);
     tokens.push_back(assistant_token);
     tokens.push_back(newline);
-    
+
     if (!language.empty()) {
-      std::string lang_lower = language;
-      std::transform(lang_lower.begin(), lang_lower.end(), lang_lower.begin(),
-                     ::tolower);
-      auto it = kLanguageTaskTokens.find(lang_lower);
-      if (it != kLanguageTaskTokens.end()) {
-        tokens.insert(tokens.end(), it->second.begin(), it->second.end());
-      }
+        std::string lang_lower = language;
+        std::transform(lang_lower.begin(), lang_lower.end(), lang_lower.begin(),
+                       ::tolower);
+        const auto it = kLanguageTaskTokens.find(lang_lower);
+        if (it != kLanguageTaskTokens.end()) {
+            tokens.insert(tokens.end(), it->second.begin(), it->second.end());
+        }
     }
-    
+
     return tokens;
 }
 
