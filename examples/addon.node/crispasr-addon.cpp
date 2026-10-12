@@ -4630,6 +4630,14 @@ static bool crisp_write_separation_wav(const std::string& path, const float* con
     return true;
 }
 
+static std::mutex g_crispasr_separation_tasks_mutex;
+static std::unordered_map<std::string, std::weak_ptr<std::atomic<bool>>> g_crispasr_separation_tasks;
+
+static int crispasr_separation_abort_requested(void* user_data) noexcept {
+    const auto* flag = static_cast<const std::atomic<bool>*>(user_data);
+    return flag && flag->load(std::memory_order_relaxed) ? 1 : 0;
+}
+
 class CrispasrSeparateWorker : public Napi::AsyncWorker {
 public:
     CrispasrSeparateWorker(
@@ -4641,7 +4649,8 @@ public:
         std::string stems_selection,
         int n_threads,
         bool use_gpu,
-        bool save_files
+        bool save_files,
+        std::string task_id
     ) : Napi::AsyncWorker(callback),
         m_model_path(std::move(model_path)),
         m_audio_file(std::move(audio_file)),
@@ -4651,17 +4660,49 @@ public:
         m_n_threads(n_threads),
         m_use_gpu(use_gpu),
         m_save_files(save_files),
+        m_task_id(std::move(task_id)),
+        m_abort_requested(std::make_shared<std::atomic<bool>>(false)),
+        m_cancelled(false),
         m_sample_rate(kSeparationSampleRate),
         m_channels(2),
-        m_n_samples(0) {}
+        m_n_samples(0) {
+        if (!m_task_id.empty()) {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            g_crispasr_separation_tasks[m_task_id] = m_abort_requested;
+        }
+    }
+
+    ~CrispasrSeparateWorker() override {
+        forgetTask();
+    }
+
+    void OnError(const Napi::Error& error) override {
+        forgetTask();
+        if (isAbortRequested()) {
+            Napi::HandleScope scope(Env());
+            Napi::Object result = Napi::Object::New(Env());
+            result.Set("status", Napi::String::New(Env(), "cancelled"));
+            Callback().Call({Env().Null(), result});
+            return;
+        }
+        Napi::AsyncWorker::OnError(error);
+    }
 
     void Execute() override {
+        if (isAbortRequested()) {
+            m_cancelled = true;
+            return;
+        }
         std::vector<float> pcm_stereo;
         int n_frames = 0;
 
         if (!m_audio_file.empty()) {
             std::string decode_error;
             if (!crisp_read_audio_44100_stereo(m_audio_file, pcm_stereo, n_frames, decode_error)) {
+                if (isAbortRequested()) {
+                    m_cancelled = true;
+                    return;
+                }
                 SetError(decode_error + ": " + m_audio_file);
                 return;
             }
@@ -4683,6 +4724,10 @@ public:
         }
 
         m_n_samples = n_frames;
+        if (isAbortRequested()) {
+            m_cancelled = true;
+            return;
+        }
 
         htdemucs_params params = htdemucs_default_params();
         params.n_threads = m_n_threads;
@@ -4690,15 +4735,33 @@ public:
         std::unique_ptr<htdemucs_context, decltype(&htdemucs_free)> ctx(
             htdemucs_init_from_file(m_model_path.c_str(), params), htdemucs_free);
         if (!ctx) {
+            if (isAbortRequested()) {
+                m_cancelled = true;
+                return;
+            }
             SetError("Failed to load HTDemucs model: " + m_model_path);
+            return;
+        }
+        if (isAbortRequested()) {
+            m_cancelled = true;
             return;
         }
 
         std::unique_ptr<htdemucs_result, decltype(&htdemucs_result_free)> res(
-            htdemucs_separate(ctx.get(), pcm_stereo.data(), n_frames), htdemucs_result_free);
+            htdemucs_separate_with_abort(ctx.get(), pcm_stereo.data(), n_frames,
+                                         crispasr_separation_abort_requested, m_abort_requested.get()),
+            htdemucs_result_free);
         std::vector<float>().swap(pcm_stereo);
         if (!res) {
+            if (isAbortRequested()) {
+                m_cancelled = true;
+                return;
+            }
             SetError("HTDemucs separation failed");
+            return;
+        }
+        if (isAbortRequested()) {
+            m_cancelled = true;
             return;
         }
 
@@ -4727,12 +4790,20 @@ public:
         if (m_save_files) {
             std::string output_error;
             for (int s = 0; s < res->n_sources; ++s) {
+                if (isAbortRequested()) {
+                    m_cancelled = true;
+                    return;
+                }
                 const std::string& name = stem_names[s];
                 if (crispasr_stem_selected(m_stems_selection, name)) {
                     const std::string out_path = crispasr_stem_output_path(base_path, name, m_output_dir);
                     const float* source[] = {res->sources[s]};
                     if (!crisp_write_separation_wav(out_path, source, 1, res->n_samples, res->n_channels,
                                                     res->sample_rate, output_error)) {
+                        if (isAbortRequested()) {
+                            m_cancelled = true;
+                            return;
+                        }
                         SetError(output_error);
                         return;
                     }
@@ -4745,6 +4816,10 @@ public:
                 const float* accompaniment_sources[] = {res->sources[0], res->sources[1], res->sources[2]};
                 if (!crisp_write_separation_wav(out_path, accompaniment_sources, 3, res->n_samples,
                                                 res->n_channels, res->sample_rate, output_error)) {
+                    if (isAbortRequested()) {
+                        m_cancelled = true;
+                        return;
+                    }
                     SetError(output_error);
                     return;
                 }
@@ -4755,7 +4830,16 @@ public:
 
     void OnOK() override {
         Napi::HandleScope scope(Env());
+        forgetTask();
+        if (isAbortRequested())
+            m_cancelled = true;
+
         Napi::Object result = Napi::Object::New(Env());
+        if (m_cancelled) {
+            result.Set("status", Napi::String::New(Env(), "cancelled"));
+            Callback().Call({Env().Null(), result});
+            return;
+        }
         result.Set("status", Napi::String::New(Env(), "ok"));
         result.Set("sample_rate", Napi::Number::New(Env(), m_sample_rate));
         result.Set("channels", Napi::Number::New(Env(), m_channels));
@@ -4780,6 +4864,23 @@ public:
     }
 
 private:
+    bool isAbortRequested() const {
+        return m_abort_requested && m_abort_requested->load(std::memory_order_relaxed);
+    }
+
+    void forgetTask() noexcept {
+        if (m_task_id.empty())
+            return;
+        try {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            auto task = g_crispasr_separation_tasks.find(m_task_id);
+            if (task != g_crispasr_separation_tasks.end() && task->second.lock() == m_abort_requested)
+                g_crispasr_separation_tasks.erase(task);
+        } catch (...) {
+            // Cleanup must never throw from the AsyncWorker destructor.
+        }
+    }
+
     std::string m_model_path;
     std::string m_audio_file;
     std::vector<float> m_pcmf32;
@@ -4788,6 +4889,9 @@ private:
     int m_n_threads;
     bool m_use_gpu;
     bool m_save_files;
+    std::string m_task_id;
+    std::shared_ptr<std::atomic<bool>> m_abort_requested;
+    bool m_cancelled;
     int m_sample_rate;
     int m_channels;
     int m_n_samples;
@@ -4886,6 +4990,13 @@ static Napi::Value crispasrSeparateImpl(const Napi::CallbackInfo& info) {
         save_files = options.Get("save_files").As<Napi::Boolean>();
     }
 
+    std::string task_id;
+    if (options.Has("task_id") && options.Get("task_id").IsString()) {
+        task_id = options.Get("task_id").As<Napi::String>();
+        if (task_id.size() > 128)
+            task_id.clear();
+    }
+
     Napi::Function callback = info[1].As<Napi::Function>();
     auto worker = std::make_unique<CrispasrSeparateWorker>(
         callback,
@@ -4896,12 +5007,43 @@ static Napi::Value crispasrSeparateImpl(const Napi::CallbackInfo& info) {
         std::move(stems),
         n_threads,
         use_gpu,
-        save_files
+        save_files,
+        std::move(task_id)
     );
     worker->Queue();
     worker.release();
 
     return env.Undefined();
+}
+
+Napi::Value crispasrCancelSeparate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+        return Napi::Boolean::New(env, false);
+
+    try {
+        std::string task_id = info[0].As<Napi::String>();
+        if (task_id.empty() || task_id.size() > 128)
+            return Napi::Boolean::New(env, false);
+
+        std::shared_ptr<std::atomic<bool>> abort_flag;
+        {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            auto task = g_crispasr_separation_tasks.find(task_id);
+            if (task == g_crispasr_separation_tasks.end())
+                return Napi::Boolean::New(env, false);
+            abort_flag = task->second.lock();
+            if (!abort_flag) {
+                g_crispasr_separation_tasks.erase(task);
+                return Napi::Boolean::New(env, false);
+            }
+        }
+
+        abort_flag->store(true, std::memory_order_relaxed);
+        return Napi::Boolean::New(env, true);
+    } catch (...) {
+        return Napi::Boolean::New(env, false);
+    }
 }
 
 Napi::Value crispasrSeparate(const Napi::CallbackInfo& info) {
@@ -4931,6 +5073,7 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("tts", Napi::Function::New(env, crispasrTTS));
     exports.Set("crispasrSeparate", Napi::Function::New(env, crispasrSeparate));
+    exports.Set("crispasrCancelSeparate", Napi::Function::New(env, crispasrCancelSeparate));
     exports.Set("separate", Napi::Function::New(env, crispasrSeparate));
 
     // Standalone Watermark APIs
