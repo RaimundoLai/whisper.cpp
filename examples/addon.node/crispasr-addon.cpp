@@ -7,6 +7,7 @@
 #include "../../third-party/CrispASR/src/nemotron3_diar.h"
 #include "whisper.h"
 #include "forced_aligner.h"
+#include "stream-segmenter.h"
 #include "../../third-party/CrispASR/src/htdemucs.h"
 #include "../../third-party/CrispASR/src/core/separation_io.h"
 #include "../../third-party/CrispASR/src/miniaudio.h"
@@ -2042,6 +2043,7 @@ public:
             m_max_nomute_chunks = options.Get("max_nomute_chunks").As<Napi::Number>().Int32Value();
         if (options.Has("use_vad") && options.Get("use_vad").IsBoolean())
             m_use_vad = options.Get("use_vad").As<Napi::Boolean>();
+        stream_seg::parse_options(m_seg, options);
     }
 
     ~CrispASRStream() {
@@ -2136,19 +2138,52 @@ public:
     }
 
 private:
-    void emit_segment(crispasr_session_result* res, int64_t start_time, int64_t end_time, int segment_index, const std::string& type, const std::vector<stream_word_item>& align_words = {}) {
+    // Transcribes (and aligns) a window into an engine-agnostic hypothesis.
+    // Word times are absolute milliseconds.
+    bool decodeHypothesis(const std::vector<float>& window, int64_t start_time, int64_t end_time, const char* lang_ptr, stream_seg::Hypothesis& out) {
+        std::vector<float> transcribe_pcm = window;
+        if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
+            transcribe_pcm.resize(32000, 0.0f);
+        }
+        crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
+        if (!res) {
+            return false;
+        }
+
+        out = stream_seg::Hypothesis{};
+        out.start_ms = start_time;
+        out.end_ms = end_time;
+
         int n_segs = crispasr_session_result_n_segments(res);
-        std::string text = "";
-        std::vector<stream_word_item> words_list = align_words;
-        
+        std::string raw_text = "";
         for (int i = 0; i < n_segs; i++) {
             const char* seg_text = crispasr_session_result_segment_text(res, i);
             if (seg_text) {
-                if (!text.empty()) text += " ";
-                text += seg_text;
+                if (!raw_text.empty()) raw_text += " ";
+                raw_text += seg_text;
             }
         }
-        trim_leading_replacement_and_spaces(text);
+
+        std::vector<stream_word_item> words_list;
+        if (m_aligner && !m_aligner_model_path.empty() && !raw_text.empty()) {
+            std::string detected_lang = m_language.empty() ? "zh" : m_language;
+            std::string clean_txt = clean_text_for_forced_aligner(raw_text);
+            trim_leading_replacement_and_spaces(clean_txt);
+            auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
+            if (align_res.success) {
+                for (const auto& w : align_res.words) {
+                    stream_word_item wi;
+                    wi.word = w.word;
+                    wi.start = start_time + static_cast<int64_t>(w.start * 1000.0);
+                    wi.end = start_time + static_cast<int64_t>(w.end * 1000.0);
+                    wi.p = 0.99f;
+                    words_list.push_back(wi);
+                }
+            }
+        }
+
+        out.text = raw_text;
+        trim_leading_replacement_and_spaces(out.text);
 
         if (words_list.empty()) {
             for (int i = 0; i < n_segs; i++) {
@@ -2164,47 +2199,60 @@ private:
                 }
             }
         }
+        crispasr_session_result_free(res);
 
         // Clean out empty, whitespace-only, or replacement character artifact words
-        std::vector<stream_word_item> filtered_words;
-        filtered_words.reserve(words_list.size());
         for (auto& wi : words_list) {
             trim_leading_replacement_and_spaces(wi.word);
             if (!wi.word.empty() && wi.word != "\xEF\xBF\xBD") {
-                filtered_words.push_back(std::move(wi));
+                stream_seg::Word word;
+                word.text = std::move(wi.word);
+                word.t0_ms = wi.start;
+                word.t1_ms = wi.end;
+                word.p = wi.p;
+                out.words.push_back(std::move(word));
             }
         }
-        words_list = std::move(filtered_words);
-        
-        if ((!text.empty() || type == "segment") && m_tsfn) {
-            auto cb_data = std::make_tuple(start_time, end_time, text, words_list, type);
-            auto callback = [cb_data, segment_index](Napi::Env env, Napi::Function cb) {
-                Napi::Object result = Napi::Object::New(env);
-                result.Set("type", Napi::String::New(env, std::get<4>(cb_data)));
-                result.Set("index", Napi::Number::New(env, segment_index));
-                result.Set("start", Napi::Number::New(env, std::get<0>(cb_data)));
-                result.Set("end", Napi::Number::New(env, std::get<1>(cb_data)));
-                result.Set("text", Napi::String::New(env, std::get<2>(cb_data)));
-                
-                const auto& wl = std::get<3>(cb_data);
-                Napi::Array words_arr = Napi::Array::New(env, wl.size());
-                for (size_t k = 0; k < wl.size(); k++) {
-                    Napi::Object w_obj = Napi::Object::New(env);
-                    w_obj.Set("word", Napi::String::New(env, wl[k].word));
-                    w_obj.Set("start", Napi::Number::New(env, wl[k].start / 1000.0));
-                    w_obj.Set("end", Napi::Number::New(env, wl[k].end / 1000.0));
-                    w_obj.Set("p", Napi::Number::New(env, wl[k].p));
-                    words_arr[k] = w_obj;
-                }
-                result.Set("words", words_arr);
-                
-                cb.Call({env.Null(), result});
-            };
-            if (type == "progressive") {
-                m_tsfn.NonBlockingCall(callback);
-            } else {
-                m_tsfn.BlockingCall(callback);
+        out.words_timed = !out.words.empty();
+        return true;
+    }
+
+    void emitHypothesis(const stream_seg::Hypothesis& hyp, int segment_index, const std::string& type) {
+        if ((hyp.text.empty() && type != "segment") || !m_tsfn) {
+            return;
+        }
+        auto callback = [hyp, type, segment_index](Napi::Env env, Napi::Function cb) {
+            Napi::Object result = Napi::Object::New(env);
+            result.Set("type", Napi::String::New(env, type));
+            result.Set("index", Napi::Number::New(env, segment_index));
+            result.Set("start", Napi::Number::New(env, hyp.start_ms));
+            result.Set("end", Napi::Number::New(env, hyp.end_ms));
+            result.Set("text", Napi::String::New(env, hyp.text));
+
+            Napi::Array words_arr = Napi::Array::New(env, hyp.words.size());
+            for (size_t k = 0; k < hyp.words.size(); k++) {
+                Napi::Object w_obj = Napi::Object::New(env);
+                w_obj.Set("word", Napi::String::New(env, hyp.words[k].text));
+                w_obj.Set("start", Napi::Number::New(env, hyp.words[k].t0_ms / 1000.0));
+                w_obj.Set("end", Napi::Number::New(env, hyp.words[k].t1_ms / 1000.0));
+                w_obj.Set("p", Napi::Number::New(env, hyp.words[k].p));
+                words_arr[k] = w_obj;
             }
+            result.Set("words", words_arr);
+
+            cb.Call({env.Null(), result});
+        };
+        if (type == "progressive") {
+            m_tsfn.NonBlockingCall(callback);
+        } else {
+            m_tsfn.BlockingCall(callback);
+        }
+    }
+
+    void decodeAndEmit(const std::vector<float>& window, int64_t start_time, int64_t end_time, const char* lang_ptr, int segment_index, const std::string& type) {
+        stream_seg::Hypothesis hyp;
+        if (decodeHypothesis(window, start_time, end_time, lang_ptr, hyp)) {
+            emitHypothesis(hyp, segment_index, type);
         }
     }
 
@@ -2339,6 +2387,40 @@ private:
         int64_t last_progressive_sample = 0;
         double last_silence_time = 0.0;
 
+        const size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
+        stream_seg::TailCache<stream_seg::Hypothesis> tail_cache;
+        bool tail_attempted = false;
+        std::string prev_hyp_text;
+        bool skip_progressive_initial = false;
+
+        auto silence_threshold = [&](int speech_chunks) {
+            return stream_seg::silence_threshold(m_seg, m_min_mute_chunks, m_chunk_size_ms, speech_chunks);
+        };
+
+        // Emits a stable sentence prefix as a final segment and drops its audio.
+        auto try_early_commit = [&](const stream_seg::Hypothesis& hyp) -> bool {
+            auto plan = stream_seg::plan_commit(hyp, prev_hyp_text, m_seg);
+            if (!plan) return false;
+            const int64_t cut_sample = (plan->cut_ms * sample_rate) / 1000;
+            const int64_t offset = cut_sample - speech_start_sample;
+            if (offset <= 0 || offset >= static_cast<int64_t>(speech_buffer.size())) return false;
+
+            stream_seg::Hypothesis head, rest;
+            stream_seg::split_hypothesis(hyp, *plan, head, rest);
+            emitHypothesis(head, m_segment_index, "segment");
+            m_segment_index++;
+
+            speech_buffer.erase(speech_buffer.begin(), speech_buffer.begin() + offset);
+            speech_start_sample = cut_sample;
+            speech_chunk_count = std::max(0, speech_chunk_count - static_cast<int>(offset / chunk_samples));
+            emitHypothesis(rest, m_segment_index, "progressive");
+            prev_hyp_text = rest.text;
+            skip_progressive_initial = true;
+            tail_cache.reset();
+            tail_attempted = false;
+            return true;
+        };
+
         while (m_running) {
             bool is_finishing_step = false;
             bool timeout = false;
@@ -2411,7 +2493,7 @@ private:
                     } else {
                         if (temp_in_speech) {
                             temp_silence_count++;
-                            if (temp_silence_count > m_min_mute_chunks) {
+                            if (temp_silence_count > silence_threshold(temp_speech_count)) {
                                 return true;
                             }
                         }
@@ -2436,17 +2518,22 @@ private:
                         m_segment_index++;
                         speech_buffer.insert(speech_buffer.end(), pre_speech_cache.begin(), pre_speech_cache.end());
                         pre_speech_cache.clear();
+                        prev_hyp_text.clear();
+                        skip_progressive_initial = false;
                     }
                     speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
                     in_speech = true;
                     silence_chunk_count = 0;
                     speech_chunk_count++;
+                    // New speech invalidates any speculative tail decode.
+                    tail_cache.reset();
+                    tail_attempted = false;
                     
                     if (m_progressive_update) {
                         int64_t current_sample = total_samples_received + i + chunk_samples;
                         int64_t elapsed_since_start_ms = ((current_sample - speech_start_sample) * 1000) / sample_rate;
                         
-                        if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                        if (skip_progressive_initial || elapsed_since_start_ms >= m_progressive_initial_ms) {
                             int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
                             if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
                                 bool has_pending_audio = false;
@@ -2458,44 +2545,14 @@ private:
                                                         has_pending_audio || 
                                                         will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
                                 if (!skip_progressive) {
-                                    std::vector<float> transcribe_pcm = speech_buffer;
-                                    if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
-                                        transcribe_pcm.resize(32000, 0.0f);
-                                    }
-                                    crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
-                                    if (res) {
-                                        int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
-                                        int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                                        std::vector<stream_word_item> aligned_words;
-                                        if (m_aligner && !m_aligner_model_path.empty()) {
-                                            int n_segs = crispasr_session_result_n_segments(res);
-                                            std::string total_txt = "";
-                                            for (int k = 0; k < n_segs; k++) {
-                                                const char* s_text = crispasr_session_result_segment_text(res, k);
-                                                if (s_text) {
-                                                    if (!total_txt.empty()) total_txt += " ";
-                                                    total_txt += s_text;
-                                                }
-                                            }
-                                            if (!total_txt.empty()) {
-                                                std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                                std::string clean_txt = clean_text_for_forced_aligner(total_txt);
-                                                trim_leading_replacement_and_spaces(clean_txt);
-                                                auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
-                                                if (align_res.success) {
-                                                    for (const auto& w : align_res.words) {
-                                                        stream_word_item wi;
-                                                        wi.word = w.word;
-                                                        wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
-                                                        wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
-                                                        wi.p = 0.99f;
-                                                        aligned_words.push_back(wi);
-                                                    }
-                                                }
-                                            }
+                                    int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                                    int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                                    stream_seg::Hypothesis hyp;
+                                    if (decodeHypothesis(speech_buffer, chunk_start_ms, chunk_end_ms, lang_ptr, hyp)) {
+                                        if (!try_early_commit(hyp)) {
+                                            emitHypothesis(hyp, m_segment_index, "progressive");
+                                            prev_hyp_text = hyp.text;
                                         }
-                                        emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "progressive", aligned_words);
-                                        crispasr_session_result_free(res);
                                     }
                                     last_progressive_sample = current_sample;
                                 }
@@ -2505,45 +2562,9 @@ private:
                     
                     if (speech_chunk_count >= m_max_nomute_chunks) {
                         int64_t current_sample = total_samples_received + i + chunk_samples;
-                        std::vector<float> transcribe_pcm = speech_buffer;
-                        if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
-                            transcribe_pcm.resize(32000, 0.0f);
-                        }
-                        crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
-                        if (res) {
-                            int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
-                            int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
-                            std::vector<stream_word_item> aligned_words;
-                            if (m_aligner && !m_aligner_model_path.empty()) {
-                                int n_segs = crispasr_session_result_n_segments(res);
-                                std::string total_txt = "";
-                                for (int k = 0; k < n_segs; k++) {
-                                    const char* s_text = crispasr_session_result_segment_text(res, k);
-                                    if (s_text) {
-                                        if (!total_txt.empty()) total_txt += " ";
-                                        total_txt += s_text;
-                                    }
-                                }
-                                if (!total_txt.empty()) {
-                                    std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                    std::string clean_txt = clean_text_for_forced_aligner(total_txt);
-                                    trim_leading_replacement_and_spaces(clean_txt);
-                                    auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
-                                    if (align_res.success) {
-                                        for (const auto& w : align_res.words) {
-                                            stream_word_item wi;
-                                            wi.word = w.word;
-                                            wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
-                                            wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
-                                            wi.p = 0.99f;
-                                            aligned_words.push_back(wi);
-                                        }
-                                    }
-                                }
-                            }
-                            emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment", aligned_words);
-                            crispasr_session_result_free(res);
-                        }
+                        int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
+                        int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
+                        decodeAndEmit(speech_buffer, chunk_start_ms, chunk_end_ms, lang_ptr, m_segment_index, "segment");
                         speech_buffer.clear();
                         speech_chunk_count = 0;
                         speech_start_sample = current_sample;
@@ -2551,72 +2572,79 @@ private:
                         m_segment_index++;
                         silence_chunk_count = 0;
                         in_speech = true;
+                        prev_hyp_text.clear();
+                        skip_progressive_initial = false;
                     }
                 } else {
                     if (in_speech) {
                         silence_chunk_count++;
-                        if (silence_chunk_count <= m_min_mute_chunks) {
+                        const int silence_limit = silence_threshold(speech_chunk_count);
+                        if (silence_chunk_count <= silence_limit) {
                             speech_buffer.insert(speech_buffer.end(), vad_chunk.begin(), vad_chunk.end());
                         }
-                        if (silence_chunk_count > m_min_mute_chunks) {
-                            in_speech = false;
+
+                        // Builds the exact window the final pass decodes: speech plus at
+                        // most post_speech_pad_samples of trailing silence.
+                        auto build_final_window = [&](int held_silence_chunks, std::vector<float>& pcm, int64_t& start_ms, int64_t& end_ms) {
                             int64_t speech_end_sample = total_samples_received + i + chunk_samples;
                             int64_t actual_end_sample = speech_end_sample - (silence_chunk_count * chunk_samples);
                             if (actual_end_sample < speech_start_sample) {
                                 actual_end_sample = speech_end_sample;
                             }
-
-                            std::vector<float> transcribe_pcm = speech_buffer;
-                            size_t silence_samples = std::min(silence_chunk_count, m_min_mute_chunks) * chunk_samples;
-                            size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
-                            if (silence_samples > post_speech_pad_samples) {
-                                size_t trim_samples = silence_samples - post_speech_pad_samples;
-                                if (transcribe_pcm.size() > trim_samples) {
-                                    transcribe_pcm.resize(transcribe_pcm.size() - trim_samples);
-                                }
+                            pcm = speech_buffer;
+                            size_t trim_samples = stream_seg::trailing_trim(
+                                static_cast<size_t>(held_silence_chunks) * chunk_samples, post_speech_pad_samples);
+                            if (trim_samples > 0 && pcm.size() > trim_samples) {
+                                pcm.resize(pcm.size() - trim_samples);
                             }
+                            start_ms = (speech_start_sample * 1000) / sample_rate;
+                            end_ms = (actual_end_sample * 1000) / sample_rate;
+                        };
 
-                            if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
-                                  transcribe_pcm.resize(32000, 0.0f);
+                        if (silence_chunk_count > silence_limit) {
+                            in_speech = false;
+                            std::vector<float> transcribe_pcm;
+                            int64_t chunk_start_ms = 0;
+                            int64_t chunk_end_ms = 0;
+                            build_final_window(std::min(silence_chunk_count, silence_limit), transcribe_pcm, chunk_start_ms, chunk_end_ms);
+                            if (m_debug) {
+                                fprintf(stderr, "[STREAM] final %lld-%lld ms: speculative tail %s\n", (long long)chunk_start_ms, (long long)chunk_end_ms,
+                                        tail_cache.matches(transcribe_pcm.size(), chunk_start_ms, chunk_end_ms) ? "reused" : (tail_cache.valid ? "mismatch" : "not available"));
                             }
-                            crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
-                            if (res) {
-                                int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
-                                int64_t chunk_end_ms = (actual_end_sample * 1000) / sample_rate;
-                                std::vector<stream_word_item> aligned_words;
-                                if (m_aligner && !m_aligner_model_path.empty()) {
-                                    int n_segs = crispasr_session_result_n_segments(res);
-                                    std::string total_txt = "";
-                                    for (int k = 0; k < n_segs; k++) {
-                                        const char* s_text = crispasr_session_result_segment_text(res, k);
-                                        if (s_text) {
-                                            if (!total_txt.empty()) total_txt += " ";
-                                            total_txt += s_text;
-                                        }
-                                    }
-                                    if (!total_txt.empty()) {
-                                        std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                        std::string clean_txt = clean_text_for_forced_aligner(total_txt);
-                                        trim_leading_replacement_and_spaces(clean_txt);
-                                        auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
-                                        if (align_res.success) {
-                                            for (const auto& w : align_res.words) {
-                                                stream_word_item wi;
-                                                wi.word = w.word;
-                                                wi.start = chunk_start_ms + static_cast<int64_t>(w.start * 1000.0);
-                                                wi.end = chunk_start_ms + static_cast<int64_t>(w.end * 1000.0);
-                                                wi.p = 0.99f;
-                                                aligned_words.push_back(wi);
-                                            }
-                                        }
-                                    }
-                                }
-                                emit_segment(res, chunk_start_ms, chunk_end_ms, m_segment_index, "segment", aligned_words);
-                                crispasr_session_result_free(res);
+                            if (tail_cache.matches(transcribe_pcm.size(), chunk_start_ms, chunk_end_ms)) {
+                                emitHypothesis(tail_cache.result, m_segment_index, "segment");
+                            } else {
+                                decodeAndEmit(transcribe_pcm, chunk_start_ms, chunk_end_ms, lang_ptr, m_segment_index, "segment");
                             }
                             speech_buffer.clear();
                             speech_chunk_count = 0;
                             pre_speech_cache.clear();
+                            tail_cache.reset();
+                            tail_attempted = false;
+                            prev_hyp_text.clear();
+                        } else if (m_seg.speculative_final && !tail_attempted &&
+                                   static_cast<int64_t>(silence_chunk_count) * m_chunk_size_ms >= m_seg.tail_delay_ms) {
+                            // Pending audio is not a reason to skip: at worst the speculative decode is wasted.
+                            bool skip_tail = is_finishing_step ||
+                                             will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
+                            if (!skip_tail) {
+                                tail_attempted = true;
+                                std::vector<float> tail_pcm;
+                                int64_t chunk_start_ms = 0;
+                                int64_t chunk_end_ms = 0;
+                                build_final_window(silence_chunk_count, tail_pcm, chunk_start_ms, chunk_end_ms);
+                                stream_seg::Hypothesis hyp;
+                                if (decodeHypothesis(tail_pcm, chunk_start_ms, chunk_end_ms, lang_ptr, hyp)) {
+                                    tail_cache.valid = true;
+                                    tail_cache.pcm_size = tail_pcm.size();
+                                    tail_cache.start_ms = chunk_start_ms;
+                                    tail_cache.end_ms = chunk_end_ms;
+                                    tail_cache.result = hyp;
+                                    if (m_progressive_update) {
+                                        emitHypothesis(hyp, m_segment_index, "progressive");
+                                    }
+                                }
+                            }
                         }
                     }
                     
@@ -2650,48 +2678,12 @@ private:
                     if (!in_speech) {
                         m_segment_index++;
                     }
-                    std::vector<float> transcribe_pcm = speech_buffer;
-                    if (transcribe_pcm.size() < 32000 && m_backend_name != "whisper") {
-                        transcribe_pcm.resize(32000, 0.0f);
-                    }
-                    crispasr_session_result* res = crispasr_session_transcribe_lang(m_session, transcribe_pcm.data(), transcribe_pcm.size(), lang_ptr);
-                    if (res) {
-                        std::vector<stream_word_item> aligned_words;
-                        if (m_aligner && !m_aligner_model_path.empty()) {
-                            int n_segs = crispasr_session_result_n_segments(res);
-                            std::string total_txt = "";
-                            for (int k = 0; k < n_segs; k++) {
-                                const char* s_text = crispasr_session_result_segment_text(res, k);
-                                if (s_text) {
-                                    if (!total_txt.empty()) total_txt += " ";
-                                    total_txt += s_text;
-                                }
-                            }
-                            if (!total_txt.empty()) {
-                                std::string detected_lang = m_language.empty() ? "zh" : m_language;
-                                std::string clean_txt = clean_text_for_forced_aligner(total_txt);
-                                trim_leading_replacement_and_spaces(clean_txt);
-                                auto align_res = m_aligner->align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
-                                if (align_res.success) {
-                                    for (const auto& w : align_res.words) {
-                                        stream_word_item wi;
-                                        wi.word = w.word;
-                                        wi.start = start + static_cast<int64_t>(w.start * 1000.0);
-                                        wi.end = start + static_cast<int64_t>(w.end * 1000.0);
-                                        wi.p = 0.99f;
-                                        aligned_words.push_back(wi);
-                                    }
-                                }
-                            }
-                        }
-                        emit_segment(res, start, (final_sample * 1000) / sample_rate, m_segment_index, "segment", aligned_words);
-                        crispasr_session_result_free(res);
-                    }
+                    decodeAndEmit(speech_buffer, start, (final_sample * 1000) / sample_rate, lang_ptr, m_segment_index, "segment");
                 }
+                tail_cache.reset();
                 break;
             }
         }
-
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_session) {
@@ -2749,6 +2741,7 @@ private:
     bool m_progressive_update = false;
     int m_progressive_interval_ms = 500;
     int m_progressive_initial_ms = 1000;
+    stream_seg::Options m_seg;
     int m_segment_index = 0;
     std::string m_vad_model_path;
     float m_vad_threshold = 0.5f;
@@ -4630,6 +4623,14 @@ static bool crisp_write_separation_wav(const std::string& path, const float* con
     return true;
 }
 
+static std::mutex g_crispasr_separation_tasks_mutex;
+static std::unordered_map<std::string, std::weak_ptr<std::atomic<bool>>> g_crispasr_separation_tasks;
+
+static int crispasr_separation_abort_requested(void* user_data) noexcept {
+    const auto* flag = static_cast<const std::atomic<bool>*>(user_data);
+    return flag && flag->load(std::memory_order_relaxed) ? 1 : 0;
+}
+
 class CrispasrSeparateWorker : public Napi::AsyncWorker {
 public:
     CrispasrSeparateWorker(
@@ -4641,7 +4642,8 @@ public:
         std::string stems_selection,
         int n_threads,
         bool use_gpu,
-        bool save_files
+        bool save_files,
+        std::string task_id
     ) : Napi::AsyncWorker(callback),
         m_model_path(std::move(model_path)),
         m_audio_file(std::move(audio_file)),
@@ -4651,17 +4653,49 @@ public:
         m_n_threads(n_threads),
         m_use_gpu(use_gpu),
         m_save_files(save_files),
+        m_task_id(std::move(task_id)),
+        m_abort_requested(std::make_shared<std::atomic<bool>>(false)),
+        m_cancelled(false),
         m_sample_rate(kSeparationSampleRate),
         m_channels(2),
-        m_n_samples(0) {}
+        m_n_samples(0) {
+        if (!m_task_id.empty()) {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            g_crispasr_separation_tasks[m_task_id] = m_abort_requested;
+        }
+    }
+
+    ~CrispasrSeparateWorker() override {
+        forgetTask();
+    }
+
+    void OnError(const Napi::Error& error) override {
+        forgetTask();
+        if (isAbortRequested()) {
+            Napi::HandleScope scope(Env());
+            Napi::Object result = Napi::Object::New(Env());
+            result.Set("status", Napi::String::New(Env(), "cancelled"));
+            Callback().Call({Env().Null(), result});
+            return;
+        }
+        Napi::AsyncWorker::OnError(error);
+    }
 
     void Execute() override {
+        if (isAbortRequested()) {
+            m_cancelled = true;
+            return;
+        }
         std::vector<float> pcm_stereo;
         int n_frames = 0;
 
         if (!m_audio_file.empty()) {
             std::string decode_error;
             if (!crisp_read_audio_44100_stereo(m_audio_file, pcm_stereo, n_frames, decode_error)) {
+                if (isAbortRequested()) {
+                    m_cancelled = true;
+                    return;
+                }
                 SetError(decode_error + ": " + m_audio_file);
                 return;
             }
@@ -4683,6 +4717,10 @@ public:
         }
 
         m_n_samples = n_frames;
+        if (isAbortRequested()) {
+            m_cancelled = true;
+            return;
+        }
 
         htdemucs_params params = htdemucs_default_params();
         params.n_threads = m_n_threads;
@@ -4690,15 +4728,33 @@ public:
         std::unique_ptr<htdemucs_context, decltype(&htdemucs_free)> ctx(
             htdemucs_init_from_file(m_model_path.c_str(), params), htdemucs_free);
         if (!ctx) {
+            if (isAbortRequested()) {
+                m_cancelled = true;
+                return;
+            }
             SetError("Failed to load HTDemucs model: " + m_model_path);
+            return;
+        }
+        if (isAbortRequested()) {
+            m_cancelled = true;
             return;
         }
 
         std::unique_ptr<htdemucs_result, decltype(&htdemucs_result_free)> res(
-            htdemucs_separate(ctx.get(), pcm_stereo.data(), n_frames), htdemucs_result_free);
+            htdemucs_separate_with_abort(ctx.get(), pcm_stereo.data(), n_frames,
+                                         crispasr_separation_abort_requested, m_abort_requested.get()),
+            htdemucs_result_free);
         std::vector<float>().swap(pcm_stereo);
         if (!res) {
+            if (isAbortRequested()) {
+                m_cancelled = true;
+                return;
+            }
             SetError("HTDemucs separation failed");
+            return;
+        }
+        if (isAbortRequested()) {
+            m_cancelled = true;
             return;
         }
 
@@ -4727,12 +4783,20 @@ public:
         if (m_save_files) {
             std::string output_error;
             for (int s = 0; s < res->n_sources; ++s) {
+                if (isAbortRequested()) {
+                    m_cancelled = true;
+                    return;
+                }
                 const std::string& name = stem_names[s];
                 if (crispasr_stem_selected(m_stems_selection, name)) {
                     const std::string out_path = crispasr_stem_output_path(base_path, name, m_output_dir);
                     const float* source[] = {res->sources[s]};
                     if (!crisp_write_separation_wav(out_path, source, 1, res->n_samples, res->n_channels,
                                                     res->sample_rate, output_error)) {
+                        if (isAbortRequested()) {
+                            m_cancelled = true;
+                            return;
+                        }
                         SetError(output_error);
                         return;
                     }
@@ -4745,6 +4809,10 @@ public:
                 const float* accompaniment_sources[] = {res->sources[0], res->sources[1], res->sources[2]};
                 if (!crisp_write_separation_wav(out_path, accompaniment_sources, 3, res->n_samples,
                                                 res->n_channels, res->sample_rate, output_error)) {
+                    if (isAbortRequested()) {
+                        m_cancelled = true;
+                        return;
+                    }
                     SetError(output_error);
                     return;
                 }
@@ -4755,7 +4823,16 @@ public:
 
     void OnOK() override {
         Napi::HandleScope scope(Env());
+        forgetTask();
+        if (isAbortRequested())
+            m_cancelled = true;
+
         Napi::Object result = Napi::Object::New(Env());
+        if (m_cancelled) {
+            result.Set("status", Napi::String::New(Env(), "cancelled"));
+            Callback().Call({Env().Null(), result});
+            return;
+        }
         result.Set("status", Napi::String::New(Env(), "ok"));
         result.Set("sample_rate", Napi::Number::New(Env(), m_sample_rate));
         result.Set("channels", Napi::Number::New(Env(), m_channels));
@@ -4780,6 +4857,23 @@ public:
     }
 
 private:
+    bool isAbortRequested() const {
+        return m_abort_requested && m_abort_requested->load(std::memory_order_relaxed);
+    }
+
+    void forgetTask() noexcept {
+        if (m_task_id.empty())
+            return;
+        try {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            auto task = g_crispasr_separation_tasks.find(m_task_id);
+            if (task != g_crispasr_separation_tasks.end() && task->second.lock() == m_abort_requested)
+                g_crispasr_separation_tasks.erase(task);
+        } catch (...) {
+            // Cleanup must never throw from the AsyncWorker destructor.
+        }
+    }
+
     std::string m_model_path;
     std::string m_audio_file;
     std::vector<float> m_pcmf32;
@@ -4788,6 +4882,9 @@ private:
     int m_n_threads;
     bool m_use_gpu;
     bool m_save_files;
+    std::string m_task_id;
+    std::shared_ptr<std::atomic<bool>> m_abort_requested;
+    bool m_cancelled;
     int m_sample_rate;
     int m_channels;
     int m_n_samples;
@@ -4886,6 +4983,13 @@ static Napi::Value crispasrSeparateImpl(const Napi::CallbackInfo& info) {
         save_files = options.Get("save_files").As<Napi::Boolean>();
     }
 
+    std::string task_id;
+    if (options.Has("task_id") && options.Get("task_id").IsString()) {
+        task_id = options.Get("task_id").As<Napi::String>();
+        if (task_id.size() > 128)
+            task_id.clear();
+    }
+
     Napi::Function callback = info[1].As<Napi::Function>();
     auto worker = std::make_unique<CrispasrSeparateWorker>(
         callback,
@@ -4896,12 +5000,43 @@ static Napi::Value crispasrSeparateImpl(const Napi::CallbackInfo& info) {
         std::move(stems),
         n_threads,
         use_gpu,
-        save_files
+        save_files,
+        std::move(task_id)
     );
     worker->Queue();
     worker.release();
 
     return env.Undefined();
+}
+
+Napi::Value crispasrCancelSeparate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+        return Napi::Boolean::New(env, false);
+
+    try {
+        std::string task_id = info[0].As<Napi::String>();
+        if (task_id.empty() || task_id.size() > 128)
+            return Napi::Boolean::New(env, false);
+
+        std::shared_ptr<std::atomic<bool>> abort_flag;
+        {
+            std::lock_guard<std::mutex> lock(g_crispasr_separation_tasks_mutex);
+            auto task = g_crispasr_separation_tasks.find(task_id);
+            if (task == g_crispasr_separation_tasks.end())
+                return Napi::Boolean::New(env, false);
+            abort_flag = task->second.lock();
+            if (!abort_flag) {
+                g_crispasr_separation_tasks.erase(task);
+                return Napi::Boolean::New(env, false);
+            }
+        }
+
+        abort_flag->store(true, std::memory_order_relaxed);
+        return Napi::Boolean::New(env, true);
+    } catch (...) {
+        return Napi::Boolean::New(env, false);
+    }
 }
 
 Napi::Value crispasrSeparate(const Napi::CallbackInfo& info) {
@@ -4931,6 +5066,7 @@ void InitCrispASR(Napi::Env env, Napi::Object exports) {
     exports.Set("qwen3TTS", Napi::Function::New(env, crispasrTTS));
     exports.Set("tts", Napi::Function::New(env, crispasrTTS));
     exports.Set("crispasrSeparate", Napi::Function::New(env, crispasrSeparate));
+    exports.Set("crispasrCancelSeparate", Napi::Function::New(env, crispasrCancelSeparate));
     exports.Set("separate", Napi::Function::New(env, crispasrSeparate));
 
     // Standalone Watermark APIs

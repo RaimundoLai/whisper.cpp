@@ -6,6 +6,7 @@
 #include "silero-vad.h"
 #include "sense-voice-frontend.h"
 #include "whisper.h"  // For whisper VAD API
+#include "stream-segmenter.h"
 
 // ============================================================================
 // SenseVoice ASR Implementation - Regular Mode with Segment Support
@@ -1068,6 +1069,8 @@ private:
     void StreamWorker();
     void emit_silence(double t);
     void processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, int segment_index, bool is_progressive = false);
+    bool decodeHypothesis(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, stream_seg::Hypothesis& out);
+    void emitHypothesis(const stream_seg::Hypothesis& hyp, int segment_index, bool is_progressive);
     std::string ExtractText(sense_voice_context* ctx, bool use_prefix);
 
     // SenseVoice context
@@ -1101,6 +1104,9 @@ private:
     int m_progressive_interval_ms = 500;
     int m_progressive_initial_ms = 5000;
     int m_progressive_window_tokens = 3;
+
+    // Shared latency policy (adaptive silence, speculative final, early commit)
+    stream_seg::Options m_seg;
 
     // Audio buffer and state
     std::deque<float> m_audio_buffer;
@@ -1211,6 +1217,7 @@ SenseVoiceStream::SenseVoiceStream(const Napi::CallbackInfo& info)
         m_progressive_initial_ms = options.Get("progressive_initial_ms").As<Napi::Number>().Int32Value();
     if (options.Has("progressive_window_tokens") && options.Get("progressive_window_tokens").IsNumber()) 
         m_progressive_window_tokens = options.Get("progressive_window_tokens").As<Napi::Number>().Int32Value();
+    stream_seg::parse_options(m_seg, options);
     
     // Debug logging flag
     if (options.Has("debug") && options.Get("debug").IsBoolean()) 
@@ -1447,6 +1454,40 @@ void SenseVoiceStream::StreamWorker() {
     
     int64_t last_progressive_sample = 0;
     double last_silence_time = 0.0;
+
+    const size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
+    stream_seg::TailCache<stream_seg::Hypothesis> tail_cache;
+    bool tail_attempted = false;
+    std::string prev_hyp_text;
+    bool skip_progressive_initial = false;
+
+    auto silence_threshold = [&](int speech_chunks) {
+        return stream_seg::silence_threshold(m_seg, min_silence_chunks, m_chunk_size_ms, speech_chunks);
+    };
+
+    // Emits a stable sentence prefix as a final segment and drops its audio.
+    auto try_early_commit = [&](const stream_seg::Hypothesis& hyp) -> bool {
+        auto plan = stream_seg::plan_commit(hyp, prev_hyp_text, m_seg);
+        if (!plan) return false;
+        const int64_t cut_sample = (plan->cut_ms * sample_rate) / 1000;
+        const int64_t offset = cut_sample - speech_start_sample;
+        if (offset <= 0 || offset >= static_cast<int64_t>(speech_buffer.size())) return false;
+
+        stream_seg::Hypothesis head, rest;
+        stream_seg::split_hypothesis(hyp, *plan, head, rest);
+        emitHypothesis(head, m_segment_index, false);
+        m_segment_index++;
+
+        speech_buffer.erase(speech_buffer.begin(), speech_buffer.begin() + offset);
+        speech_start_sample = cut_sample;
+        speech_chunk_count = std::max(0, speech_chunk_count - static_cast<int>(offset / chunk_samples));
+        emitHypothesis(rest, m_segment_index, true);
+        prev_hyp_text = rest.text;
+        skip_progressive_initial = true;
+        tail_cache.reset();
+        tail_attempted = false;
+        return true;
+    };
     
     // Reset total samples counter for timeline
     m_n_total_samples_received = 0;
@@ -1551,7 +1592,7 @@ void SenseVoiceStream::StreamWorker() {
                 } else {
                     if (temp_in_speech) {
                         temp_silence_count++;
-                        if (temp_silence_count > min_silence_chunks) {
+                        if (temp_silence_count > silence_threshold(temp_speech_count)) {
                             return true;
                         }
                     }
@@ -1580,7 +1621,12 @@ void SenseVoiceStream::StreamWorker() {
                     m_segment_index++;
                     speech_buffer.insert(speech_buffer.end(), pre_speech_cache.begin(), pre_speech_cache.end());
                     pre_speech_cache.clear();
+                    prev_hyp_text.clear();
+                    skip_progressive_initial = false;
                 }
+                // New speech invalidates any speculative tail decode.
+                tail_cache.reset();
+                tail_attempted = false;
                 // Append speech chunk (no scaling - SenseVoice expects normalized audio)
                 for (int j = 0; j < chunk_samples; j++) {
                     speech_buffer.push_back(accumulated_samples[i + j]);
@@ -1593,7 +1639,7 @@ void SenseVoiceStream::StreamWorker() {
                     int64_t current_sample = m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples;
                     int64_t elapsed_since_start_ms = ((current_sample - speech_start_sample) * 1000) / sample_rate;
                     
-                    if (elapsed_since_start_ms >= m_progressive_initial_ms) {
+                    if (skip_progressive_initial || elapsed_since_start_ms >= m_progressive_initial_ms) {
                         int64_t elapsed_since_last_prog_ms = ((current_sample - last_progressive_sample) * 1000) / sample_rate;
                         if (elapsed_since_last_prog_ms >= m_progressive_interval_ms) {
                             bool has_pending_audio = false;
@@ -1608,7 +1654,13 @@ void SenseVoiceStream::StreamWorker() {
                                 int64_t chunk_start_ms = (speech_start_sample * 1000) / sample_rate;
                                 int64_t chunk_end_ms = (current_sample * 1000) / sample_rate;
                                 
-                                processAndOutput(wparams, speech_buffer, chunk_start_ms, chunk_end_ms, m_segment_index, true);
+                                stream_seg::Hypothesis hyp;
+                                if (decodeHypothesis(wparams, speech_buffer, chunk_start_ms, chunk_end_ms, hyp)) {
+                                    if (!try_early_commit(hyp)) {
+                                        emitHypothesis(hyp, m_segment_index, true);
+                                        prev_hyp_text = hyp.text;
+                                    }
+                                }
                                 
                                 last_progressive_sample = current_sample;
                             }
@@ -1618,44 +1670,82 @@ void SenseVoiceStream::StreamWorker() {
             } else if (in_speech) {
                 // We were in speech, count silence chunks
                 silence_chunk_count++;
+                const int silence_limit = silence_threshold(speech_chunk_count);
                 
                 // Include some silence for natural boundaries
-                if (silence_chunk_count <= min_silence_chunks) {
+                if (silence_chunk_count <= silence_limit) {
                     for (int j = 0; j < chunk_samples; j++) {
                         speech_buffer.push_back(accumulated_samples[i + j]);
                     }
                 }
-                
-                // End of speech detected
-                if (silence_chunk_count > min_silence_chunks) {
-                    in_speech = false;
-                    
-                    // Calculate timestamps
+
+                // Builds the exact window the final pass decodes: speech plus at
+                // most post_speech_pad_samples of trailing silence.
+                auto build_final_window = [&](int held_silence_chunks, std::vector<double>& pcm, int64_t& start_ms, int64_t& end_ms) {
                     int64_t speech_end_sample = m_n_total_samples_received + static_cast<int64_t>(i) + chunk_samples;
                     int64_t actual_end_sample = speech_end_sample - (silence_chunk_count * chunk_samples);
                     if (actual_end_sample < speech_start_sample) {
                         actual_end_sample = speech_end_sample;
                     }
-                    
-                    int64_t start_time_ms = (speech_start_sample * 1000) / sample_rate;
-                    int64_t end_time_ms = (actual_end_sample * 1000) / sample_rate;
+                    pcm = speech_buffer;
+                    size_t trim_samples = stream_seg::trailing_trim(
+                        static_cast<size_t>(held_silence_chunks) * chunk_samples, post_speech_pad_samples);
+                    if (trim_samples > 0 && pcm.size() > trim_samples) {
+                        pcm.resize(pcm.size() - trim_samples);
+                    }
+                    start_ms = (speech_start_sample * 1000) / sample_rate;
+                    end_ms = (actual_end_sample * 1000) / sample_rate;
+                };
+                
+                // End of speech detected
+                if (silence_chunk_count > silence_limit) {
+                    in_speech = false;
                     
                     // Process accumulated speech
                     if (!speech_buffer.empty()) {
-                        std::vector<double> transcribe_pcm = speech_buffer;
-                        size_t silence_samples = std::min(silence_chunk_count, min_silence_chunks) * chunk_samples;
-                        size_t post_speech_pad_samples = (300 * sample_rate) / 1000;
-                        if (silence_samples > post_speech_pad_samples) {
-                            size_t trim_samples = silence_samples - post_speech_pad_samples;
-                            if (transcribe_pcm.size() > trim_samples) {
-                                transcribe_pcm.resize(transcribe_pcm.size() - trim_samples);
-                            }
+                        std::vector<double> transcribe_pcm;
+                        int64_t start_time_ms = 0;
+                        int64_t end_time_ms = 0;
+                        build_final_window(std::min(silence_chunk_count, silence_limit), transcribe_pcm, start_time_ms, end_time_ms);
+                        if (m_debug) {
+                            fprintf(stderr, "[STREAM] final %lld-%lld ms: speculative tail %s\n", (long long)start_time_ms, (long long)end_time_ms,
+                                    tail_cache.matches(transcribe_pcm.size(), start_time_ms, end_time_ms) ? "reused" : (tail_cache.valid ? "mismatch" : "not available"));
                         }
-                        processAndOutput(wparams, transcribe_pcm, start_time_ms, end_time_ms, m_segment_index, false);
+                        if (tail_cache.matches(transcribe_pcm.size(), start_time_ms, end_time_ms)) {
+                            emitHypothesis(tail_cache.result, m_segment_index, false);
+                        } else {
+                            processAndOutput(wparams, transcribe_pcm, start_time_ms, end_time_ms, m_segment_index, false);
+                        }
                     }
                     speech_buffer.clear();
                     speech_chunk_count = 0;
                     pre_speech_cache.clear();
+                    tail_cache.reset();
+                    tail_attempted = false;
+                    prev_hyp_text.clear();
+                } else if (m_seg.speculative_final && !tail_attempted && !speech_buffer.empty() &&
+                           static_cast<int64_t>(silence_chunk_count) * m_chunk_size_ms >= m_seg.tail_delay_ms) {
+                    // Pending audio is not a reason to skip: at worst the speculative decode is wasted.
+                    bool skip_tail = is_finishing ||
+                                     will_segment_end(c + 1, in_speech, silence_chunk_count, speech_chunk_count);
+                    if (!skip_tail) {
+                        tail_attempted = true;
+                        std::vector<double> tail_pcm;
+                        int64_t start_time_ms = 0;
+                        int64_t end_time_ms = 0;
+                        build_final_window(silence_chunk_count, tail_pcm, start_time_ms, end_time_ms);
+                        stream_seg::Hypothesis hyp;
+                        if (decodeHypothesis(wparams, tail_pcm, start_time_ms, end_time_ms, hyp)) {
+                            tail_cache.valid = true;
+                            tail_cache.pcm_size = tail_pcm.size();
+                            tail_cache.start_ms = start_time_ms;
+                            tail_cache.end_ms = end_time_ms;
+                            tail_cache.result = hyp;
+                            if (m_progressive_update) {
+                                emitHypothesis(hyp, m_segment_index, true);
+                            }
+                        }
+                    }
                 }
             } else {
                 // Keep rolling pre-speech cache
@@ -1702,6 +1792,10 @@ void SenseVoiceStream::StreamWorker() {
             m_segment_index++;
             silence_chunk_count = 0;
             in_speech = true;
+            prev_hyp_text.clear();
+            skip_progressive_initial = false;
+            tail_cache.reset();
+            tail_attempted = false;
         }
         
         if (is_finishing) {
@@ -1746,35 +1840,32 @@ void SenseVoiceStream::emit_silence(double t) {
     }
 }
 
-void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, int segment_index, bool is_progressive) {
-    const int sample_rate = SENSE_VOICE_SAMPLE_RATE;
-    
+bool SenseVoiceStream::decodeHypothesis(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, stream_seg::Hypothesis& out) {
     // Safety check
     if (!m_ctx || audio.empty()) {
-        return;
+        return false;
     }
     
+    bool ok = false;
     try {
         // Use sense_voice_full_parallel for streaming
         if (sense_voice_full_parallel(m_ctx, wparams, audio, audio.size(), m_n_threads) == 0) {
-            // Extract text and prefix info directly from state (API functions not available in this version)
-            std::string text_str;
-            std::string lang_str, emo_str, evt_str;
-            
-            // Compute token timestamps using passed time range
-            std::vector<std::tuple<int64_t, int64_t, std::string>> token_data;
+            out = stream_seg::Hypothesis{};
+            out.start_ms = start_time_ms;
+            out.end_ms = end_time_ms;
             int64_t segment_duration_ms = end_time_ms - start_time_ms;
             
             if (m_ctx->state->ids.size() > 4) {
                 // Extract prefix tokens
                 auto it_lang = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[0]);
-                if (it_lang != m_ctx->vocab.id_to_token.end()) lang_str = it_lang->second;
+                if (it_lang != m_ctx->vocab.id_to_token.end()) out.language = it_lang->second;
                 auto it_emo = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[1]);
-                if (it_emo != m_ctx->vocab.id_to_token.end()) emo_str = it_emo->second;
+                if (it_emo != m_ctx->vocab.id_to_token.end()) out.emotion = it_emo->second;
                 auto it_evt = m_ctx->vocab.id_to_token.find(m_ctx->state->ids[2]);
-                if (it_evt != m_ctx->vocab.id_to_token.end()) evt_str = it_evt->second;
+                if (it_evt != m_ctx->vocab.id_to_token.end()) out.event = it_evt->second;
                 // Extract tokens with their frame timestamps
                 bool has_timestamps = (m_ctx->state->ids.size() == m_ctx->state->token_timestamps.size()) && !m_ctx->state->token_timestamps.empty();
+                out.words_timed = has_timestamps;
                 
                 size_t n_valid_tokens = 0;
                 for (size_t k = 4; k < m_ctx->state->ids.size(); k++) {
@@ -1792,7 +1883,7 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
 
                             if (has_timestamps) {
                                 int frame_idx = m_ctx->state->token_timestamps[k];
-                                int actual_frame = std::max(0, frame_idx - 4); // 扣除 4 幀偏移
+                                int actual_frame = std::max(0, frame_idx - 4); // Subtract the 4-frame prefix offset
                                 token_t0 = start_time_ms + actual_frame * 60;
 
                                 int64_t next_token_t0 = end_time_ms;
@@ -1811,60 +1902,75 @@ void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::v
                                 
                                 if (token_t1 <= token_t0) token_t1 = token_t0 + 60;
                             } else {
-                                // 安全降級
+                                // Fallback: spread tokens evenly across the segment
                                 token_t0 = start_time_ms + (segment_duration_ms * token_idx) / std::max((size_t)1, n_valid_tokens);
                                 token_t1 = start_time_ms + (segment_duration_ms * (token_idx + 1)) / std::max((size_t)1, n_valid_tokens);
                             }
 
-                            token_data.push_back(std::make_tuple(token_t0, token_t1, it->second));
-                            text_str += it->second;
+                            stream_seg::Word word;
+                            word.text = it->second;
+                            word.t0_ms = token_t0;
+                            word.t1_ms = token_t1;
+                            out.words.push_back(std::move(word));
+                            out.text += it->second;
                             token_idx++;
                         }
                     }
                 }
             }
-            
-            if (!text_str.empty() && m_tsfn_callback) {
-                auto callback_data = std::make_tuple(start_time_ms, end_time_ms, text_str, lang_str, emo_str, evt_str, token_data);
-                auto callback = [callback_data, is_progressive, segment_index](Napi::Env env, Napi::Function jsCallback) {
-                    Napi::Object result = Napi::Object::New(env);
-                    if (is_progressive) {
-                        result.Set("type", "progressive");
-                    } else {
-                        result.Set("type", "segment");
-                    }
-                    result.Set("index", Napi::Number::New(env, segment_index));
-                    result.Set("start", Napi::Number::New(env, std::get<0>(callback_data)));
-                    result.Set("end", Napi::Number::New(env, std::get<1>(callback_data)));
-                    result.Set("text", Napi::String::New(env, std::get<2>(callback_data)));
-                    result.Set("language", Napi::String::New(env, std::get<3>(callback_data)));
-                    result.Set("emotion", Napi::String::New(env, std::get<4>(callback_data)));
-                    result.Set("event", Napi::String::New(env, std::get<5>(callback_data)));
-                    
-                    // Add token timestamps (converted to seconds)
-                    const auto& tokens = std::get<6>(callback_data);
-                    Napi::Array tokensArr = Napi::Array::New(env, tokens.size());
-                    for (size_t i = 0; i < tokens.size(); i++) {
-                        Napi::Object tok = Napi::Object::New(env);
-                        tok.Set("t0", Napi::Number::New(env, std::get<0>(tokens[i])));
-                        tok.Set("t1", Napi::Number::New(env, std::get<1>(tokens[i])));
-                        tok.Set("text", Napi::String::New(env, std::get<2>(tokens[i])));
-                        tokensArr[i] = tok;
-                    }
-                    result.Set("tokens", tokensArr);
-                    
-                    jsCallback.Call({env.Null(), result});
-                };
-                if (is_progressive) {
-                    m_tsfn_callback.NonBlockingCall(callback);
-                } else {
-                    m_tsfn_callback.BlockingCall(callback);
-                }
-            }
+            ok = true;
         }
         
         m_n_samples_processed += audio.size();
     } catch (...) {
         // Catch any exception to prevent crash
+        ok = false;
+    }
+    return ok;
+}
+
+void SenseVoiceStream::emitHypothesis(const stream_seg::Hypothesis& hyp, int segment_index, bool is_progressive) {
+    if (hyp.text.empty() || !m_tsfn_callback) {
+        return;
+    }
+    auto callback = [hyp, is_progressive, segment_index](Napi::Env env, Napi::Function jsCallback) {
+        Napi::Object result = Napi::Object::New(env);
+        if (is_progressive) {
+            result.Set("type", "progressive");
+        } else {
+            result.Set("type", "segment");
+        }
+        result.Set("index", Napi::Number::New(env, segment_index));
+        result.Set("start", Napi::Number::New(env, hyp.start_ms));
+        result.Set("end", Napi::Number::New(env, hyp.end_ms));
+        result.Set("text", Napi::String::New(env, hyp.text));
+        result.Set("language", Napi::String::New(env, hyp.language));
+        result.Set("emotion", Napi::String::New(env, hyp.emotion));
+        result.Set("event", Napi::String::New(env, hyp.event));
+        
+        // Token timestamps in milliseconds
+        Napi::Array tokensArr = Napi::Array::New(env, hyp.words.size());
+        for (size_t i = 0; i < hyp.words.size(); i++) {
+            Napi::Object tok = Napi::Object::New(env);
+            tok.Set("t0", Napi::Number::New(env, hyp.words[i].t0_ms));
+            tok.Set("t1", Napi::Number::New(env, hyp.words[i].t1_ms));
+            tok.Set("text", Napi::String::New(env, hyp.words[i].text));
+            tokensArr[i] = tok;
+        }
+        result.Set("tokens", tokensArr);
+        
+        jsCallback.Call({env.Null(), result});
+    };
+    if (is_progressive) {
+        m_tsfn_callback.NonBlockingCall(callback);
+    } else {
+        m_tsfn_callback.BlockingCall(callback);
+    }
+}
+
+void SenseVoiceStream::processAndOutput(sense_voice_full_params& wparams, std::vector<double>& audio, int64_t start_time_ms, int64_t end_time_ms, int segment_index, bool is_progressive) {
+    stream_seg::Hypothesis hyp;
+    if (decodeHypothesis(wparams, audio, start_time_ms, end_time_ms, hyp)) {
+        emitHypothesis(hyp, segment_index, is_progressive);
     }
 }
