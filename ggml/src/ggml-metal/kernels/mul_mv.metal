@@ -596,6 +596,49 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Q8_0 x Q8_0 integer-dot mat-vec. Each lane owns one output row and mirrors
+// ggml_vec_dot_q8_0_q8_0_generic, including per-block F16 scale conversion.
+[[host_name("kernel_mul_mv_q8_0_q8_0")]]
+kernel void kernel_mul_mv_q8_0_q8_0(
+        constant ggml_metal_kargs_mul_mv_q8_0_q8_0 & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int row = int(tgpig.x) * N_SIMDWIDTH + int(tiisg);
+    if (row >= args.ne01) {
+        return;
+    }
+
+    const int r1 = int(tgpig.y);
+    const int im = int(tgpig.z);
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    const uint64_t offset0 = uint64_t(row) * args.nb01 +
+        uint64_t(i12 / args.r2) * args.nb02 + uint64_t(i13 / args.r3) * args.nb03;
+    device const block_q8_0 * x = (device const block_q8_0 *) (src0 + offset0);
+
+    const int blocks_per_row = args.ne00 / QK8_0;
+    const uint64_t input_row = uint64_t(im) * uint64_t(args.ne11) + uint64_t(r1);
+    device const block_q8_0 * y = (device const block_q8_0 *) src1 + input_row * blocks_per_row;
+
+    float sumf = 0.0f;
+    for (int ib = 0; ib < blocks_per_row; ++ib) {
+        int32_t sumi = 0;
+        for (int j = 0; j < QK8_0; ++j) {
+            sumi += int32_t(x[ib].qs[j]) * int32_t(y[ib].qs[j]);
+        }
+        sumf += float(sumi) * (float(x[ib].d) * float(y[ib].d));
+    }
+
+    device float * dst_f32 = (device float *) dst;
+    const uint64_t dst_offset = uint64_t(im) * uint64_t(args.ne0) * uint64_t(args.ne1) +
+        uint64_t(r1) * uint64_t(args.ne0) + uint64_t(row);
+    dst_f32[dst_offset] = sumf;
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
@@ -1622,6 +1665,84 @@ kernel void kernel_mul_mv_q4_K_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// Q4_K x Q8_K integer-dot mat-vec. Each lane owns one output row and follows
+// ggml_vec_dot_q4_K_q8_K_generic: scales are applied to the 32-value Q4_K
+// groups and the Q4_K minima are compensated with Q8_K's 16-value bsums.
+[[host_name("kernel_mul_mv_q4_K_q8_K")]]
+kernel void kernel_mul_mv_q4_K_q8_K(
+        constant ggml_metal_kargs_mul_mv_q4_K_q8_K & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int row = int(tgpig.x) * N_SIMDWIDTH + int(tiisg);
+    if (row >= args.ne01) {
+        return;
+    }
+
+    const int r1 = int(tgpig.y);
+    const int im = int(tgpig.z);
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    const uint64_t offset0 = uint64_t(row) * args.nb01 +
+        uint64_t(i12 / args.r2) * args.nb02 + uint64_t(i13 / args.r3) * args.nb03;
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    const int blocks_per_row = args.ne00 / QK_K;
+    const uint64_t input_row = uint64_t(im) * uint64_t(args.ne11) + uint64_t(r1);
+    device const block_q8_K * y = (device const block_q8_K *) src1 + input_row * blocks_per_row;
+
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < blocks_per_row; ++ib) {
+        int32_t aux32[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        int32_t sumi = 0;
+
+        for (int group = 0; group < QK_K / 32; ++group) {
+            const uchar2 scale_min = get_scale_min_k4_just2(group, 0, x[ib].scales);
+            const int scale = int(scale_min[0]);
+            const int min = int(scale_min[1]);
+
+            sumi += int32_t(y[ib].bsums[2 * group]) * min;
+            sumi += int32_t(y[ib].bsums[2 * group + 1]) * min;
+
+            // The packed Q4_K bytes store low and high nibbles for adjacent
+            // 32-value groups. Accumulate the same eight lane sums as the CPU
+            // generic implementation to retain its integer-dot ordering.
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int pos = group * 32 + chunk * 8 + lane;
+                    const int q4_byte = (pos / 64) * 32 + (pos % 32);
+                    const uchar packed = x[ib].qs[q4_byte];
+                    const int q4 = (pos % 64) < 32 ? int(packed & 0x0F) : int(packed >> 4);
+                    const int32_t product = int32_t(y[ib].qs[pos]) * q4;
+                    aux32[lane] += scale * product;
+                }
+            }
+        }
+
+        const float d = float(x[ib].d) * float(y[ib].d);
+        for (int lane = 0; lane < 8; ++lane) {
+            sums[lane] += d * float(aux32[lane]);
+        }
+
+        const float dmin = float(x[ib].dmin) * float(y[ib].d);
+        sumf -= dmin * float(sumi);
+    }
+
+    for (int lane = 0; lane < 8; ++lane) {
+        sumf += sums[lane];
+    }
+
+    device float * dst_f32 = (device float *) dst;
+    const uint64_t dst_offset = uint64_t(im) * uint64_t(args.ne0) * uint64_t(args.ne1) +
+        uint64_t(r1) * uint64_t(args.ne0) + uint64_t(row);
+    dst_f32[dst_offset] = sumf;
 }
 
 template<int nr0, typename args_t>

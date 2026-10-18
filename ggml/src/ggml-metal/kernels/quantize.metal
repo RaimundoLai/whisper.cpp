@@ -2,6 +2,132 @@
 #include "dequantize.h"
 #include "quantize.h"
 
+// Match ggml-quants.c's nearest_int helper, which rounds to nearest with
+// ties to even by adding 1.5 * 2^23 and extracting the mantissa bits.
+static inline int quantize_nearest_int_q8_K(float x) {
+    const float rounded = x + 12582912.0f;
+    const int bits = as_type<int>(rounded);
+    return (bits & 0x007fffff) - 0x00400000;
+}
+
+// Quantize one 256-element F32 block into the temporary Q8_K format used by
+// the PREC_F32 Q4_K mat-vec path. The dispatch uses one 32-thread group per
+// block; lane 0 performs the reference scalar algorithm to preserve its
+// signed-amax selection and rounding behavior.
+[[host_name("kernel_quantize_q8_K_f32")]]
+kernel void kernel_quantize_q8_K_f32(
+        constant ggml_metal_kargs_quantize_q8_K & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]]) {
+#pragma METAL fp math_mode(safe)
+    if (tiitg != 0) {
+        return;
+    }
+
+    constexpr int QK = 256;
+    const uint block_idx = tgpig.x;
+    const uint row       = tgpig.y;
+    const uint batch     = tgpig.z;
+    const uint i2        = batch % args.ne02;
+    const uint i3        = batch / args.ne02;
+
+    const uint64_t src_off = (uint64_t)i3 * args.nb03 +
+                             (uint64_t)i2 * args.nb02 +
+                             (uint64_t)row * args.nb01 +
+                             (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    float max_value = 0.0f;
+    float amax = 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        const float value = x[j];
+        const float abs_value = fabs(value);
+        if (abs_value > amax) {
+            amax = abs_value;
+            max_value = value;
+        }
+    }
+
+    const uint64_t out_block =
+        (((uint64_t)batch * args.ne01 + row) * args.num_blocks_per_row + block_idx);
+    device block_q8_K * out = (device block_q8_K *)(dst + out_block * sizeof(block_q8_K));
+
+    if (amax == 0.0f) {
+        out->d = 0.0f;
+        for (int j = 0; j < QK; ++j) {
+            out->qs[j] = 0;
+        }
+        // The CPU reference leaves bsums untouched for zero blocks. Store
+        // their mathematically correct values so this temporary block is
+        // deterministic and safe for downstream dot products.
+        for (int j = 0; j < QK / 16; ++j) {
+            out->bsums[j] = 0;
+        }
+        return;
+    }
+
+    const float iscale = -127.0f / max_value;
+    for (int j = 0; j < QK; ++j) {
+        const int q = min(127, quantize_nearest_int_q8_K(iscale * x[j]));
+        out->qs[j] = (int8_t)q;
+    }
+    for (int j = 0; j < QK / 16; ++j) {
+        int sum = 0;
+        for (int k = 0; k < 16; ++k) {
+            sum += (int)out->qs[j * 16 + k];
+        }
+        out->bsums[j] = (int16_t)sum;
+    }
+    out->d = 1.0f / iscale;
+}
+
+// Quantize one 32-element F32 block into Q8_0 for the PREC_F32 mat-vec path.
+// Apple ARM's CPU quantizer uses round-to-nearest-even (vcvtnq_s32_f32), so
+// use rint here while computing quantized values from the unrounded F32 d.
+[[host_name("kernel_quantize_q8_0_f32")]]
+kernel void kernel_quantize_q8_0_f32(
+        constant ggml_metal_kargs_quantize_q8_0 & args,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]]) {
+#pragma METAL fp math_mode(safe)
+    if (tiitg != 0) {
+        return;
+    }
+
+    constexpr int QK = 32;
+    const uint block_idx = tgpig.x;
+    const uint row       = tgpig.y;
+    const uint batch     = tgpig.z;
+    const uint i2        = batch % args.ne02;
+    const uint i3        = batch / args.ne02;
+
+    const uint64_t src_off = (uint64_t)i3 * args.nb03 +
+                             (uint64_t)i2 * args.nb02 +
+                             (uint64_t)row * args.nb01 +
+                             (uint64_t)block_idx * QK * sizeof(float);
+    device const float * x = (device const float *)(src + src_off);
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        amax = MAX(amax, fabs(x[j]));
+    }
+
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    const uint64_t out_block =
+        (((uint64_t)batch * args.ne01 + row) * args.num_blocks_per_row + block_idx);
+    device block_q8_0 * out = (device block_q8_0 *)(dst + out_block * sizeof(block_q8_0));
+    out->d = (half)d;
+    for (int j = 0; j < QK; ++j) {
+        out->qs[j] = (int8_t)rint(x[j] * id);
+    }
+}
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,

@@ -8,6 +8,9 @@ npm install
 cd ../../
 mkdir -p artifacts
 
+echo "Clearing build cache..."
+rm -rf build/CMakeCache.txt build/CMakeFiles/
+
 echo "Building Metal variant..."
 npx cmake-js compile -T addon.node -B Release \
   --CDBUILD_SHARED_LIBS=OFF \
