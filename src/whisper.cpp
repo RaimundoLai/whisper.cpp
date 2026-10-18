@@ -4460,6 +4460,7 @@ struct whisper_vad_context {
     int     n_window;
     int     n_context;
     int     n_threads;
+    bool    source_context = false; // CrispASR: carry n_context samples across frames (Silero wrapper recipe)
 
     std::vector<ggml_backend_t> backends;
     ggml_backend_buffer_t       buffer = nullptr;
@@ -4472,6 +4473,7 @@ struct whisper_vad_context {
     struct ggml_tensor * h_state;
     struct ggml_tensor * c_state;
     std::vector<float>   probs;
+    std::vector<float>   window; // persists the waveform context between calls when source_context is set
 };
 
 struct whisper_vad_context_params whisper_vad_default_context_params(void) {
@@ -4565,9 +4567,9 @@ static ggml_backend_buffer_type_t select_weight_buft(const whisper_vad_hparams &
 }
 
 static ggml_tensor * whisper_vad_build_stft_layer(ggml_context * ctx0,
-        const whisper_vad_model & model, ggml_tensor * cur) {
+        const whisper_vad_model & model, ggml_tensor * cur, bool source_context) {
     // Apply reflective padding to the input tensor
-    ggml_tensor * padded = ggml_pad_reflect_1d(ctx0, cur, 64, 64);
+    ggml_tensor * padded = ggml_pad_reflect_1d(ctx0, cur, source_context ? 0 : 64, 64);
 
     struct ggml_tensor * stft = ggml_conv_1d(ctx0, model.stft_forward_basis, padded, model.hparams.lstm_input_size, 0, 1);
 
@@ -4670,13 +4672,13 @@ static struct ggml_cgraph * whisper_vad_build_graph(whisper_vad_context & vctx) 
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor * frame = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window, 1);
+    struct ggml_tensor * frame = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vctx.n_window + (vctx.source_context ? vctx.n_context : 0), 1);
     ggml_set_name(frame, "frame");
     ggml_set_input(frame);
 
     struct ggml_tensor * cur = nullptr;
     {
-        cur = whisper_vad_build_stft_layer(ctx0, model, frame);
+        cur = whisper_vad_build_stft_layer(ctx0, model, frame, vctx.source_context);
 
         cur = whisper_vad_build_encoder_layer(ctx0, model, cur);
 
@@ -5139,6 +5141,8 @@ struct whisper_vad_context * whisper_vad_init_with_params(
 
 void whisper_vad_reset_state(whisper_vad_context * vctx) {
     ggml_backend_buffer_clear(vctx->buffer, 0);
+    // the waveform context is reset along with the LSTM state
+    std::fill(vctx->window.begin(), vctx->window.end(), 0.0f);
 }
 
 bool whisper_vad_detect_speech_no_reset(
@@ -5156,7 +5160,11 @@ bool whisper_vad_detect_speech_no_reset(
     vctx->probs.resize(n_chunks);
     WHISPER_LOG_INFO("%s: props size: %u\n", __func__, n_chunks);
 
-    std::vector<float> window(vctx->n_window, 0.0f);
+    const int carry = vctx->source_context ? vctx->n_context : 0;
+    if ((int) vctx->window.size() != vctx->n_window + carry) {
+        vctx->window.assign(vctx->n_window + carry, 0.0f);
+    }
+    auto & window = vctx->window;
 
     auto & sched = vctx->sched.sched;
 
@@ -5187,14 +5195,14 @@ bool whisper_vad_detect_speech_no_reset(
             // Copy the zero-padded chunk to the window.
             const int samples_to_copy_max = vctx->n_window;
             const int samples_to_copy_cur = std::min(samples_to_copy_max, (int)partial_chunk.size());
-            std::copy(partial_chunk.begin(), partial_chunk.begin() + samples_to_copy_cur, window.begin());
+            std::copy(partial_chunk.begin(), partial_chunk.begin() + samples_to_copy_cur, window.begin() + carry);
             if (samples_to_copy_cur < samples_to_copy_max) {
-                std::fill(window.begin() + samples_to_copy_cur, window.end(), 0.0f);
+                std::fill(window.begin() + carry + samples_to_copy_cur, window.end(), 0.0f);
             }
         } else {
             // Copy current frame samples to the window.
             const int samples_to_copy = std::min(idx_end - idx_start, vctx->n_window);
-            std::copy(samples + idx_start, samples + idx_start + samples_to_copy, window.begin());
+            std::copy(samples + idx_start, samples + idx_start + samples_to_copy, window.begin() + carry);
         }
 
         // Set the frame tensor data with the samples.
@@ -5208,6 +5216,9 @@ bool whisper_vad_detect_speech_no_reset(
 
         // Get the probability for this chunk.
         ggml_backend_tensor_get(prob, &vctx->probs[i], 0, sizeof(float));
+        if (carry) {
+            std::copy(window.end() - carry, window.end(), window.begin());
+        }
 
         //WHISPER_LOG_DEBUG("chunk %d: p = %7.3f\n", i, probs[i]);
     }
@@ -9537,5 +9548,23 @@ int whisper_score_texts(struct whisper_context* ctx, const float* samples, int n
                 n_steps, t_dec, n_steps ? t_dec / n_steps : 0.0, t_sm, ms(t_start, now()));
     }
     return 0;
+}
+
+// CrispASR's streaming VAD and Silero source-context recipe (crispasr.cpp is
+// not compiled here, so these live next to the VAD they extend).
+bool crispasr_silero_enable_context(struct whisper_vad_context * ctx) {
+    if (!ctx || ctx->n_window != 512 || ctx->n_context != 64) {
+        return false;
+    }
+    ctx->source_context = true;
+    return true;
+}
+
+bool whisper_vad_detect_speech_continue(struct whisper_vad_context * vctx, const float * samples, int n_samples) {
+    return whisper_vad_detect_speech_no_reset(vctx, samples, n_samples);
+}
+
+void whisper_vad_set_probs(struct whisper_vad_context * vctx, const float * probs, int n_probs) {
+    vctx->probs.assign(probs, probs + std::max(0, n_probs));
 }
 }
