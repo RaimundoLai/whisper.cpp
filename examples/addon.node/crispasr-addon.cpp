@@ -728,6 +728,8 @@ static std::vector<speaker_utterance> parse_speaker_utterances(const std::string
     }
 
     // 2. Try parsing as Moss-Diarize: [0.0][S1] ... [1.5][S2] ...
+    // Times are relative to the audio passed in and the model can emit times
+    // past its end, so clamp to total_duration_ms when it is known.
     if (input.find("[S") != std::string::npos || input.find("[s") != std::string::npos) {
         struct token_item {
             enum { TIME, SPEAKER, TEXT } type;
@@ -766,7 +768,8 @@ static std::vector<speaker_utterance> parse_speaker_utterances(const std::string
                 }
             }
 
-            size_t next_b = input.find('[', idx);
+            // An unknown or unclosed '[' is kept as text; search past it so the loop always advances.
+            size_t next_b = input.find('[', input[idx] == '[' ? idx + 1 : idx);
             std::string piece = (next_b == std::string::npos) ? input.substr(idx) : input.substr(idx, next_b - idx);
             trim_leading_replacement_and_spaces(piece);
             while (!piece.empty() && (piece.back() == ' ' || piece.back() == '\t')) piece.pop_back();
@@ -787,22 +790,28 @@ static std::vector<speaker_utterance> parse_speaker_utterances(const std::string
             trim_leading_replacement_and_spaces(cur_text);
             while (!cur_text.empty() && (cur_text.back() == ' ' || cur_text.back() == '\t')) cur_text.pop_back();
             if (!cur_text.empty()) {
-                speaker_utterance u;
-                u.text = cur_text;
-                u.speaker = "Speaker " + std::to_string(cur_speaker);
-                u.start_ms = cur_start >= 0 ? static_cast<int64_t>(cur_start * 1000.0) : 0;
-                u.end_ms = cur_end >= 0 ? static_cast<int64_t>(cur_end * 1000.0) : (total_duration_ms > 0 ? total_duration_ms : u.start_ms + 1000);
-                if (u.end_ms <= u.start_ms) u.end_ms = u.start_ms + 1000;
-                utterances.push_back(std::move(u));
+                int64_t start_ms = cur_start >= 0 ? static_cast<int64_t>(cur_start * 1000.0) : 0;
+                int64_t end_ms = cur_end >= 0 ? static_cast<int64_t>(cur_end * 1000.0) : (total_duration_ms > 0 ? total_duration_ms : start_ms + 1000);
+                if (total_duration_ms > 0) end_ms = std::min(end_ms, total_duration_ms);
+                // Drops utterances that start at/after the end of the audio.
+                if (end_ms > start_ms) {
+                    speaker_utterance u;
+                    u.text = cur_text;
+                    u.speaker = "Speaker " + std::to_string(cur_speaker);
+                    u.start_ms = start_ms;
+                    u.end_ms = end_ms;
+                    utterances.push_back(std::move(u));
+                }
             }
             cur_text = "";
-            cur_start = -1.0;
+            // [start][S1]text[end][S2]text...: the previous end starts the next utterance.
+            cur_start = cur_end;
             cur_end = -1.0;
         };
 
         for (const auto& t : tokens) {
             if (t.type == token_item::TIME) {
-                if (cur_start < 0) {
+                if (cur_text.empty()) {
                     cur_start = t.time_val;
                 } else {
                     cur_end = t.time_val;
@@ -963,7 +972,9 @@ public:
         return m_should_abort->load();
     }
 
-    void process_result(crispasr_session_result* res, int64_t offset_ms, const qwen3_asr::alignment_result* align_res = nullptr) {
+    void process_result(crispasr_session_result* res, int64_t offset_ms,
+                        const qwen3_asr::alignment_result* align_res = nullptr,
+                        int64_t real_audio_duration_ms = -1) {
         int n_segs = crispasr_session_result_n_segments(res);
         std::string full_text = m_result.text;
         bool use_aligner_words = (align_res && align_res->success);
@@ -975,7 +986,11 @@ public:
             int64_t seg_end_ms = offset_ms + crispasr_session_result_segment_t1(res, i) * 10;
             int64_t seg_dur_ms = seg_end_ms - seg_start_ms;
 
-            auto utterances = parse_speaker_utterances(raw_seg_text, seg_dur_ms);
+            // The audio may have been zero-padded before transcription, so bound
+            // parsed speaker times by the real (unpadded) audio length.
+            const int64_t parse_dur_ms = real_audio_duration_ms >= 0 ? real_audio_duration_ms : seg_dur_ms;
+            const int64_t audio_end_ms = real_audio_duration_ms >= 0 ? offset_ms + real_audio_duration_ms : INT64_MAX;
+            auto utterances = parse_speaker_utterances(raw_seg_text, parse_dur_ms);
 
             if (!utterances.empty()) {
                 // Multi-speaker mode: distribute words to each speaker utterance!
@@ -1005,6 +1020,9 @@ public:
                 }
 
                 for (auto& wd : seg_words) {
+                    // Drop words in the padding, clip words that run past the real end.
+                    if (wd.start_ms >= audio_end_ms) continue;
+                    wd.end_ms = std::min(wd.end_ms, audio_end_ms);
                     int64_t w_mid = (wd.start_ms + wd.end_ms) / 2;
                     int best_u = -1;
                     int64_t min_dist = INT64_MAX;
@@ -1278,7 +1296,8 @@ public:
                             align_res = aligner.align(transcribe_pcm.data(), transcribe_pcm.size(), clean_txt, detected_lang);
                         }
                     }
-                    process_result(res, 0, use_aligner ? &align_res : nullptr);
+                    process_result(res, 0, use_aligner ? &align_res : nullptr,
+                                   static_cast<int64_t>(m_pcmf32.size()) * 1000 / 16000);
                     crispasr_session_result_free(res);
                 } else {
                     SetError("CrispASR transcription failed");
@@ -1378,7 +1397,8 @@ public:
                                     align_res = aligner.align(chunk.data(), chunk.size(), clean_txt, detected_lang);
                                 }
                             }
-                            process_result(res, static_cast<int64_t>(chunk_t0 * 1000), use_aligner ? &align_res : nullptr);
+                            process_result(res, static_cast<int64_t>(chunk_t0 * 1000), use_aligner ? &align_res : nullptr,
+                                           (chunk_end - chunk_start) * 1000 / 16000);
                             crispasr_session_result_free(res);
                         } else {
                             discard_session = true;

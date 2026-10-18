@@ -177,6 +177,8 @@ list(APPEND CRISPASR_SOURCES ${GLINT_SOURCES})
 list(APPEND CRISPASR_SOURCES ${CRISPASR_C2PA_SOURCES})
 list(APPEND CRISPASR_SOURCES ${WEBRTC_VAD_SOURCES})
 list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/crispasr.cpp" "${CRISPASR_DIR}/src/chat.cpp" "${CRISPASR_DIR}/src/wav2vec2-ggml-debug.cpp" "${CRISPASR_DIR}/src/miniaudio_libopus.c")
+# Match CrispASR's optional ONNX build; this addon does not link ONNX Runtime.
+list(REMOVE_ITEM CRISPASR_SOURCES "${CRISPASR_DIR}/src/moonshine_onnx.cpp")
 
 if (MSVC)
     # CrispASR 0.8.38 still uses shared_ptr::unique() in this translation
@@ -259,6 +261,12 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(whisper PUBLIC ggml Threads::Threads)
+
+# Index-Echo uses CrispASR's private llama.cpp decoder. Build the same
+# private static core against this project's ggml targets, then keep its
+# headers and link dependency private to whisper.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CrispASRLlama.cmake")
+crispasr_add_llama_core(whisper "${CRISPASR_DIR}")
 
 # Link Accelerate framework on Apple for qwen3-asr mel spectrogram
 if(APPLE)
